@@ -108,6 +108,11 @@
 #define USE_UART7
 #define USE_UART8
 
+// Custom companion-computer link on UART3 (SITL serial is a TCP server;
+// UART3 listens on tcp/5763, MSP keeps tcp/5761)
+#define USE_CUSTOM_LINK
+#define CUSTOM_LINK_UART        SERIAL_PORT_USART3
+
 #define ENABLE_RX_UDP           1
 
 // DEFAULT_RX_FEATURE is picked by config/feature.h: FEATURE_RX_UDP when

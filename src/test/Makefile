@@ -359,6 +359,14 @@ rx_crsf_unittest_SRC := \
 		$(USER_DIR)/drivers/serial.c \
 		$(USER_DIR)/drivers/serial_impl.c
 
+custom_link_unittest_SRC := \
+		$(USER_DIR)/telemetry/custom_link_protocol.c \
+		$(USER_DIR)/common/crc.c \
+		$(USER_DIR)/common/streambuf.c
+
+custom_link_unittest_DEFINES := \
+		USE_CUSTOM_LINK=
+
 
 rx_ibus_unittest_SRC := \
 		$(USER_DIR)/rx/ibus.c

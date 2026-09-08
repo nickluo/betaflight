@@ -59,12 +59,19 @@ static void onData(dyad_Event *e)
 static void onClose(dyad_Event *e)
 {
     tcpPort_t* s = (tcpPort_t*)(e->udata);
-    s->clientCount--;
+    if (s->clientCount > 0) {
+        s->clientCount--;
+    }
     s->conn = NULL;
     fprintf(stderr, "[CLS]UART%u: %d,%d\n", s->id + 1U, s->connected, s->clientCount);
     if (s->clientCount == 0) {
         s->connected = false;
     }
+    // Bytes buffered for the gone client are stale; drop them so the ring
+    // cannot stay full and wedge producers that check serialTxBytesFree().
+    pthread_mutex_lock(&s->txLock);
+    s->port.txBufferHead = s->port.txBufferTail = 0;
+    pthread_mutex_unlock(&s->txLock);
 }
 
 static void onAccept(dyad_Event *e)
@@ -73,11 +80,21 @@ static void onAccept(dyad_Event *e)
     fprintf(stderr, "New connection on UART%u, %d\n", s->id + 1U, s->clientCount);
 
     s->connected = true;
-    if (s->clientCount > 0) {
+    // conn is the authoritative "have a live client" state. A previous
+    // client may have disconnected with its close event not yet processed
+    // (stale clientCount), which used to reject the reconnect and made
+    // auto-reconnecting hosts flap.
+    if (s->conn != NULL) {
         dyad_close(e->remote);
         return;
     }
     s->clientCount++;
+    // Discard anything buffered while nobody was connected: a new client must
+    // not receive pre-connection leftovers, and stale head/tail would leave
+    // serialTxBytesFree() permanently low for producers that drop on full.
+    pthread_mutex_lock(&s->txLock);
+    s->port.txBufferHead = s->port.txBufferTail = 0;
+    pthread_mutex_unlock(&s->txLock);
     fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1U, s->connected, s->clientCount);
     s->conn = e->remote;
     dyad_setNoDelay(e->remote, 1);

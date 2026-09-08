@@ -335,6 +335,14 @@ void pgResetFn_serialConfig(serialConfig_t *serialConfig)
     }
 #endif
 
+#if defined(USE_CUSTOM_LINK) && defined(CUSTOM_LINK_UART)
+    serialPortConfig_t *customLinkUartConfig = serialFindPortConfigurationMutable(CUSTOM_LINK_UART);
+    if (customLinkUartConfig) {
+        customLinkUartConfig->functionMask = FUNCTION_CUSTOM_LINK;
+        customLinkUartConfig->telemetry_baudrateIndex = BAUD_921600;
+    }
+#endif
+
 #ifdef USE_VTX
 #ifdef VTX_SMARTAUDIO_UART
     serialPortConfig_t *vtxSmartAudioUartConfig = serialFindPortConfigurationMutable(VTX_SMARTAUDIO_UART);

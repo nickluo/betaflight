@@ -10,6 +10,7 @@ PG_SRC = \
             pg/bus_quadspi.c \
             pg/bus_spi.c \
             pg/can.c \
+            pg/custom_link.c \
             pg/dashboard.c \
             pg/dronecan.c \
             pg/dronecan_dna.c \
@@ -296,6 +297,8 @@ COMMON_SRC = \
             telemetry/msp_shared.c \
             telemetry/ibus.c \
             telemetry/ibus_shared.c \
+            telemetry/custom_link.c \
+            telemetry/custom_link_protocol.c \
             sensors/esc_sensor.c \
             io/vtx.c \
             io/vtx_rtc6705.c \

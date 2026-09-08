@@ -65,6 +65,8 @@
 #include "sensors/gyro.h"
 #include "sensors/sensors.h"
 
+#include "telemetry/custom_link.h"
+
 #include "mixer.h"
 
 #define DYN_LPF_THROTTLE_STEPS             100
@@ -812,6 +814,15 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
     }
 #endif
 
+#ifdef USE_CUSTOM_LINK
+    // Offboard (companion computer) throttle - same override point as altitude
+    // hold / GPS rescue so throttle boost and throttle limit do not modify the
+    // host command.
+    if (customLinkHasControl()) {
+        throttle = customLinkGetThrottle();
+    }
+#endif
+
     motorMixRange = motorMixMax - motorMixMin;
 
     // note that here airmodeEnabled is true also when Launch Control is active
@@ -835,7 +846,7 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
         && ARMING_FLAG(ARMED)
         && !mixerRuntime.feature3dEnabled
         && !airmodeEnabled
-        && !FLIGHT_MODE(GPS_RESCUE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE)   // disable motor_stop while GPS Rescue / Alt Hold / Pos Hold is active
+        && !FLIGHT_MODE(GPS_RESCUE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE | OFFBOARD_MODE)   // disable motor_stop while GPS Rescue / Alt Hold / Pos Hold / Offboard is active
         && (rcData[THROTTLE] < rxConfig()->mincheck)) {
         applyMotorStop();
     } else {

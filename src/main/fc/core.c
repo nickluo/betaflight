@@ -115,6 +115,7 @@
 #include "sensors/gyro.h"
 
 #include "telemetry/telemetry.h"
+#include "telemetry/custom_link.h"
 
 #include "core.h"
 
@@ -1201,6 +1202,26 @@ void processRxModes(timeUs_t currentTimeUs)
         }
     } else {
         DISABLE_FLIGHT_MODE(POS_HOLD_MODE);
+    }
+#endif
+
+#ifdef USE_CUSTOM_LINK
+    // OFFBOARD: host (companion computer) control. The pilot's BOXOFFBOARD
+    // switch expresses intent; control engages only while armed, with a fresh
+    // host control stream (custom_link_watchdog_ms), no active failsafe, and
+    // no level/hold/autonomy mode claiming priority. Any of those conditions
+    // lapsing (switch off, watchdog expiry, failsafe) reverts to pilot RC.
+    if (ARMING_FLAG(ARMED)
+        && IS_RC_MODE_ACTIVE(BOXOFFBOARD)
+        && customLinkIsControlFresh()
+        && !failsafeIsActive()
+        && !FLIGHT_MODE(GPS_RESCUE_MODE | AUTOPILOT_MODE | ALT_HOLD_MODE | POS_HOLD_MODE)
+        && !FLIGHT_MODE(ANGLE_MODE | HORIZON_MODE)) {
+        if (!FLIGHT_MODE(OFFBOARD_MODE)) {
+            ENABLE_FLIGHT_MODE(OFFBOARD_MODE);
+        }
+    } else {
+        DISABLE_FLIGHT_MODE(OFFBOARD_MODE);
     }
 #endif
 

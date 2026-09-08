@@ -206,6 +206,11 @@ typedef enum {
 #if ENABLE_DRONECAN
     TASK_DRONECAN,
 #endif
+#ifdef USE_CUSTOM_LINK
+    TASK_CUSTOM_LINK_FAST,
+    TASK_CUSTOM_LINK_MED,
+    TASK_CUSTOM_LINK_SLOW,
+#endif
 
     /* Count of real tasks */
     TASK_COUNT,

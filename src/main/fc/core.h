@@ -57,6 +57,7 @@ typedef enum {
     DISARM_REASON_SERIAL_COMMAND    = 8,
     DISARM_REASON_LANDING           = 9,
     DISARM_REASON_CRASHFLIP         = 10,
+    DISARM_REASON_OFFBOARD          = 11,
 #ifdef UNIT_TEST
     DISARM_REASON_SYSTEM            = 255,
 #endif

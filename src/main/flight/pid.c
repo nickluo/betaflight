@@ -42,6 +42,7 @@
 #include "fc/controlrate_profile.h"
 #include "fc/core.h"
 #include "fc/rc.h"
+#include "telemetry/custom_link.h"
 #include "fc/rc_controls.h"
 #include "fc/runtime_config.h"
 
@@ -1188,6 +1189,14 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
 #endif // USE_CHIRP
 
         float currentPidSetpoint = getSetpointRate(axis);
+#ifdef USE_CUSTOM_LINK
+        // Offboard (companion computer) control: replace the pilot-computed
+        // setpoint with the host rate command; the same acceleration limit
+        // applies as for stick input.
+        if (customLinkHasControl()) {
+            currentPidSetpoint = customLinkGetRateSetpoint(axis);
+        }
+#endif
         if (pidRuntime.maxVelocity[axis]) {
             currentPidSetpoint = accelerationLimit(axis, currentPidSetpoint);
         }

@@ -45,6 +45,8 @@
 #include "flight/pid.h"
 #include "flight/failsafe.h"
 
+#include "telemetry/custom_link.h"
+
 #include "io/beeper.h"
 #include "io/usb_cdc_hid.h"
 #include "io/dashboard.h"
@@ -176,7 +178,15 @@ void processRcStickPositions(void)
 
     // perform actions
     if (!isUsingSticksToArm) {
-        if (IS_RC_MODE_ACTIVE(BOXARM)) {
+        // A fresh custom-link stream holding arm=1 counts as an armed request:
+        // the pilot already expressed handover intent with the BOXOFFBOARD
+        // switch, and the box-off branch below would otherwise immediately
+        // disarm again, flapping against host-initiated arming.
+        if (IS_RC_MODE_ACTIVE(BOXARM)
+#ifdef USE_CUSTOM_LINK
+            || customLinkHostArmActive()
+#endif
+        ) {
             rcDisarmTicks = 0;
             // Arming via ARM BOX
             tryArm();

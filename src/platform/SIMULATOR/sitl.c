@@ -720,6 +720,12 @@ uint32_t micros(void)
     return micros64() & 0xFFFFFFFF;
 }
 
+// The simulator has no interrupt context; ISR timestamps equal poll time.
+uint32_t microsISR(void)
+{
+    return micros();
+}
+
 uint32_t millis(void)
 {
     return millis64() & 0xFFFFFFFF;

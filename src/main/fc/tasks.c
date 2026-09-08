@@ -106,6 +106,7 @@
 
 #include "telemetry/telemetry.h"
 #include "telemetry/crsf.h"
+#include "telemetry/custom_link.h"
 
 #ifdef USE_BST
 #include "i2c_bst.h"
@@ -499,6 +500,12 @@ task_attribute_t task_attributes[TASK_COUNT] = {
     [TASK_DRONECAN] = DEFINE_TASK("DRONECAN", NULL, NULL, dronecanUpdate, TASK_PERIOD_HZ(50), TASK_PRIORITY_LOW),
 #endif
 
+#ifdef USE_CUSTOM_LINK
+    [TASK_CUSTOM_LINK_FAST] = DEFINE_TASK("CUSTOM_LINK_F", NULL, NULL, customLinkTaskFast, TASK_PERIOD_HZ(200), TASK_PRIORITY_HIGH),
+    [TASK_CUSTOM_LINK_MED] = DEFINE_TASK("CUSTOM_LINK_M", NULL, NULL, customLinkTaskMed, TASK_PERIOD_HZ(100), TASK_PRIORITY_MEDIUM_HIGH),
+    [TASK_CUSTOM_LINK_SLOW] = DEFINE_TASK("CUSTOM_LINK_S", NULL, NULL, customLinkTaskSlow, TASK_PERIOD_HZ(10), TASK_PRIORITY_MEDIUM),
+#endif
+
 };
 
 task_t *getTask(unsigned taskId)
@@ -625,6 +632,12 @@ void tasksInit(void)
             rescheduleTask(TASK_TELEMETRY, TASK_PERIOD_HZ(500));
         }
     }
+#endif
+
+#ifdef USE_CUSTOM_LINK
+    setTaskEnabled(TASK_CUSTOM_LINK_FAST, customLinkIsEnabled());
+    setTaskEnabled(TASK_CUSTOM_LINK_MED, customLinkIsEnabled());
+    setTaskEnabled(TASK_CUSTOM_LINK_SLOW, customLinkIsEnabled());
 #endif
 
 #ifdef USE_LED_STRIP

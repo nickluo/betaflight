@@ -41,7 +41,8 @@ typedef enum {
     BOXPOSHOLD,
     BOXGPSRESCUE,
     BOXAUTOPILOT,  // GPS waypoint following
-    BOXID_FLIGHTMODE_LAST = BOXAUTOPILOT,
+    BOXOFFBOARD,   // companion computer (custom link) control
+    BOXID_FLIGHTMODE_LAST = BOXOFFBOARD,
 
 // When new flight modes are added, the parameter group version for 'modeActivationConditions' in src/main/fc/rc_modes.c has to be incremented to ensure that the RC modes configuration is reset.
 

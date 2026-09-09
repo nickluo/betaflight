@@ -795,7 +795,17 @@ FAST_CODE void scheduler(void)
 
 #if defined(USE_LATE_TASK_STATISTICS)
                 if (cyclesOverdue > 0) {
-                    if ((currentTask - tasks) != TASK_SERIAL) {
+                    // Serial-writing tasks (TASK_SERIAL, custom link streams) spend
+                    // unbounded time in the UART write path; their budget estimate
+                    // is meaningless and every run would otherwise count as late,
+                    // tripping the ARMING_DISABLED_LOAD gate.
+                    const taskId_e lateTaskId = currentTask - tasks;
+                    bool lateStatExempt = (lateTaskId == TASK_SERIAL);
+#ifdef USE_CUSTOM_LINK
+                    lateStatExempt = lateStatExempt ||
+                        (lateTaskId >= TASK_CUSTOM_LINK_FAST && lateTaskId <= TASK_CUSTOM_LINK_SLOW);
+#endif
+                    if (!lateStatExempt) {
                         DEBUG_SET(DEBUG_SCHEDULER_DETERMINISM, 1, currentTask - tasks);
                         DEBUG_SET(DEBUG_SCHEDULER_DETERMINISM, 2, clockCyclesTo10thMicros(cyclesOverdue));
                         currentTask->lateCount++;

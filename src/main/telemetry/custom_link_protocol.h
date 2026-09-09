@@ -66,7 +66,10 @@ typedef struct __attribute__((packed)) {
     uint32_t ts_us;             // FC micros() timestamp
     int16_t gyro[3];            // filtered gyro, 0.1 deg/s
     int16_t acc[3];             // accelerometer, 1 mg
-    int16_t attitude[3];        // roll/pitch/yaw euler angles, 0.01 deg
+    int16_t attitude[3];        // roll/pitch/yaw euler angles, 0.01 deg; yaw is a
+                                // right-handed math angle: positive = counter-
+                                // clockwise around body +Z(Up), 0 = magnetic
+                                // north, expressed as -180.00..+180.00 deg
 } clPayloadFast_t;
 
 // 0x11 - 100 Hz barometer, temperature and RC channels (46 bytes)
@@ -74,7 +77,9 @@ typedef struct __attribute__((packed)) {
     uint32_t ts_us;             // FC micros() timestamp
     uint32_t baro_pa;           // absolute pressure, Pa
     int32_t baro_alt_cm;        // barometric altitude, cm
-    int16_t imu_temp_cdeg;      // IMU temperature, 0.01 degC
+    int16_t temp_cdeg;      // fused temperature, 0.01 degC: barometer
+                                // sensor > IMU > ISA estimate (20 degC at sea
+                                // level, -0.6 degC per 100 m climb)
     uint16_t rc[16];            // RC channel pulse widths, us (1000-2000)
 } clPayloadMedium_t;
 

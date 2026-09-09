@@ -35,6 +35,8 @@
 #include "drivers/serial.h"
 #include "drivers/time.h"
 
+#include "scheduler/scheduler.h"
+
 #include "fc/core.h"
 #include "fc/rc_modes.h"
 #include "fc/runtime_config.h"
@@ -280,8 +282,37 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
     }
     fast.attitude[0] = clScaleFloat(attitude.values.roll, 10.0f);                   // 0.01 deg
     fast.attitude[1] = clScaleFloat(attitude.values.pitch, 10.0f);
-    fast.attitude[2] = clScaleFloat(attitude.values.yaw, 10.0f);
+    // Betaflight attitude.values.yaw 是罗盘航向 (0..360, 顺时针为正)。协议输出
+    // 改为右手系数学角：绕机体 +Z(Up) 逆时针为正，0 = 磁北，±180 deg 折返，
+    // 同时满足 i16 (±0.01 deg) 编码范围。
+    int32_t yawCd = -(int32_t)attitude.values.yaw * 10;                             // -36000..0
+    while (yawCd > 18000) {
+        yawCd -= 36000;
+    }
+    while (yawCd < -18000) {
+        yawCd += 36000;
+    }
+    fast.attitude[2] = constrain(yawCd, INT16_MIN, INT16_MAX);
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_FAST, &fast, sizeof(fast));
+
+    // 串口写路径的耗时抖动不应抬调度器对本任务的时间预算需求
+    //（8 kHz gyro 节奏下凑不出大预算窗口，会饥饿降频）。
+    schedulerIgnoreTaskExecTime();
+}
+
+// 温度来源优先级：气压计内部温度（DPS310 等用于补偿的实测值）> IMU 温度 >
+// ISA 估计（海平面 20 degC，每上升 100 m 降 0.6 degC）。读不到以 0 为无效判据
+// （实测环境不会恰好 0.00 degC；无温度寄存器支持的驱动保持为 0）。
+static int32_t customLinkTemperatureCdeg(void)
+{
+    if (baro.temperature != 0) {
+        return baro.temperature;                              // already centidegrees
+    }
+    const int16_t imuTemp = gyroGetTemperature();            // whole degrees C
+    if (imuTemp != 0) {
+        return (int32_t)imuTemp * 100;
+    }
+    return (int32_t)lrintf(2000.0f - getBaroAltitude() * 0.006f);
 }
 
 void customLinkTaskMed(timeUs_t currentTimeUs)
@@ -295,11 +326,13 @@ void customLinkTaskMed(timeUs_t currentTimeUs)
     med.ts_us = (uint32_t)currentTimeUs;
     med.baro_pa = (uint32_t)baro.pressure;
     med.baro_alt_cm = (int32_t)lrintf(getBaroAltitude());
-    med.imu_temp_cdeg = (int16_t)gyroGetTemperature() * 100;                        // 0.01 degC
+    med.temp_cdeg = constrain(customLinkTemperatureCdeg(), INT16_MIN, INT16_MAX); // 0.01 degC
     for (int chan = 0; chan < 16 && chan < MAX_SUPPORTED_RC_CHANNEL_COUNT; chan++) {
         med.rc[chan] = (uint16_t)lrintf(rcData[chan]);
     }
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_MEDIUM, &med, sizeof(med));
+
+    schedulerIgnoreTaskExecTime();
 }
 
 void customLinkTaskSlow(timeUs_t currentTimeUs)
@@ -326,6 +359,8 @@ void customLinkTaskSlow(timeUs_t currentTimeUs)
     slow.status = (ARMING_FLAG(ARMED) ? CL_STATUS_ARMED : 0) |
                   (failsafeIsActive() ? CL_STATUS_FAILSAFE : 0);
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_SLOW, &slow, sizeof(slow));
+
+    schedulerIgnoreTaskExecTime();
 }
 
 #endif // USE_CUSTOM_LINK

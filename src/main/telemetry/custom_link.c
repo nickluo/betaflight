@@ -235,7 +235,30 @@ bool customLinkHostArmActive(void)
 
 float customLinkGetRateSetpoint(int axis)
 {
-    return cachedRate[axis];
+    float rate = cachedRate[axis];
+
+    // Host rate setpoint clamp (deg/s). Applied ahead of the PID loop so the
+    // envelope holds regardless of what the host sends; 0 disables.
+    const uint16_t rateLimit = customLinkConfig()->rate_limit_dps;
+    if (rateLimit != 0) {
+        rate = constrainf(rate, -(float)rateLimit, (float)rateLimit);
+    }
+
+    // Roll/pitch attitude envelope: once the euler angle leaves the limit,
+    // commands that would bank further in the same direction are cut to zero
+    // (recovery-direction commands still pass). Betaflight attitude signs are
+    // aligned with their rate axes (roll: right positive, pitch: nose-up
+    // positive), so the direction comparison is direct. 0 disables.
+    const uint16_t angleLimit = customLinkConfig()->angle_limit_deg;
+    if (axis < FD_YAW && angleLimit != 0) {
+        const float angle = (axis == FD_ROLL ? attitude.values.roll : attitude.values.pitch) * 0.1f;
+        if ((angle > (float)angleLimit && rate > 0.0f) ||
+            (angle < -(float)angleLimit && rate < 0.0f)) {
+            rate = 0.0f;
+        }
+    }
+
+    return rate;
 }
 
 float customLinkGetThrottle(void)

@@ -27,8 +27,18 @@
 #define CUSTOM_LINK_WATCHDOG_MS  50   // 200 Hz stream: 10 consecutive lost frames
 #endif
 
-PG_REGISTER_WITH_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig, PG_CUSTOM_LINK_CONFIG, 0);
+#ifndef CUSTOM_LINK_RATE_LIMIT_DPS
+#define CUSTOM_LINK_RATE_LIMIT_DPS  0  // 0 = unlimited (host is fully trusted)
+#endif
+
+#ifndef CUSTOM_LINK_ANGLE_LIMIT_DEG
+#define CUSTOM_LINK_ANGLE_LIMIT_DEG  0  // 0 = unlimited (host is fully trusted)
+#endif
+
+PG_REGISTER_WITH_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig, PG_CUSTOM_LINK_CONFIG, 1);
 
 PG_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig,
     .watchdog_ms = CUSTOM_LINK_WATCHDOG_MS,
+    .rate_limit_dps = CUSTOM_LINK_RATE_LIMIT_DPS,
+    .angle_limit_deg = CUSTOM_LINK_ANGLE_LIMIT_DEG,
 );

@@ -2115,6 +2115,8 @@ const clivalue_t valueTable[] = {
 
 #ifdef USE_CUSTOM_LINK
     { "custom_link_watchdog_ms",   VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 10, 1000 }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, watchdog_ms) },
+    { "custom_link_rate_limit_dps",  VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 0, 1800 }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, rate_limit_dps) },
+    { "custom_link_angle_limit_deg", VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 0, 89 }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, angle_limit_deg) },
 #endif
 };
 

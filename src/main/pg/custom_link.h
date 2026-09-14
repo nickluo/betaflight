@@ -24,6 +24,8 @@
 
 typedef struct customLinkConfig_s {
     uint16_t watchdog_ms;       // host control stream staleness limit before offboard reverts to RC
+    uint16_t rate_limit_dps;    // host rate setpoint clamp per axis, deg/s; 0 = unlimited
+    uint16_t angle_limit_deg;   // roll/pitch attitude envelope for host control, deg; 0 = unlimited
 } customLinkConfig_t;
 
 PG_DECLARE(customLinkConfig_t, customLinkConfig);

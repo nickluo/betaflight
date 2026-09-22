@@ -1041,7 +1041,18 @@ void processRxModes(timeUs_t currentTimeUs)
     }
 
     bool canUseHorizonMode = true;
-    if ((IS_RC_MODE_ACTIVE(BOXANGLE)
+#ifdef USE_CUSTOM_LINK
+    // OFFBOARD (host control) has priority over the level and hold modes:
+    // while it is engaged ANGLE/HORIZON (and ALT_HOLD/POS_HOLD further below)
+    // must stay off so the host rate setpoints reach the PID loop unmodified
+    // (pidLevel would otherwise overwrite them). When OFFBOARD disengages,
+    // the switch-selected mode re-engages on the next cycle.
+    const bool offboardHasPriority = FLIGHT_MODE(OFFBOARD_MODE);
+#else
+    const bool offboardHasPriority = false;
+#endif
+    if (!offboardHasPriority
+        && (IS_RC_MODE_ACTIVE(BOXANGLE)
         || failsafeIsActive()
 #ifdef USE_ALTITUDE_HOLD
         || FLIGHT_MODE(ALT_HOLD_MODE)
@@ -1058,6 +1069,9 @@ void processRxModes(timeUs_t currentTimeUs)
         }
     } else {
         DISABLE_FLIGHT_MODE(ANGLE_MODE); // failsafe support
+    }
+    if (offboardHasPriority) {
+        canUseHorizonMode = false;
     }
 
 #if defined(USE_GPS_RESCUE) && !ENABLE_RESCUE_PLAN
@@ -1168,6 +1182,8 @@ void processRxModes(timeUs_t currentTimeUs)
     if (ARMING_FLAG(ARMED)
         // and not in GPS_RESCUE_MODE, to give it priority over Altitude Hold
         && !FLIGHT_MODE(GPS_RESCUE_MODE)
+        // and OFFBOARD (host control) has priority over altitude hold
+        && !offboardHasPriority
         // and either the alt_hold switch is activated, or are in failsafe landing mode,
         // or an autopilot mission needs altitude control, or a switch-rescue fallback descent
         && (IS_RC_MODE_ACTIVE(BOXALTHOLD) || failsafeIsActive() || FLIGHT_MODE(AUTOPILOT_MODE) || flightPlanNavIsRescueDescentActive())
@@ -1190,6 +1206,8 @@ void processRxModes(timeUs_t currentTimeUs)
     if (ARMING_FLAG(ARMED)
         // and not in GPS_RESCUE_MODE, to give it priority over Position Hold
         && !FLIGHT_MODE(GPS_RESCUE_MODE)
+        // and OFFBOARD (host control) has priority over position hold
+        && !offboardHasPriority
         // and either the pos_hold switch is activated, or are in failsafe landing mode,
         // or an autopilot mission needs the position controller
         && (IS_RC_MODE_ACTIVE(BOXPOSHOLD) || failsafeIsActive() || FLIGHT_MODE(AUTOPILOT_MODE))
@@ -1209,14 +1227,15 @@ void processRxModes(timeUs_t currentTimeUs)
     // OFFBOARD: host (companion computer) control. The pilot's BOXOFFBOARD
     // switch expresses intent; control engages only while armed, with a fresh
     // host control stream (custom_link_watchdog_ms), no active failsafe, and
-    // no level/hold/autonomy mode claiming priority. Any of those conditions
-    // lapsing (switch off, watchdog expiry, failsafe) reverts to pilot RC.
+    // no safety autonomy claiming priority (GPS rescue, autopilot mission).
+    // OFFBOARD preempts ACRO/ANGLE/HORIZON/ALT_HOLD/POS_HOLD - the blocks
+    // above stand down while it is engaged, and turning the switch off
+    // reverts to the mode selected by the remaining switches.
     if (ARMING_FLAG(ARMED)
         && IS_RC_MODE_ACTIVE(BOXOFFBOARD)
         && customLinkIsControlFresh()
         && !failsafeIsActive()
-        && !FLIGHT_MODE(GPS_RESCUE_MODE | AUTOPILOT_MODE | ALT_HOLD_MODE | POS_HOLD_MODE)
-        && !FLIGHT_MODE(ANGLE_MODE | HORIZON_MODE)) {
+        && !FLIGHT_MODE(GPS_RESCUE_MODE | AUTOPILOT_MODE)) {
         if (!FLIGHT_MODE(OFFBOARD_MODE)) {
             ENABLE_FLIGHT_MODE(OFFBOARD_MODE);
         }

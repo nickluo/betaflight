@@ -1485,7 +1485,7 @@ RAM_CODE static void cliSerial(const char *cmdName, char *cmdline)
             portConfig.gps_baudrateIndex = baudRateIndex;
             break;
         case 2:
-            if (baudRateIndex != BAUD_AUTO && baudRateIndex > BAUD_460800) {
+            if (baudRateIndex != BAUD_AUTO && baudRateIndex > BAUD_921600) {
                 continue;
             }
             portConfig.telemetry_baudrateIndex = baudRateIndex;

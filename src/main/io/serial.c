@@ -311,6 +311,9 @@ void pgResetFn_serialConfig(serialConfig_t *serialConfig)
     serialPortConfig_t *gpsUartConfig = serialFindPortConfigurationMutable(GPS_UART);
     if (gpsUartConfig) {
         gpsUartConfig->functionMask = FUNCTION_GPS;
+#ifdef GPS_UART_BAUDRATE
+        gpsUartConfig->gps_baudrateIndex = GPS_UART_BAUDRATE;
+#endif
     }
 #endif
 

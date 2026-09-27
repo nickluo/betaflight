@@ -320,6 +320,115 @@ TEST(CustomLinkParserTest, TestSeqWrap)
     EXPECT_EQ((unsigned)testRx.lastFrame.seq, 1u);   // 254, 255, 0, 1
 }
 
+TEST(CustomLinkRoundtripTest, TestSimulationFrames)
+{
+    resetParser(10000);
+    uint8_t buf[CUSTOM_LINK_FRAME_MAX];
+    uint8_t len;
+
+    clPayloadMotors_t motors = {};
+    motors.count = 4;
+    motors.motor[0] = 1000;
+    motors.motor[1] = 1250;
+    motors.motor[2] = 1500;
+    motors.motor[3] = 2000;
+    motors.motor[7] = 0xFFFF;
+    len = clEncodeFrame(CUSTOM_LINK_MSG_FC_MOTORS, 11, &motors, sizeof(motors), buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 1000, 10);
+    EXPECT_EQ(testRx.frameCount, 1u);
+    EXPECT_EQ(testRx.lastFrame.msgId, CUSTOM_LINK_MSG_FC_MOTORS);
+    clPayloadMotors_t motorsOut;
+    memcpy(&motorsOut, testRx.lastFrame.payload, sizeof(motorsOut));
+    EXPECT_EQ(motorsOut.count, 4u);
+    EXPECT_EQ(motorsOut.motor[0], 1000u);
+    EXPECT_EQ(motorsOut.motor[3], 2000u);
+    EXPECT_EQ(motorsOut.motor[7], 0xFFFFu);                 // motor domain spans the full u16 range
+
+    clPayloadHostImu_t imu = {};
+    imu.ts_us = 999999;
+    imu.gyro[0] = -32768;
+    imu.gyro[1] = 32767;
+    imu.gyro[2] = 0;
+    imu.acc[2] = 1000;                                       // level: +1 g on Z
+    imu.quat[0] = 16384;                                     // identity attitude, w = 1.0
+    imu.quat[3] = -16384;
+    len = clEncodeFrame(CUSTOM_LINK_MSG_HOST_IMU, 12, &imu, sizeof(imu), buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 5000, 10);
+    EXPECT_EQ(testRx.frameCount, 2u);
+    clPayloadHostImu_t imuOut;
+    memcpy(&imuOut, testRx.lastFrame.payload, sizeof(imuOut));
+    EXPECT_EQ(imuOut.ts_us, imu.ts_us);
+    EXPECT_EQ(imuOut.gyro[0], -32768);
+    EXPECT_EQ(imuOut.gyro[1], 32767);
+    EXPECT_EQ(imuOut.acc[2], 1000);
+    EXPECT_EQ(imuOut.quat[0], 16384);
+    EXPECT_EQ(imuOut.quat[3], -16384);                       // negative quat components survive the roundtrip
+
+    clPayloadHostEnv_t env = {};
+    env.ts_us = 42;
+    env.baro_pa = 101325;
+    env.temp_cdeg = 2500;
+    env.lat_e7 = -23000000;
+    env.lon_e7 = 123456789;
+    env.alt_msl_cm = 123456;
+    env.vel_ned[0] = -100;
+    env.vel_ned[1] = 200;
+    env.vel_ned[2] = -300;
+    env.gspeed_cms = 223;
+    env.course_cdeg = 35999;
+    env.fix = 1;
+    env.sats = 17;
+    len = clEncodeFrame(CUSTOM_LINK_MSG_HOST_ENV, 13, &env, sizeof(env), buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 9000, 10);
+    EXPECT_EQ(testRx.frameCount, 3u);
+    clPayloadHostEnv_t envOut;
+    memcpy(&envOut, testRx.lastFrame.payload, sizeof(envOut));
+    EXPECT_EQ(envOut.baro_pa, 101325u);
+    EXPECT_EQ(envOut.lat_e7, -23000000);
+    EXPECT_EQ(envOut.lon_e7, 123456789);
+    EXPECT_EQ(envOut.alt_msl_cm, 123456);
+    EXPECT_EQ(envOut.vel_ned[2], -300);
+    EXPECT_EQ(envOut.gspeed_cms, 223u);
+    EXPECT_EQ(envOut.course_cdeg, 35999u);
+    EXPECT_EQ(envOut.fix, 1u);
+    EXPECT_EQ(envOut.sats, 17u);
+
+    clPayloadHostRc_t rc = {};
+    rc.ts_us = 7;
+    rc.rc[0] = 1000;
+    rc.rc[3] = 2000;
+    rc.rc[15] = 1500;
+    len = clEncodeFrame(CUSTOM_LINK_MSG_HOST_RC, 14, &rc, sizeof(rc), buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 13000, 10);
+    EXPECT_EQ(testRx.frameCount, 4u);
+    clPayloadHostRc_t rcOut;
+    memcpy(&rcOut, testRx.lastFrame.payload, sizeof(rcOut));
+    EXPECT_EQ(rcOut.rc[0], 1000u);
+    EXPECT_EQ(rcOut.rc[3], 2000u);
+    EXPECT_EQ(rcOut.rc[15], 1500u);
+}
+
+TEST(CustomLinkParserTest, TestUnknownMessageIdStillDelivered)
+{
+    // Compatibility property: the codec has no knowledge of specific message
+    // ids, so hosts and FCs of different protocol generations interoperate -
+    // unknown ids flow through the parser (each side's handler ignores them).
+    resetParser(10000);
+
+    uint8_t payload[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+    uint8_t buf[CUSTOM_LINK_FRAME_MAX];
+    const uint8_t len = clEncodeFrame(0x77, 21, payload, sizeof(payload), buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 1000, 10);
+    EXPECT_EQ(testRx.frameCount, 1u);
+    EXPECT_EQ(testRx.lastFrame.msgId, 0x77);
+    EXPECT_EQ(testRx.lastFrame.len, 4u);
+}
+
 TEST(CustomLinkControlTest, TestArmEdgeDetection)
 {
     clControlState_t state;
@@ -409,7 +518,11 @@ TEST(CustomLinkStructTest, TestPackedLayout)
     EXPECT_EQ(sizeof(clPayloadFast_t), 22u);
     EXPECT_EQ(sizeof(clPayloadMedium_t), 46u);
     EXPECT_EQ(sizeof(clPayloadSlow_t), 36u);
+    EXPECT_EQ(sizeof(clPayloadMotors_t), 17u);
     EXPECT_EQ(sizeof(clPayloadControl_t), 20u);
+    EXPECT_EQ(sizeof(clPayloadHostImu_t), 24u);
+    EXPECT_EQ(sizeof(clPayloadHostEnv_t), 34u);
+    EXPECT_EQ(sizeof(clPayloadHostRc_t), 36u);
     EXPECT_EQ(sizeof(clPayloadTimesyncReq_t), 8u);
     EXPECT_EQ(sizeof(clPayloadTimesyncResp_t), 16u);
 
@@ -419,6 +532,24 @@ TEST(CustomLinkStructTest, TestPackedLayout)
     EXPECT_EQ(offsetof(clPayloadControl_t, mode_req), 11u);
     EXPECT_EQ(offsetof(clPayloadControl_t, throttle), 12u);
     EXPECT_EQ(offsetof(clPayloadControl_t, rate_x10), 14u);
+
+    EXPECT_EQ(offsetof(clPayloadMotors_t, count), 0u);
+    EXPECT_EQ(offsetof(clPayloadMotors_t, motor), 1u);      // packed: no padding after count
+
+    EXPECT_EQ(offsetof(clPayloadHostImu_t, ts_us), 0u);
+    EXPECT_EQ(offsetof(clPayloadHostImu_t, gyro), 4u);
+    EXPECT_EQ(offsetof(clPayloadHostImu_t, acc), 10u);
+    EXPECT_EQ(offsetof(clPayloadHostImu_t, quat), 16u);
+
+    EXPECT_EQ(offsetof(clPayloadHostEnv_t, ts_us), 0u);
+    EXPECT_EQ(offsetof(clPayloadHostEnv_t, baro_pa), 4u);
+    EXPECT_EQ(offsetof(clPayloadHostEnv_t, lat_e7), 10u);
+    EXPECT_EQ(offsetof(clPayloadHostEnv_t, vel_ned), 22u);
+    EXPECT_EQ(offsetof(clPayloadHostEnv_t, fix), 32u);
+    EXPECT_EQ(offsetof(clPayloadHostEnv_t, sats), 33u);
+
+    EXPECT_EQ(offsetof(clPayloadHostRc_t, ts_us), 0u);
+    EXPECT_EQ(offsetof(clPayloadHostRc_t, rc), 4u);
 
     EXPECT_EQ(offsetof(clPayloadTimesyncResp_t, t2_isr_us), 8u);
     EXPECT_EQ(offsetof(clPayloadTimesyncResp_t, t3_tx_us), 12u);

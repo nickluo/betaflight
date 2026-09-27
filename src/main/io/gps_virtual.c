@@ -58,6 +58,14 @@ void setVirtualGPS(double latitude, double longitude, double altiutude, double s
     __atomic_store_n(&updateCount, next, __ATOMIC_RELEASE);
 }
 
+void setVirtualGPSSatellites(uint8_t numSat)
+{
+    // Feeder-supplied satellite count; the default setVirtualGPS feed reports
+    // a fixed 12. Written after the position publish so a reader that sees the
+    // new count also sees matching coordinates.
+    __atomic_store_n(&gpsVirtualData.numSat, numSat, __ATOMIC_RELEASE);
+}
+
 void getVirtualGPS(gpsSolutionData_t *gpsSolData)
 {
     *gpsSolData = gpsVirtualData;

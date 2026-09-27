@@ -56,7 +56,11 @@ typedef enum {
     CUSTOM_LINK_MSG_FC_FAST        = 0x10,   // 200 Hz gyro/acc/attitude
     CUSTOM_LINK_MSG_FC_MEDIUM      = 0x11,   // 100 Hz baro/temperature/rc channels
     CUSTOM_LINK_MSG_FC_SLOW        = 0x12,   // 10 Hz battery/gps/flight mode
+    CUSTOM_LINK_MSG_FC_MOTORS      = 0x13,   // 200 Hz mixer motor outputs (SITL)
     CUSTOM_LINK_MSG_HOST_CONTROL   = 0x20,   // 100-200 Hz control setpoints
+    CUSTOM_LINK_MSG_HOST_IMU       = 0x21,   // >=200 Hz simulator IMU injection (SITL)
+    CUSTOM_LINK_MSG_HOST_ENV       = 0x22,   // 10-50 Hz simulator baro/GPS injection (SITL)
+    CUSTOM_LINK_MSG_HOST_RC        = 0x23,   // 50 Hz simulator RC channel injection (SITL)
     CUSTOM_LINK_MSG_HOST_TIMESYNC  = 0x30,   // time sync request (u64 T1)
     CUSTOM_LINK_MSG_FC_TIMESYNC    = 0x31,   // time sync response (T1, T2, T3)
 } customLinkMsgId_e;
@@ -124,6 +128,53 @@ typedef struct __attribute__((packed)) {
     uint32_t t2_isr_us;         // FC micros() captured in the RX ISR when the request completed
     uint32_t t3_tx_us;          // FC micros() captured immediately before the response was sent
 } clPayloadTimesyncResp_t;
+
+//
+// Simulation frames (SITL). A simulator acting as the host replaces the real
+// sensors: 0x21/0x22/0x23 feed the virtual sensor drivers (the same path the
+// UDP FDM bridge uses on SITL targets) and 0x13 returns the mixer motor
+// outputs. Axes/units mirror the telemetry frames above so a host can feed
+// back what it once decoded: Betaflight body conventions (gyro: roll right +,
+// pitch nose-down +, yaw clockwise-from-above +; acc Z +1 g level), gyro
+// 0.1 deg/s, acc 1 mg. The quaternion is the Betaflight internal attitude
+// quaternion (FLU body to NWU world, i.e. euler extraction below yields
+// attitude.values); each component is scaled by 16384.
+//
+
+// 0x13 - mixer motor outputs (17 bytes)
+typedef struct __attribute__((packed)) {
+    uint8_t count;              // number of valid motor entries
+    uint16_t motor[8];          // external motor values, us domain (as MSP_MOTOR)
+} clPayloadMotors_t;
+
+// 0x21 - simulator IMU injection (24 bytes)
+typedef struct __attribute__((packed)) {
+    uint32_t ts_us;             // simulator timestamp
+    int16_t gyro[3];            // body angular rate, 0.1 deg/s
+    int16_t acc[3];             // body specific force, 1 mg (level: z = +1000)
+    int16_t quat[4];            // attitude quaternion w/x/y/z, x 16384
+} clPayloadHostImu_t;
+
+// 0x22 - simulator environment injection (34 bytes)
+typedef struct __attribute__((packed)) {
+    uint32_t ts_us;             // simulator timestamp
+    uint32_t baro_pa;           // absolute pressure, Pa
+    int16_t temp_cdeg;          // temperature, 0.01 degC (0 = sensor default)
+    int32_t lat_e7;             // latitude, deg * 1e7
+    int32_t lon_e7;             // longitude, deg * 1e7
+    int32_t alt_msl_cm;         // altitude above mean sea level, cm
+    int16_t vel_ned[3];         // NED velocity, cm/s
+    uint16_t gspeed_cms;        // ground speed, cm/s
+    uint16_t course_cdeg;       // ground course, 0.01 deg
+    uint8_t fix;                // 0 = no fix, 1 = 3D fix
+    uint8_t sats;               // satellites in use
+} clPayloadHostEnv_t;
+
+// 0x23 - simulator RC channel injection (36 bytes)
+typedef struct __attribute__((packed)) {
+    uint32_t ts_us;             // simulator timestamp
+    uint16_t rc[16];            // RC channel pulse widths, us (1000-2000)
+} clPayloadHostRc_t;
 
 typedef struct {
     uint8_t msgId;

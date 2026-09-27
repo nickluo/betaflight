@@ -35,10 +35,17 @@
 #define CUSTOM_LINK_ANGLE_LIMIT_DEG  0  // 0 = unlimited (host is fully trusted)
 #endif
 
-PG_REGISTER_WITH_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig, PG_CUSTOM_LINK_CONFIG, 1);
+#ifdef SIMULATOR
+#define CUSTOM_LINK_MOTORS_STREAM 1     // SITL: the simulator needs the mixer outputs
+#else
+#define CUSTOM_LINK_MOTORS_STREAM 0     // real hardware: opt-in only (extra downlink bandwidth)
+#endif
+
+PG_REGISTER_WITH_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig, PG_CUSTOM_LINK_CONFIG, 2);
 
 PG_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig,
     .watchdog_ms = CUSTOM_LINK_WATCHDOG_MS,
     .rate_limit_dps = CUSTOM_LINK_RATE_LIMIT_DPS,
     .angle_limit_deg = CUSTOM_LINK_ANGLE_LIMIT_DEG,
+    .motors_stream = CUSTOM_LINK_MOTORS_STREAM,
 );

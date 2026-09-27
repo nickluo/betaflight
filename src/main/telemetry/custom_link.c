@@ -32,6 +32,7 @@
 #include "common/time.h"
 #include "common/utils.h"
 
+#include "drivers/motor.h"
 #include "drivers/serial.h"
 #include "drivers/time.h"
 
@@ -43,6 +44,7 @@
 
 #include "flight/failsafe.h"
 #include "flight/imu.h"
+#include "flight/mixer.h"
 
 #include "io/gps.h"
 #include "io/serial.h"
@@ -56,10 +58,30 @@
 #include "sensors/battery.h"
 #include "sensors/gyro.h"
 
+#ifdef SIMULATOR
+// Simulator sensor injection (0x21/0x22/0x23) feeds the same virtual sensor
+// drivers the UDP FDM bridge uses; these headers exist on every target but
+// the symbols only link on SITL builds, so all references stay inside
+// #ifdef SIMULATOR / USE_VIRTUAL_* guards.
+#include <stdio.h>
+
+#include "drivers/accgyro/accgyro_virtual.h"
+#include "drivers/barometer/barometer_virtual.h"
+#include "drivers/compass/compass_virtual.h"
+#include "io/gps_virtual.h"
+#endif
+
 #include "telemetry/custom_link.h"
 #include "telemetry/custom_link_protocol.h"
 
-#define CL_RX_RING_LEN          4       // completed uplink frames buffered from ISR to task
+// Completed uplink frames buffered from ISR/parser to the 200 Hz task. A
+// simulator host injects 0x21/0x22/0x23 alongside 0x20 (~400 frames/s total,
+// bursty against the task period), so SITL builds get extra headroom.
+#ifdef SIMULATOR
+#define CL_RX_RING_LEN          8
+#else
+#define CL_RX_RING_LEN          4
+#endif
 
 typedef struct {
     clFrame_t frame;
@@ -142,6 +164,119 @@ static int16_t clScaleFloat(float v, float scale)
     return constrain((int32_t)lrintf(v * scale), INT16_MIN, INT16_MAX);
 }
 
+#ifdef SIMULATOR
+// Simulator sensor injection. A simulator host replaces the real sensors by
+// streaming 0x21/0x22/0x23 frames; they reach the firmware through the same
+// virtual sensor drivers as the UDP FDM bridge (sitl.c), so scale/sign
+// conventions are kept identical to that path: 1 dps = 16.4 gyro counts,
+// 1 g = acc_1G counts, level accelerometer = +1000 mg on Z.
+
+#define CL_SIM_GYRO_SCALE       16.4f   // sitl.c GYRO_SCALE
+#define CL_SIM_QUAT_SCALE       16384.0f
+
+static void customLinkInjectImu(const clPayloadHostImu_t *imu)
+{
+#if defined(USE_VIRTUAL_GYRO)
+    if (virtualGyroDev) {
+        int16_t gyroAdc[XYZ_AXIS_COUNT];
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            const float dps = imu->gyro[axis] * 0.1f;
+            gyroAdc[axis] = constrain((int32_t)lrintf(dps * CL_SIM_GYRO_SCALE), INT16_MIN, INT16_MAX);
+        }
+        virtualGyroSet(virtualGyroDev, gyroAdc[X], gyroAdc[Y], gyroAdc[Z]);
+    }
+#endif
+#if defined(USE_VIRTUAL_ACC)
+    if (virtualAccDev) {
+        int16_t accAdc[XYZ_AXIS_COUNT];
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            const float g = imu->acc[axis] / 1000.0f;
+            accAdc[axis] = constrain((int32_t)lrintf(g * acc.dev.acc_1G), INT16_MIN, INT16_MAX);
+        }
+        virtualAccSet(virtualAccDev, accAdc[X], accAdc[Y], accAdc[Z]);
+    }
+#endif
+
+    const float qw = imu->quat[0] / CL_SIM_QUAT_SCALE;
+    const float qx = imu->quat[1] / CL_SIM_QUAT_SCALE;
+    const float qy = imu->quat[2] / CL_SIM_QUAT_SCALE;
+    const float qz = imu->quat[3] / CL_SIM_QUAT_SCALE;
+
+#if defined(USE_VIRTUAL_MAG)
+    {
+        // Synthetic earth field, NWU, 4096 counts (same model as sitl.c):
+        // 60 deg inclination, 2 deg east declination so every body component
+        // is generically nonzero. v_body = R(q)^T * v_world.
+        static const float fieldN = 2046.8f;
+        static const float fieldW = -71.5f;
+        static const float fieldU = -3547.2f;
+        const float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);
+        const float r01 = 2.0f * (qx * qy - qw * qz);
+        const float r02 = 2.0f * (qx * qz + qw * qy);
+        const float r10 = 2.0f * (qx * qy + qw * qz);
+        const float r11 = 1.0f - 2.0f * (qx * qx + qz * qz);
+        const float r12 = 2.0f * (qy * qz - qw * qx);
+        const float r20 = 2.0f * (qx * qz - qw * qy);
+        const float r21 = 2.0f * (qy * qz + qw * qx);
+        const float r22 = 1.0f - 2.0f * (qx * qx + qy * qy);
+        const float magX = r00 * fieldN + r10 * fieldW + r20 * fieldU;
+        const float magY = r01 * fieldN + r11 * fieldW + r21 * fieldU;
+        const float magZ = r02 * fieldN + r12 * fieldW + r22 * fieldU;
+        virtualMagSet(lrintf(magX), lrintf(magY), lrintf(magZ));
+    }
+#endif
+
+#if !defined(USE_IMU_CALC)
+    // Direct-attitude builds (SITL_ATTITUDE_DIRECT); by default SITL runs the
+    // real estimator on the injected gyro/acc/mag instead.
+    imuSetAttitudeQuat(qw, qx, qy, qz);
+#else
+    UNUSED(qw);
+    UNUSED(qx);
+    UNUSED(qy);
+    UNUSED(qz);
+#endif
+}
+
+static void customLinkInjectEnv(const clPayloadHostEnv_t *env)
+{
+#if defined(USE_VIRTUAL_BARO)
+    if (env->baro_pa != 0) {
+        virtualBaroSet((int32_t)env->baro_pa, env->temp_cdeg);
+    }
+#endif
+#if defined(USE_VIRTUAL_GPS)
+    if (env->fix != 0 && env->sats != 0) {
+        const double latitude = (double)env->lat_e7 / 1e7;
+        const double longitude = (double)env->lon_e7 / 1e7;
+        const double altitude = (double)env->alt_msl_cm / 100.0;
+        const double velN = (double)env->vel_ned[0] / 100.0;
+        const double velE = (double)env->vel_ned[1] / 100.0;
+        const double velD = (double)env->vel_ned[2] / 100.0;
+        const double speed = sqrt(velN * velN + velE * velE);
+        const double speed3D = sqrt(velN * velN + velE * velE + velD * velD);
+        const double course = (double)env->course_cdeg / 100.0;
+        setVirtualGPS(latitude, longitude, altitude, speed, speed3D, course, velN, velE, velD);
+        setVirtualGPSSatellites(env->sats);
+    }
+#endif
+}
+
+static void customLinkInjectRc(const clPayloadHostRc_t *rc)
+{
+#if ENABLE_RX_UDP
+    // Same entry point as the UDP RC bridge: latches the channel array and
+    // marks one RC frame complete for the rx task. Copied out of the packed
+    // payload to avoid taking the address of a packed member.
+    uint16_t channels[ARRAYLEN(rc->rc)];
+    memcpy(channels, rc->rc, sizeof(channels));
+    rxUpdateUdpChannels(channels, ARRAYLEN(channels));
+#else
+    UNUSED(rc);
+#endif
+}
+#endif // SIMULATOR
+
 static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
 {
     switch (frame->msgId) {
@@ -173,6 +308,35 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
         }
         break;
     }
+
+#ifdef SIMULATOR
+    case CUSTOM_LINK_MSG_HOST_IMU: {
+        clPayloadHostImu_t imu;
+        if (frame->len == sizeof(imu)) {
+            memcpy(&imu, frame->payload, sizeof(imu));
+            customLinkInjectImu(&imu);
+        }
+        break;
+    }
+
+    case CUSTOM_LINK_MSG_HOST_ENV: {
+        clPayloadHostEnv_t env;
+        if (frame->len == sizeof(env)) {
+            memcpy(&env, frame->payload, sizeof(env));
+            customLinkInjectEnv(&env);
+        }
+        break;
+    }
+
+    case CUSTOM_LINK_MSG_HOST_RC: {
+        clPayloadHostRc_t rc;
+        if (frame->len == sizeof(rc)) {
+            memcpy(&rc, frame->payload, sizeof(rc));
+            customLinkInjectRc(&rc);
+        }
+        break;
+    }
+#endif // SIMULATOR
 
     default:
         break;
@@ -318,6 +482,26 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
     fast.attitude[2] = constrain(yawCd, INT16_MIN, INT16_MAX);
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_FAST, &fast, sizeof(fast));
 
+#ifdef USE_MOTOR
+    // Mixer motor outputs for the simulator (0x13). External values in the us
+    // domain, exactly what MSP_MOTOR reports, so a host normalizes the same
+    // way for both protocols. Opt-in via custom_link_motors_stream (default
+    // on for SITL builds, off for real hardware).
+    if (customLinkConfig()->motors_stream && motorIsEnabled()) {
+        clPayloadMotors_t motors;
+        memset(&motors, 0, sizeof(motors));
+        motors.count = getMotorCount();
+        if (motors.count > ARRAYLEN(motors.motor)) {
+            motors.count = ARRAYLEN(motors.motor);
+        }
+        for (uint8_t i = 0; i < motors.count; i++) {
+            const uint16_t value = motorIsMotorEnabled(i) ? motorConvertToExternal(motor[i]) : 0;
+            motors.motor[i] = value;
+        }
+        customLinkSendFrame(CUSTOM_LINK_MSG_FC_MOTORS, &motors, sizeof(motors));
+    }
+#endif
+
     // 串口写路径的耗时抖动不应抬调度器对本任务的时间预算需求
     //（8 kHz gyro 节奏下凑不出大预算窗口，会饥饿降频）。
     schedulerIgnoreTaskExecTime();
@@ -382,6 +566,27 @@ void customLinkTaskSlow(timeUs_t currentTimeUs)
     slow.status = (ARMING_FLAG(ARMED) ? CL_STATUS_ARMED : 0) |
                   (failsafeIsActive() ? CL_STATUS_FAILSAFE : 0);
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_SLOW, &slow, sizeof(slow));
+
+#ifdef SIMULATOR
+    // Pure custom-link SITL sessions never run updateState()'s 1 Hz status
+    // print (no UDP FDM arrives), so surface arming blockers here instead.
+    static uint32_t lastArmingDebugMs;
+    const uint32_t nowMs = millis();
+    if (cmp32(nowMs, lastArmingDebugMs) >= 1000 && ARMING_FLAG(ARMED) == 0) {
+        lastArmingDebugMs = nowMs;
+        const armingDisableFlags_e flags = getArmingDisableFlags();
+        if (flags != 0) {
+            printf("[SITL] t=%dms Arming disabled:", (int)millis());
+            for (unsigned i = 0; i < ARMING_DISABLE_FLAGS_COUNT; i++) {
+                const armingDisableFlags_e flag = (1 << i);
+                if (flags & flag) {
+                    printf(" %s", getArmingDisableFlagName(flag));
+                }
+            }
+            printf("\n");
+        }
+    }
+#endif
 
     schedulerIgnoreTaskExecTime();
 }

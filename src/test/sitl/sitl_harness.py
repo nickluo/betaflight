@@ -21,6 +21,7 @@ import argparse
 import json
 import math
 import os
+import select
 import shutil
 import socket
 import struct
@@ -58,6 +59,7 @@ RC_LOW = 1000
 RC_HIGH = 2000
 
 VERBOSE = False
+JOYSTICK_DEVICE = None  # set from --joystick; swaps RcFeed for JoystickRcFeed
 TELEMETRY_PORT = 9005  # ground-truth JSON fan-out for external visualisers, 0 disables
 
 
@@ -96,6 +98,82 @@ class RcFeed(threading.Thread):
 
     def shutdown(self):
         self.running = False
+
+
+class JoystickRcFeed:
+    """RcFeed replacement that sources channels from a Linux joystick.
+
+    Used by the 'manual' scenario with --joystick: a radio in USB joystick
+    mode (see sitl_joystick.py) becomes the pilot's RC via the same UDP 9004
+    protocol. The mapping lives in sitl_joystick.JoystickState; this class
+    only wires it into the harness feed lifecycle. Programmatic rc.set()
+    calls make no sense against a human's sticks and are refused loudly
+    rather than silently fighting the pilot.
+    """
+
+    def __init__(self, device="/dev/input/js0"):
+        import sitl_joystick  # local: only needed for manual flight
+
+        fd, info = sitl_joystick.open_joystick(device)
+        os.close(fd)  # the constructor only queries the layout
+        self.state = sitl_joystick.JoystickState(sitl_joystick.default_mapping(info))
+        self.device = device
+        self.fd = None
+        self.reader = None
+        self.sender = None
+        self._stopping = None
+
+    def start(self):
+        import sitl_joystick
+
+        self.fd, _ = sitl_joystick.open_joystick(self.device)
+        state = self.state
+        sender = sitl_joystick.RcSender(state.channels, ("127.0.0.1", RC_PORT))
+        self.sender = sender
+
+        def reader():
+            rem = b""
+            while not self._stopping.is_set():
+                r, _, _ = select.select([self.fd], [], [], 0.1)
+                if not r:
+                    continue
+                try:
+                    data = os.read(self.fd, sitl_joystick.JS_EVENT_SIZE * 64)
+                except OSError:
+                    break
+                if not data:
+                    break
+                events, rem = sitl_joystick.parse_event_stream(rem + data)
+                for ev in events:
+                    state.feed(ev)
+            # reader death (device unplugged or shutdown) must end the RC
+            # stream: a frozen 50 Hz sender would hold the last channels
+            # forever and SITL failsafe could never engage
+            sender.stop()
+            if not self._stopping.is_set():
+                log("joystick device went away; RC stream stopped - SITL failsafe takes over")
+
+        self._stopping = threading.Event()
+        self.reader = threading.Thread(target=reader, daemon=True)
+        self.reader.start()
+        sender.start()
+
+    def set(self, index, value):
+        raise RuntimeError("JoystickRcFeed is pilot-owned; rc.set() is not available")
+
+    def describe(self):
+        return self.state.describe()
+
+    def shutdown(self):
+        if self._stopping is not None:
+            self._stopping.set()
+        if self.reader is not None:
+            self.reader.join(timeout=1.0)
+        if self.sender is not None:
+            self.sender.stop()
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 class MotorFeed(threading.Thread):
@@ -684,6 +762,70 @@ def base_config(extra):
         # 10 m above home, 5 m/s — low and quick keeps landing scenarios short
         f"waypoint insert 0 {WP_LAT:.7f} {HOME_LON:.7f} {int((HOME_ALT_M + 10) * 100)} 500 flyover 0 none",
     ] + extra
+
+
+def joystick_config(extra):
+    """Aux table for the sitl_joystick.py bridge layout (permanent box ids).
+
+    The 6-pos dial owns AUX1 with the firmware's native 200 us bands
+    (fc/rc_adjustments.c), the 3-pos toggle owns AUX2, the ARM switch
+    owns AUX3 and the Trigger button owns AUX4 (left unbound; add
+    e.g. PREARM(36)/BEEPER(13) ranges on aux index 3 as needed).
+    Arming requires the dial outside the ALTHOLD/POSHOLD positions.
+    """
+    from sitl_joystick import CLI_CONFIG_LINES
+
+    return [
+        "feature GPS",
+        "set gps_provider = VIRTUAL",
+        "set failsafe_procedure = AUTO-LAND",
+        "set failsafe_delay = 10",
+        "set small_angle = 180",
+        "set trust_mag = ON",
+    ] + list(CLI_CONFIG_LINES) + extra
+
+
+MODE_NAMES = {0: "ARM", 1: "ANGLE", 2: "HORIZON", 3: "ALTHOLD", 11: "POSHOLD",
+              46: "GPSRESCUE", 56: "AUTOPILOT", 58: "OFFBOARD"}
+
+
+def scenario_manual(sitl, rc, fdm):
+    """Interactive free flight with the joystick bridge as the RC source.
+
+    Run with --joystick /dev/input/jsN --scenario manual. The human arms and
+    flies; this body only keeps the physics feed alive and prints status
+    until interrupted. Modes print as permanent box ids (MODE_NAMES).
+    """
+    rc.start()
+    fdm.start()
+
+    # guidance first: the boot gate below reads the dial/throttle state, so
+    # the pilot needs to know the arming requirements before it can time out
+    log("manual flight: arm with the radio ARM button (throttle low, dial out of")
+    log("ALTHOLD/POSHOLD), fly, then Ctrl-C to end (failsafe AUTO-LAND takes over)")
+    try:
+        wait_for("GPS fix + RX recovery (arming flags clear)",
+                 lambda: sitl.status()["arming_flags"] == 0, timeout=40)
+        # same recalibration as boot_and_engage: the boot-time acc calibration
+        # can capture offsets from a not-yet-settled FDM feed
+        sitl.acc_calibrate()
+        time.sleep(2.0)
+        wait_for("recalibration complete", lambda: sitl.status()["arming_flags"] == 0, timeout=20)
+
+        last = 0.0
+        while True:
+            if time.monotonic() - last >= 0.5:
+                last = time.monotonic()
+                st = sitl.status()
+                modes = [MODE_NAMES.get(m, str(m)) for m in sorted(st["modes"])]
+                log("armed={:>5}  modes={:<28} alt={:5.1f} m  pos=({:+6.1f},{:+6.1f}) m  {}".format(
+                    BOX_ARM in st["modes"], ",".join(modes) or "-",
+                    fdm.model.pos[2], fdm.model.pos[0], fdm.model.pos[1],
+                    rc.describe()))
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        log("manual flight ended by user")
+    return {}
 
 
 def boot_and_engage(sitl, rc, fdm):
@@ -1536,6 +1678,9 @@ SCENARIOS = {
         scenario_rescue_switch_descent,
         [*RESCUE_CFG, "aux 5 46 4 1700 2100 0 0"],   # BOXGPSRESCUE on AUX5
     ),
+    # interactive human-in-the-loop flight: excluded from --scenario all,
+    # run explicitly as `--scenario manual --joystick /dev/input/js0`
+    "manual": (scenario_manual, [], {"joystick_only": True, "joystick_config": True}),
 }
 
 
@@ -1557,11 +1702,12 @@ def run_leg(name, variant, body, extra_cfg, opts, binary, leg_dir):
     try:
         # feed construction can fail (port 9002 bind); it must fail the
         # scenario, not abort the suite
-        rc = RcFeed()
+        rc = JoystickRcFeed(JOYSTICK_DEVICE) if JOYSTICK_DEVICE else RcFeed()
         motors = MotorFeed()
         poller = StatusPoller(sitl) if TELEMETRY_PORT else None
         fdm = FdmFeed(motors, initial_yaw_deg=opts.get("initial_yaw_deg", 0.0), status=poller)
-        sitl.provision(base_config(extra_cfg))
+        config_fn = joystick_config if opts.get("joystick_config") else base_config
+        sitl.provision(config_fn(extra_cfg))
         sitl.start()
         motors.start()
         if poller:
@@ -1604,7 +1750,7 @@ def run_scenario(name, binary, workdir, binary_b=None):
 
 
 def main():
-    global VERBOSE, TELEMETRY_PORT
+    global VERBOSE, TELEMETRY_PORT, JOYSTICK_DEVICE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--binary", required=True, help="path to betaflight_SITL.elf (built with USE_FLIGHT_PLAN)")
     ap.add_argument("--binary-b", help="rescue-plan binary (-DENABLE_RESCUE_PLAN=1) for A/B scenarios")
@@ -1612,13 +1758,25 @@ def main():
     ap.add_argument("--workdir", default="/tmp/sitl_harness")
     ap.add_argument("--telemetry-port", type=int, default=TELEMETRY_PORT,
                     help="UDP port for ground-truth JSON telemetry (0 disables)")
+    ap.add_argument("--joystick", help="joystick device for --scenario manual "
+                    "(RC source replaces the scripted RcFeed; see sitl_joystick.py)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     VERBOSE = args.verbose
     TELEMETRY_PORT = args.telemetry_port
+    JOYSTICK_DEVICE = args.joystick
+
+    if JOYSTICK_DEVICE and args.scenario != "manual":
+        ap.error("--joystick only makes sense with --scenario manual (scripted "
+                 "scenarios drive the RC channels themselves)")
 
     os.makedirs(args.workdir, exist_ok=True)
-    names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    # interactive human-in-the-loop scenarios never run as part of 'all'
+    names = ([n for n, spec in SCENARIOS.items()
+              if not (len(spec) > 2 and spec[2].get("joystick_only"))]
+             if args.scenario == "all" else [args.scenario])
+    if args.scenario == "manual" and not JOYSTICK_DEVICE:
+        ap.error("--scenario manual requires --joystick /dev/input/jsN")
     results = {name: run_scenario(name, args.binary, args.workdir, args.binary_b) for name in names}
 
     log("--- summary")

@@ -66,3 +66,5 @@ eeprom.bin
 AGENTS.md
 CLAUDE.md
 /tasks
+
+__pycache__/

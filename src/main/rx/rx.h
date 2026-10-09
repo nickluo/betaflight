@@ -178,6 +178,8 @@ extern rxRuntimeState_t rxRuntimeState; //!!TODO remove this extern, only needed
 void rxInit(void);
 #if ENABLE_RX_UDP
 void rxUpdateUdpChannels(const uint16_t *channels, uint8_t channelCount);
+void rxNoteUdpBridgeRcFrame(void);
+bool rxUdpBridgeRcFresh(void);
 #endif
 void rxProcessPending(bool state);
 bool rxUpdateCheck(timeUs_t currentTimeUs, timeDelta_t currentDeltaTimeUs);

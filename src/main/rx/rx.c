@@ -229,6 +229,29 @@ void rxUpdateUdpChannels(const uint16_t *channels, uint8_t channelCount)
     udpChannelCount = count;
     udpFrameReceived = true;
 }
+
+// RC source arbitration: while the native UDP RC bridge (the simulator's
+// port 9004, fed e.g. by a host joystick tool) is streaming, the custom-link
+// HOST_RC injector defers to it, because both write this shared channel
+// latch and the last writer wins per frame. The freshness window is shorter
+// than RXLOSS_TRIGGER_INTERVAL (150 ms) so handing control back to the
+// custom-link stream when the bridge stops completes before RX loss fires.
+// The unsigned subtraction is millis()-rollover safe; lastFrameMs == 0 also
+// reads fresh during the first 100 ms after boot, which is harmless (the
+// custom-link transport is never up that early).
+#define UDP_BRIDGE_RC_FRESH_MS 100
+
+static uint32_t udpBridgeRcLastFrameMs;
+
+void rxNoteUdpBridgeRcFrame(void)
+{
+    udpBridgeRcLastFrameMs = millis();
+}
+
+bool rxUdpBridgeRcFresh(void)
+{
+    return millis() - udpBridgeRcLastFrameMs < UDP_BRIDGE_RC_FRESH_MS;
+}
 #endif
 
 STATIC_UNIT_TESTED bool isPulseValid(uint16_t pulseDuration)

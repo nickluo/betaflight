@@ -554,6 +554,7 @@ static void *udpRCThread(void *data)
                 rc_received = true;
             }
             rxUpdateUdpChannels(rcPkt.channels, SIMULATOR_MAX_RC_CHANNELS);
+            rxNoteUdpBridgeRcFrame();
         }
     }
 

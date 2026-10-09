@@ -265,6 +265,13 @@ static void customLinkInjectEnv(const clPayloadHostEnv_t *env)
 static void customLinkInjectRc(const clPayloadHostRc_t *rc)
 {
 #if ENABLE_RX_UDP
+    // RC arbitration: a live UDP RC bridge (host joystick tool on the
+    // simulator's port 9004) owns the channels while it streams, so two
+    // sources cannot fight over the shared latch; rxUdpBridgeRcFresh()
+    // hands authority back once the bridge goes quiet.
+    if (rxUdpBridgeRcFresh()) {
+        return;
+    }
     // Same entry point as the UDP RC bridge: latches the channel array and
     // marks one RC frame complete for the rx task. Copied out of the packed
     // payload to avoid taking the address of a packed member.
@@ -411,7 +418,7 @@ float customLinkGetRateSetpoint(int axis)
     // Roll/pitch attitude envelope: once the euler angle leaves the limit,
     // commands that would bank further in the same direction are cut to zero
     // (recovery-direction commands still pass). Betaflight attitude signs are
-    // aligned with their rate axes (roll: right positive, pitch: nose-up
+    // aligned with their rate axes (roll: right positive, pitch: nose-down
     // positive), so the direction comparison is direct. 0 disables.
     const uint16_t angleLimit = customLinkConfig()->angle_limit_deg;
     if (axis < FD_YAW && angleLimit != 0) {

@@ -68,9 +68,12 @@ typedef enum {
 // 0x10 - 200 Hz IMU and attitude (22 bytes)
 typedef struct __attribute__((packed)) {
     uint32_t ts_us;             // FC micros() timestamp
-    int16_t gyro[3];            // filtered gyro, 0.1 deg/s
-    int16_t acc[3];             // accelerometer, 1 mg
-    int16_t attitude[3];        // roll/pitch/yaw euler angles, 0.01 deg; yaw is a
+    int16_t gyro[3];            // filtered gyro, 0.1 deg/s (roll right +,
+                                // pitch nose-down +, yaw CCW +)
+    int16_t acc[3];             // accelerometer, 1 mg (FLU: X fwd, Y LEFT, Z up;
+                                // level reads +1000 on Z)
+    int16_t attitude[3];        // roll/pitch/yaw euler angles, 0.01 deg:
+                                // roll right +, pitch NOSE-DOWN +; yaw is a
                                 // right-handed math angle: positive = counter-
                                 // clockwise around body +Z(Up), 0 = magnetic
                                 // north, expressed as -180.00..+180.00 deg
@@ -114,7 +117,9 @@ typedef struct __attribute__((packed)) {
     uint8_t arm;                // 0 = request disarm, 1 = request arm
     uint8_t mode_req;           // 0 = manual/rate, 1 = angle, 2 = offboard override
     uint16_t throttle;          // throttle, us-style 1000-2000 (clamped)
-    int16_t rate_x10[3];        // roll/pitch/yaw rate targets, 0.1 deg/s
+    int16_t rate_x10[3];        // roll/pitch/yaw rate targets, 0.1 deg/s,
+                                // in the same frame as the 0x10 gyro: roll
+                                // right +, pitch nose-down +, yaw CCW +
 } clPayloadControl_t;
 
 // 0x30 - time sync request (8 bytes)
@@ -134,11 +139,21 @@ typedef struct __attribute__((packed)) {
 // sensors: 0x21/0x22/0x23 feed the virtual sensor drivers (the same path the
 // UDP FDM bridge uses on SITL targets) and 0x13 returns the mixer motor
 // outputs. Axes/units mirror the telemetry frames above so a host can feed
-// back what it once decoded: Betaflight body conventions (gyro: roll right +,
-// pitch nose-down +, yaw clockwise-from-above +; acc Z +1 g level), gyro
-// 0.1 deg/s, acc 1 mg. The quaternion is the Betaflight internal attitude
-// quaternion (FLU body to NWU world, i.e. euler extraction below yields
-// attitude.values); each component is scaled by 16384.
+// back what it once decoded. The Betaflight body conventions, confirmed
+// end-to-end (closed loop) by src/test/sitl/sitl_custom_link_frames_test.py:
+//
+//   gyro   = FLU angular velocity, verbatim: roll right +, pitch nose-down +
+//            (both are the FLU right-handed +axis rotation), yaw CCW +
+//            (note fc/rc.c negates the yaw stick, so a positive 0x20 yaw
+//            rate command yaws LEFT; stick-right = negative)
+//   acc    = FLU specific force: X forward +, Y LEFT +, Z up + (+1 g level)
+//   euler  roll right +, pitch nose-down + (FLU algebra), yaw right-handed
+//          math angle (CCW +, 0 = north)
+//
+// gyro 0.1 deg/s, acc 1 mg. The quaternion is the Betaflight internal
+// attitude quaternion (its euler extraction yields attitude.values above;
+// relative to a plain FLU->world quaternion, the y and z components are
+// negated); each component is scaled by 16384.
 //
 
 // 0x13 - mixer motor outputs (17 bytes)

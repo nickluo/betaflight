@@ -9,10 +9,67 @@ import unittest
 from unittest.mock import Mock
 
 import airsim_control_test as control
+import airsim_offboard_test as offboard
 import sitl_joystick as joystick
 
 
 class ControlRunnerTest(unittest.TestCase):
+    def test_offboard_host_controller_uses_flu_pitch_and_vertical_feedback(self):
+        rates, throttle = offboard.rate_throttle(5, 5, 2, 0, 2, 0.59)
+        self.assertLess(rates[0], 0)
+        self.assertGreater(rates[1], 0)
+        self.assertGreater(throttle, 0.59)
+        _, climb = offboard.rate_throttle(0, 0, 1, 0, 2, 0.59)
+        _, descend = offboard.rate_throttle(0, 0, 3, 0, 2, 0.59)
+        self.assertGreater(climb, 0.59)
+        self.assertLess(descend, 0.59)
+        _, braking = offboard.rate_throttle(0, 0, 2, 1, 2, 0.59)
+        self.assertGreater(braking, 0.59)
+
+    def test_offboard_rate_override_and_bounds(self):
+        rates, throttle = offboard.rate_throttle(30, 30, -10, 10, 2, 0.59, (2, 0.35))
+        self.assertEqual(rates, (-0.5, 0.5, 0.35))
+        self.assertEqual(throttle, 0.78)
+
+    def test_offboard_touchdown_requires_fresh_ground_contact_and_low_velocity(self):
+        collision = SimpleNamespace(has_collided=True, time_stamp=200, normal=SimpleNamespace(z_val=-1))
+        self.assertTrue(offboard.touchdown_confirmed(collision, 100, (0, 0, 0)))
+        self.assertFalse(offboard.touchdown_confirmed(collision, 200, (0, 0, 0)))
+        self.assertFalse(offboard.touchdown_confirmed(collision, 100, (0, 0, 1)))
+        collision.normal.z_val = 0
+        self.assertFalse(offboard.touchdown_confirmed(collision, 100, (0, 0, 0)))
+        collision.normal.z_val = -1
+        collision.has_collided = False
+        self.assertFalse(offboard.touchdown_confirmed(collision, 100, (0, 0, 0)))
+    def test_offboard_rate_assertion_checks_all_axis_signs_and_units(self):
+        for axis in (0, 1, 2):
+            with self.subTest(axis=axis):
+                sample = [0.0, 0.0, 0.0]
+                sample[axis] = 0.2 if axis == 0 else -0.2
+                result = offboard.assert_rate_response([sample] * 4, axis, 0.2)
+                self.assertAlmostEqual(result["gain"], 1)
+                sample[axis] *= -1
+                with self.assertRaises(AssertionError):
+                    offboard.assert_rate_response([sample] * 4, axis, 0.2)
+
+    def test_api_cleanup_disarms_and_disables_control_on_rejected_disarm(self):
+        test = Mock()
+        test.client.isApiControlEnabled.return_value = True
+        test.client.armDisarm.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "not confirmed"):
+            control.disarm_test(test)
+        test.client.enableApiControl.assert_called_once_with(False, vehicle_name=test.vehicle)
+        test.rc.set.assert_called_once_with(arm=1000, throttle=1000, yaw=1500, autopilot=1000)
+        test.wait.assert_called_once()
+
+    def test_offboard_rpc_rejection_is_not_hidden_by_future_join(self):
+        test = Mock()
+        test.client.moveByAngleRatesThrottleAsync.return_value.get.return_value = False
+        scenario = offboard.OffboardTest(test, 0.59)
+        with self.assertRaisesRegex(RuntimeError, "rejected"):
+            scenario.command((0, 0, 0), 0)
+        test.client.moveByAngleRatesThrottleAsync.return_value.get.assert_called_once()
+
     def test_heading_wrap(self):
         self.assertEqual(control.angle_error(2, 358), 4)
         self.assertEqual(control.angle_error(358, 2), -4)
@@ -106,6 +163,26 @@ class ControlRunnerTest(unittest.TestCase):
         rc = control.RcStream("127.0.0.1")
         try:
             self.assertEqual(rc.channels, state.channels())
+        finally:
+            rc.close()
+
+    def test_landing_uses_full_low_throttle_without_disarming_early(self):
+        rc = control.RcStream("127.0.0.1")
+        msp = Mock()
+        msp.request.return_value = bytes((0, 3, 11))
+        runner = control.ControlTest(Mock(), "Copter", msp, rc, Mock())
+        runner.origin = (0.0, 0.0, 0.0)
+        snapshots = []
+        runner.wait = Mock(side_effect=lambda *_args, **_kwargs: snapshots.append(list(rc.channels)))
+        try:
+            rc.set(arm=2000)
+            rc.set_mode("POSHOLD+ALTHOLD")
+            runner.land()
+            self.assertEqual(snapshots[0][2], 1000)
+            self.assertEqual(snapshots[0][4], 1800)
+            self.assertEqual(snapshots[0][6], 2000)
+            self.assertEqual(snapshots[1][6], 2000)
+            self.assertEqual(snapshots[2][6], 1000)
         finally:
             rc.close()
 

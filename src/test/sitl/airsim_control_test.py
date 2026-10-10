@@ -8,6 +8,7 @@ MSP. No FDM packets or synthetic IMU/GPS samples are generated.
 
 import argparse
 import csv
+from contextlib import contextmanager, ExitStack
 import json
 import math
 from pathlib import Path
@@ -28,6 +29,7 @@ class FlightState(TypedDict):
     velocity: tuple[float, float, float]
     rpy: tuple[float, float, float]
     fc_rpy: tuple[float, float, float]
+    yaw_rate_dps: float
     modes: list[int]
     arming_flags: int
 
@@ -160,11 +162,37 @@ def require_free_ports():
             if probe.connect_ex(("127.0.0.1", port)) == 0:
                 raise RuntimeError(f"TCP {port} is occupied; stop the existing SITL explicitly")
 
+def require_quiet_rc():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 9004))
+        probe.settimeout(0.3)
+        try:
+            probe.recvfrom(64)
+        except socket.timeout:
+            return
+        raise RuntimeError("another RC sender is streaming on UDP 9004; stop the joystick bridge first")
+
+
+def check_vehicle(client, vehicle, airsim):
+    if not client.ping() or vehicle not in client.listVehicles():
+        raise RuntimeError("AirSim RPC/vehicle unavailable; start UE simulation first")
+    if client.isApiControlEnabled(vehicle_name=vehicle):
+        raise RuntimeError("AirSim API control is enabled; disable it before this RC test")
+    kinematics = client.simGetGroundTruthKinematics(vehicle_name=vehicle)
+    if not isinstance(kinematics, airsim.KinematicsState):
+        raise RuntimeError("AirSim returned invalid kinematics")
+    velocity = kinematics.linear_velocity
+    speed = math.sqrt(velocity.x_val ** 2 + velocity.y_val ** 2 + velocity.z_val ** 2)
+    if not math.isfinite(speed) or speed > 0.3:
+        raise RuntimeError("vehicle is moving before startup; choose a stationary launch "
+                           "surface with working UE ground collisions")
+
 
 class ControlTest:
     FIELDS = ("stage", "elapsed_s", "sim_timestamp", "north_m", "east_m", "down_m",
               "vn_mps", "ve_mps", "vd_mps", "roll_deg", "pitch_up_deg", "heading_deg",
-              "fc_roll_deg", "fc_pitch_down_deg", "fc_heading_deg", "arming_flags", "modes")
+              "fc_roll_deg", "fc_pitch_down_deg", "fc_heading_deg", "arming_flags", "modes",
+              "yaw_rate_dps")
 
     def __init__(self, client, vehicle, msp, rc, writer):
         self.client, self.vehicle, self.msp, self.rc, self.writer = client, vehicle, msp, rc, writer
@@ -188,15 +216,18 @@ class ControlTest:
         pos = (k.position.x_val, k.position.y_val, k.position.z_val)
         vel = (k.linear_velocity.x_val, k.linear_velocity.y_val, k.linear_velocity.z_val)
         rpy = euler_degrees(k.orientation)
-        if not all(math.isfinite(value) for value in (*pos, *vel, *rpy)):
+        yaw_rate = math.degrees(k.angular_velocity.z_val)
+        if not all(math.isfinite(value) for value in (*pos, *vel, *rpy, yaw_rate)):
             raise RuntimeError("non-finite AirSim ground truth")
         attitude = struct.unpack("<hhh", self.msp.request(108))
         fc = (attitude[0] / 10, attitude[1] / 10, float(attitude[2]))
         modes, flags = decode_status(self.msp.request(101), self.box_ids)
         self.writer.writerow((self.stage, time.monotonic() - self.start, timestamp,
-                              *pos, *vel, *rpy, *fc, flags, ";".join(map(str, sorted(modes)))))
+                              *pos, *vel, *rpy, *fc, flags, ";".join(map(str, sorted(modes))),
+                              yaw_rate))
         state: FlightState = {"position": pos, "velocity": vel, "rpy": rpy,
-                              "fc_rpy": fc, "modes": sorted(modes), "arming_flags": flags}
+                              "fc_rpy": fc, "modes": sorted(modes), "arming_flags": flags,
+                              "yaw_rate_dps": yaw_rate}
         self.last_sample = state
         if self.origin is not None and self.stage != "cleanup":
             height = self.origin[2] - pos[2]
@@ -308,12 +339,88 @@ class ControlTest:
         if origin is None:
             raise RuntimeError("landing requires a takeoff origin")
         self.stage = "landing"
-        self.rc.set(autopilot=1000, throttle=1100)
+        self.rc.set(autopilot=1000, throttle=1000)
+        self.wait("ALT HOLD accepts full-low throttle while armed",
+                  lambda s: {0, 3, 11} <= set(s["modes"]) and 56 not in s["modes"],
+                  timeout=5)
         self.wait("landed", lambda s: origin[2] - s["position"][2] < 0.5
                   and abs(s["velocity"][2]) < 0.5, timeout=60, dwell=1)
         self.rc.set(arm=1000, throttle=1000)
         self.rc.set_mode("ACRO")
         self.wait("disarmed", lambda s: 0 not in s["modes"], timeout=5)
+
+
+def provision(binary, directory, lines, name="config", log_name=None):
+    config = directory / f"{name}.txt"
+    config.write_text("\n".join(lines) + "\n")
+    result = subprocess.run([str(binary), "--config", str(config.resolve())], cwd=directory,
+                            capture_output=True, text=True, timeout=60)
+    log_path = directory / f"{log_name or name}.log"
+    log_path.write_text(result.stdout + result.stderr)
+    if result.returncode or not (directory / "eeprom.bin").exists() \
+            or "###ERROR" in result.stdout or "###ERROR" in result.stderr:
+        raise RuntimeError(f"SITL provisioning failed; see {log_path}")
+    return result.stdout
+
+
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def disarm_test(test):
+    test.stage = "cleanup"
+    test.rc.set(arm=1000, throttle=1000, yaw=1500, autopilot=1000)
+    test.rc.set_mode("ACRO")
+    try:
+        if test.client.isApiControlEnabled(vehicle_name=test.vehicle):
+            try:
+                if not test.client.armDisarm(False, vehicle_name=test.vehicle):
+                    raise RuntimeError("API cleanup disarm was not confirmed")
+            finally:
+                test.client.enableApiControl(False, vehicle_name=test.vehicle)
+    finally:
+        test.wait("cleanup disarm confirmed", lambda s: 0 not in s["modes"], timeout=5)
+        time.sleep(0.3)
+
+
+@contextmanager
+def flight_session(binary, client, vehicle, directory, lines, stream_rc=True):
+    require_free_ports()
+    require_quiet_rc()
+    with ExitStack() as stack:
+        sitl_log = stack.enter_context((directory / "sitl.log").open("w"))
+        trajectory = stack.enter_context((directory / "trajectory.csv").open("w", newline=""))
+        provision(binary, directory, lines, log_name="provision")
+        process = subprocess.Popen([str(binary)], cwd=directory, stdout=sitl_log, stderr=sitl_log)
+        stack.callback(stop_process, process)
+        deadline = time.monotonic() + 20
+        sock = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("SITL exited during startup; see sitl.log")
+            try:
+                sock = socket.create_connection(("127.0.0.1", 5761), timeout=0.5)
+                break
+            except (ConnectionRefusedError, socket.timeout):
+                time.sleep(0.2)
+        if sock is None:
+            raise TimeoutError("SITL MSP did not become responsive")
+        stack.callback(sock.close)
+        rc = RcStream("127.0.0.1")
+        stack.callback(rc.close)
+        if stream_rc:
+            rc.thread.start()
+        writer = csv.writer(trajectory)
+        writer.writerow(ControlTest.FIELDS)
+        test = ControlTest(client, vehicle, MspClient(sock), rc, writer)
+        stack.callback(disarm_test, test)
+        yield test
 
 
 def main():
@@ -339,54 +446,17 @@ def main():
     if args.output:
         output.mkdir(parents=True, exist_ok=False)
     log(f"artifacts: {output}")
-    process = sock = rc = test = None
+    test = None
     report = {"scenario": args.scenario, "vehicle": args.vehicle, "passed": False}
-    with (output / "sitl.log").open("w") as sitl_log, \
-            (output / "trajectory.csv").open("w", newline="") as trajectory:
-        try:
-            require_free_ports()
-            client = airsim.MultirotorClient(ip=args.host, port=args.rpc_port, timeout_value=5)
-            if not client.ping() or args.vehicle not in client.listVehicles():
-                raise RuntimeError("AirSim RPC/vehicle unavailable; start UE simulation first")
-            if client.isApiControlEnabled(vehicle_name=args.vehicle):
-                raise RuntimeError("AirSim API control is enabled; disable it before this RC test")
-            kinematics = client.simGetGroundTruthKinematics(vehicle_name=args.vehicle)
-            if not isinstance(kinematics, airsim.KinematicsState):
-                raise RuntimeError("AirSim returned invalid kinematics")
-            velocity = kinematics.linear_velocity
-            if math.sqrt(velocity.x_val ** 2 + velocity.y_val ** 2 + velocity.z_val ** 2) > 0.3:
-                raise RuntimeError("vehicle is moving before startup; choose a stationary launch "
-                                   "surface with working UE ground collisions")
-            gps_data = client.getGpsData(vehicle_name=args.vehicle)
-            if not isinstance(gps_data, airsim.GpsData):
-                raise RuntimeError("AirSim returned invalid GPS data")
-            gps = gps_data.gnss.geo_point
-            config = output / "config.txt"
-            config.write_text("\n".join(configuration(gps, args.hover_pwm)) + "\n")
-            binary = str(args.binary.resolve())
-            provision = subprocess.run([binary, "--config", str(config.resolve())], cwd=output,
-                                       capture_output=True, text=True, timeout=60)
-            (output / "provision.log").write_text(provision.stdout + provision.stderr)
-            if provision.returncode or not (output / "eeprom.bin").exists() \
-                    or "###ERROR" in provision.stdout:
-                raise RuntimeError("SITL provisioning failed; see provision.log")
-            process = subprocess.Popen([binary], cwd=output, stdout=sitl_log, stderr=sitl_log)
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise RuntimeError("SITL exited during startup; see sitl.log")
-                try:
-                    sock = socket.create_connection(("127.0.0.1", 5761), timeout=0.5)
-                    break
-                except (ConnectionRefusedError, socket.timeout):
-                    time.sleep(0.2)
-            if sock is None:
-                raise TimeoutError("SITL MSP did not become responsive")
-            rc = RcStream("127.0.0.1")
-            rc.thread.start()
-            writer = csv.writer(trajectory)
-            writer.writerow(ControlTest.FIELDS)
-            test = ControlTest(client, args.vehicle, MspClient(sock), rc, writer)
+    client = airsim.MultirotorClient(ip=args.host, port=args.rpc_port, timeout_value=5)
+    try:
+        require_free_ports()
+        check_vehicle(client, args.vehicle, airsim)
+        gps_data = client.getGpsData(vehicle_name=args.vehicle)
+        if not isinstance(gps_data, airsim.GpsData):
+            raise RuntimeError("AirSim returned invalid GPS data")
+        lines = configuration(gps_data.gnss.geo_point, args.hover_pwm)
+        with flight_session(args.binary.resolve(), client, args.vehicle, output, lines) as test:
             test.sensors()
             if args.scenario != "sensors":
                 test.takeoff(args.hover_pwm)
@@ -395,36 +465,17 @@ def main():
                 if args.scenario in ("mission", "all"):
                     test.mission()
                 test.land()
-            report["passed"] = True
-        except (AssertionError, RuntimeError, OSError, TimeoutError, ValueError, RPCError) as exc:
-            report["error"] = str(exc)
-            log(f"FAIL: {exc}")
-        finally:
-            if test is not None:
-                report["last_state"] = test.last_sample
-                if rc is not None:
-                    test.stage = "cleanup"
-                    rc.set(arm=1000, throttle=1000, autopilot=1000)
-                    rc.set_mode("ACRO")
-                    try:
-                        test.wait("cleanup disarm confirmed", lambda s: 0 not in s["modes"], timeout=5)
-                        time.sleep(0.3)  # let AirSim consume zero motor outputs before closing SITL
-                    except (AssertionError, RuntimeError, OSError, TimeoutError, RPCError) as exc:
-                        report["cleanup_error"] = str(exc)
-                        report["passed"] = False
-                        log(f"cleanup failed: {exc}")
-            if rc is not None:
-                rc.close()
-            if sock is not None:
-                sock.close()
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-            (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        report["passed"] = True
+    except (AssertionError, RuntimeError, OSError, TimeoutError, ValueError, RPCError) as exc:
+        report["error"] = str(exc)
+        if exc.__context__ is not None:
+            report["caused_by"] = str(exc.__context__)
+        log(f"FAIL: {exc}")
+    finally:
+        client.client.close()
+        if test is not None:
+            report["last_state"] = test.last_sample
+        (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     log("PASS" if report["passed"] else "FAIL")
     return 0 if report["passed"] else 1
 

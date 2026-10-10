@@ -123,6 +123,96 @@ thrust. Different mass/rotors require a matching value. The test enforces
 a 15 m height / 45 m horizontal / 45 degree tilt envelope. These are
 simulation-only tests, not hardware flight procedures.
 
+In active ALTHOLD (including the fifth POSHOLD+ALTHOLD detent), full-low
+throttle requests descent at `alt_hold_climb_rate`; it is not a command to
+hold altitude or disarm. ARM low remains the disarm command. The automatic
+test lands with 1000 us throttle while checking that ALTHOLD remains active.
+The neutral deadband is still centered on `ap_hover_throttle`; setting
+`alt_hold_deadband = 0` disables pilot altitude adjustments. Mission altitude
+targets and failsafe descent retain priority over the pilot's throttle.
+
 Offline runner checks:
 
     python3 -m unittest discover -s src/test/sitl -p airsim_control_test_unittest.py
+
+### Native AirSim OFFBOARD test
+
+Use `src/test/sitl/airsim_offboard_test.py` to verify the actual AirSim API
+and custom-link control path, rather than the UDP RC path:
+
+    python3 src/test/sitl/airsim_offboard_test.py \
+        --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin --vehicle Copter
+
+Start UE Play with the vehicle stationary on a valid ground surface, stop
+other SITL/RC senders and disable existing API control first. The test clones
+the current EEPROM (including PID tuning) into a temporary directory. It
+sends no UDP RC/FDM packets and does not modify the source EEPROM.
+
+Set the AirSim vehicle's `RC.RemoteControlID` to `-1` and
+`RC.AllowAPIWhenDisconnected` to `true`, then restart UE. This disables
+AirSim's native joystick mapping, which would otherwise overwrite RC values
+every physics tick even when the external joystick bridge is stopped.
+The external `sitl_joystick.py` bridge is unaffected.
+
+It verifies host arming with AUX3 ARM low, OFFBOARD with the firmware's
+angle/altitude/position loops inactive, a 2 m takeoff/hover/landing and body-rate tracking in both
+Yaw directions plus roll/pitch. Python rate commands are FLU rad/s; AirSim
+ground-truth FRD rates negate pitch and Yaw. The script supplies an explicit
+small host attitude/altitude loop using `moveByAngleRatesThrottleAsync`;
+the adapter does not implement high-level takeoff/hover/position commands,
+and OFFBOARD itself disables the firmware's level/altitude/position loops.
+
+After landing it checks API disarm, re-arm and loss of host arming/OFFBOARD
+when API control is disabled. Cleanup disarms via the API before disabling
+it and stopping the child SITL. State CSVs, provision/SITL logs and a JSON
+report are preserved under `--output <new-directory>`.
+Touchdown requires a fresh ground collision and low ground-truth velocity,
+not just reaching the launch point's height. Completing a Python rate command
+does not stop the adapter's 100 Hz heartbeat: the last command persists while
+API control is enabled. Send a neutral command, disarm and disable API control
+explicitly when handing control back.
+
+### Automatic real-AirSim Yaw tuning
+
+`src/test/sitl/airsim_yaw_tune.py` clones the current working directory's
+EEPROM for each trial and reuses the real-AirSim flight runner. Stop other
+SITL/RC senders, start UE Play on a valid ground surface, disable API
+control and leave at least 8 m of clear space around the launch point:
+
+    python3 src/test/sitl/airsim_yaw_tune.py \
+        --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin --vehicle Copter --apply
+
+Without `--apply` it does not change your EEPROM. The bounded search varies
+Yaw P/I/F and Yaw feedforward-hold gain, not roll/pitch, D or filters. Each
+trial takes off, applies 1.25 s opposite Yaw pulses followed by 8 s neutral
+observation windows, and lands before changing gains. It compares AirSim
+body Yaw rates with the firmware's measured setpoint (MSP FEEDFORWARD debug),
+including tracking error, response gain, reversal angle and settling time.
+Weak/no-turn responses are rejected, not rewarded for their lack of ringing.
+
+Applying requires an independent repeat with settling <=2 s, final Yaw-rate
+RMS <=1.5 deg/s, reversal <=1.5 deg, acceptable tracking and at least 10%
+score improvement over a repeated baseline. Otherwise the original remains
+unchanged and the command fails explicitly. Original EEPROM, trajectories,
+per-pulse CSVs, metrics and the final report are kept in a new artifact
+directory (`--output`). A validated result also produces `recommended.cfg`.
+The script refuses to overwrite an EEPROM changed by another process.
+
+Once ringing is controlled, `--objective response` additionally scores the
+entire pulse's tracking error and the sustained time to reach 80% of the
+requested rate. This prevents a slow but quiet response from winning:
+
+    python3 src/test/sitl/airsim_yaw_tune.py \
+        --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin \
+        --vehicle Copter --objective response --apply
+
+This search leaves I unchanged, tries P up to 150, F up to 120 and
+feedforward-hold gain up to 30. The response candidate must still pass all
+ring-down limits, reach 80% in <=0.6 s, track steady rate within 10%, and
+keep peak overshoot <=15%. The independently repeated response score and
+rise time must each improve by at least 10% before applying. These bounds
+are simulation-specific and do not certify hardware or aggressive maneuvers.
+
+Offline scoring/persistence checks:
+
+    PYTHONPATH=src/test/sitl python3 -m unittest airsim_yaw_tune_unittest

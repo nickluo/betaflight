@@ -97,14 +97,12 @@ static void altHoldProcessTransitions(void) {
 
 static void altHoldUpdateTargetAltitude(void)
 {
-    // User can adjust the target altitude with throttle, but only when
-    // - throttle is outside deadband, and
-    // - throttle is not low (zero), and
-    // - deadband is not configured to zero
+    // Outside the deadband, including full-low throttle, the pilot requests
+    // vertical speed. Arming's low-throttle check does not apply to this loop.
 
     float stickFactor = 0.0f;
 
-    if (altHold.allowStickAdjustment && calculateThrottleStatus() != THROTTLE_LOW) {
+    if (altHold.allowStickAdjustment) {
         const float rcThrottle = rcCommand[THROTTLE];
         const float hoverPwm = (float)autopilotGetEffectiveHoverThrottlePwm();
         const float lowThreshold = hoverPwm - altHold.deadband * (hoverPwm - PWM_RANGE_MIN);
@@ -117,12 +115,9 @@ static void altHoldUpdateTargetAltitude(void)
         }
     }
     // StickFactor is a multiplier for maxClimbRate, based on throttle position, that sets the ascend or descend velocity
-    // is zero at zero throttle and within the deadband, meaning no requested change in altitude
-    // below the lower deadband limit, it is negative, changing from 0 to -1, or full descend speed, reached just above zero throttle
+    // is zero within the deadband, meaning no requested change in altitude
+    // below the lower deadband limit, it is negative, reaching -1 (full descent) at zero throttle
     // conversely, as throttle moves above the upper deadband limit, StickFactor increased from 0 to 1 at full throttle
-    // when throttle is moved quickly upwards from being fully down, it passes through the maximum descent rate range, leading to a negative glitch.
-    // a similar downgoing glitch occurs when exiting upwards from zero throttle
-    // these glitches are minimised  when these transitions are quick
             
     // if failsafe is active, and we get here, we are in failsafe landing mode, it controls throttle.
     // a switch-invoked rescue that cannot stage or has aborted drives the same descent.

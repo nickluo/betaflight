@@ -60,13 +60,17 @@ extern "C" {
     PG_REGISTER(positionConfig_t, positionConfig, PG_POSITION, 0);
     PG_REGISTER(rcControlsConfig_t, rcControlsConfig, PG_RC_CONTROLS_CONFIG, 0);
 
-    bool failsafeIsActive(void) { return false; }
+    bool testFailsafeActive = false;
+    bool failsafeIsActive(void) { return testFailsafeActive; }
     timeUs_t currentTimeUs = 0;
     bool isAltHoldActive();
     extern float testAltitudeCm;
     extern float testAltitudeDerivativeCmS;
     extern float testCosTiltAngle;
     extern throttleStatus_e testThrottleStatus;
+    extern bool testNavActive;
+    extern positionNavCommand_t testNavCommand;
+    extern vector3_t testNavVelocityCmS;
 }
 
 #include "unittest_macros.h"
@@ -89,6 +93,12 @@ protected:
         testAltitudeDerivativeCmS = 0.0f;
         testCosTiltAngle = 1.0f;
         testThrottleStatus = THROTTLE_LOW;
+        testFailsafeActive = false;
+        testNavActive = false;
+        memset(&testNavCommand, 0, sizeof(testNavCommand));
+        vector3Zero(&testNavVelocityCmS);
+        memset(debug, 0, sizeof(debug));
+        debugMode = DEBUG_NONE;
 
         autopilotConfig_t *apCfg = autopilotConfigMutable();
         apCfg->hoverThrottle = 1500;
@@ -207,6 +217,97 @@ TEST_F(AltholdControlUnittest, AltitudeControlCompensatesForTilt)
     EXPECT_GT(tiltedThrottle, levelThrottle);
 }
 
+TEST_F(AltholdControlUnittest, FullLowThrottleCommandsMaximumDescent)
+{
+    autopilotConfigMutable()->hoverThrottle = 1590;
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 1000.0f;
+    rcCommand[THROTTLE] = 1590.0f;
+    testThrottleStatus = THROTTLE_HIGH;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+    const float hoverThrottle = getAutopilotThrottle();
+    ASSERT_EQ(debug[2], 1000);
+
+    rcCommand[THROTTLE] = 1000.0f;
+    testThrottleStatus = THROTTLE_LOW;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_EQ(debug[2], 995); // 500 cm/s descent for one 100 Hz update
+    EXPECT_EQ(debug[6], -250);
+    EXPECT_LT(getAutopilotThrottle(), hoverThrottle);
+}
+
+TEST_F(AltholdControlUnittest, ReturningToDeadbandStopsDescentTargetVelocity)
+{
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 1000.0f;
+    rcCommand[THROTTLE] = 1000.0f;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+    ASSERT_EQ(debug[2], 995);
+
+    rcCommand[THROTTLE] = 1500.0f;
+    testThrottleStatus = THROTTLE_HIGH;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_EQ(debug[2], 995);
+    EXPECT_EQ(debug[6], 0);
+}
+
+TEST_F(AltholdControlUnittest, ZeroDeadbandStillDisablesPilotAltitudeAdjustment)
+{
+    altHoldConfigMutable()->deadband = 0;
+    altHoldInit();
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 1000.0f;
+    rcCommand[THROTTLE] = 1000.0f;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_EQ(debug[2], 1000);
+    EXPECT_EQ(debug[6], 0);
+}
+
+TEST_F(AltholdControlUnittest, FullLowThrottleDoesNotActivateAltitudeHold)
+{
+    rcCommand[THROTTLE] = 1000.0f;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_FALSE(isAltHoldActive());
+    EXPECT_FLOAT_EQ(getAutopilotThrottle(), 0.0f);
+}
+
+TEST_F(AltholdControlUnittest, FailsafeDescentStillOverridesHighThrottle)
+{
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 1000.0f;
+    testFailsafeActive = true;
+    rcCommand[THROTTLE] = 2000.0f;
+    testThrottleStatus = THROTTLE_HIGH;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_EQ(debug[2], 993);
+    EXPECT_EQ(debug[6], -250);
+}
+
+TEST_F(AltholdControlUnittest, NavigationAltitudeStillOverridesFullLowThrottle)
+{
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 1000.0f;
+    testNavActive = true;
+    testNavCommand.includeAltitude = true;
+    testNavCommand.targetPosEfM.z = 12.0f;
+    testNavVelocityCmS.z = 150.0f;
+    rcCommand[THROTTLE] = 1000.0f;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_EQ(debug[2], 1200);
+    EXPECT_EQ(debug[6], 75);
+}
+
 // STUBS
 
 extern "C" {
@@ -225,6 +326,9 @@ extern "C" {
     float testAltitudeDerivativeCmS = 0.0f;
     float testCosTiltAngle = 1.0f;
     throttleStatus_e testThrottleStatus = THROTTLE_LOW;
+    bool testNavActive = false;
+    positionNavCommand_t testNavCommand;
+    vector3_t testNavVelocityCmS;
 
     float getAltitudeCm(void) { return testAltitudeCm; }
     float getAltitudeDerivative(void) { return testAltitudeDerivativeCmS; }
@@ -262,10 +366,10 @@ extern "C" {
     void positionNavInit(void) { }
     void positionNavReset(void) { }
     void positionNavUpdate(float /*dt*/, const positionEstimate3d_t * /*est*/) { }
-    bool positionNavHasActiveTarget(void) { return false; }
+    bool positionNavHasActiveTarget(void) { return testNavActive; }
     bool positionNavTargetReached(void) { return false; }
-    vector3_t positionNavGetTargetVelocityCmS(void) { return (vector3_t){{0, 0, 0}}; }
-    const positionNavCommand_t *positionNavGetActiveCommand(void) { return NULL; }
+    vector3_t positionNavGetTargetVelocityCmS(void) { return testNavVelocityCmS; }
+    const positionNavCommand_t *positionNavGetActiveCommand(void) { return &testNavCommand; }
 
     void parseRcChannels(const char *input, rxConfig_t *rxConfig) {
         UNUSED(input);

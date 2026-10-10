@@ -117,6 +117,9 @@ uint32_t simulationFeatureFlags = 0;
 uint32_t simulationTime = 0;
 bool gyroCalibDone = false;
 bool simulationHaveRx = false;
+bool mockHostRequested = false;
+bool mockHostControl = false;
+float mockHostThrottle = 0;
 
 #include "gtest/gtest.h"
 
@@ -1057,8 +1060,129 @@ TEST(ArmingPreventionTest, Paralyze)
     EXPECT_TRUE(IS_RC_MODE_ACTIVE(BOXVTXPITMODE));
 }
 
+class OffboardModeTest : public ::testing::Test {
+protected:
+    pidProfile_t pidProfile = {};
+    controlRateConfig_t rateProfile = {};
+    void SetUp() override
+    {
+        currentPidProfile = &pidProfile;
+        currentControlRateProfile = &rateProfile;
+        simulationFeatureFlags = 0;
+        mockHostRequested = false;
+        mockHostControl = false;
+        mockHostThrottle = 0;
+        simulationHaveRx = true;
+        gyroCalibDone = true;
+        mockIsUpright = true;
+        memset(modeActivationConditionsMutable(0), 0,
+            sizeof(modeActivationCondition_t) * MAX_MODE_ACTIVATION_CONDITION_COUNT);
+        memset(rcData, 0, sizeof(rcData));
+        for (unsigned i = 0; i < MAX_SUPPORTED_RC_CHANNEL_COUNT; i++) {
+            rcData[i] = 1000;
+        }
+        auto *arm = modeActivationConditionsMutable(1);
+        arm->modeId = BOXARM;
+        arm->auxChannelIndex = 1;
+        arm->range.startStep = CHANNEL_VALUE_TO_STEP(1700);
+        arm->range.endStep = CHANNEL_VALUE_TO_STEP(2100);
+        rcData[AUX2] = 2000;
+        analyzeModeActivationConditions();
+        updateActivatedModes();
+        rxConfigMutable()->mincheck = 1050;
+        rxConfigMutable()->airModeActivateThreshold = 15;
+        flightModeFlags = 0;
+        DISABLE_ARMING_FLAG(ARMED);
+        processRx(0);
+        ENABLE_ARMING_FLAG(ARMED);
+        sensorsSet(SENSOR_ACC | SENSOR_GYRO | SENSOR_GPS);
+        ENABLE_STATE(GPS_FIX);
+    }
+    void mode(boxId_e box)
+    {
+        auto *mac = modeActivationConditionsMutable(0);
+        mac->modeId = box;
+        mac->auxChannelIndex = 0;
+        mac->range.startStep = CHANNEL_VALUE_TO_STEP(1700);
+        mac->range.endStep = CHANNEL_VALUE_TO_STEP(2100);
+        rcData[AUX1] = 1800;
+        analyzeModeActivationConditions();
+    }
+    void raisedHostThrottle()
+    {
+        mockHostControl = true;
+        mockHostThrottle = 0.17f;
+        processRx(10000);
+    }
+    void TearDown() override
+    {
+        mockHostRequested = false;
+        mockHostControl = false;
+        DISABLE_ARMING_FLAG(ARMED);
+        flightModeFlags = 0;
+    }
+};
+
+TEST_F(OffboardModeTest, ApiThrottleLatchesRaisedWithoutMovingPilotThrottle)
+{
+    EXPECT_FALSE(wasThrottleRaised());
+    raisedHostThrottle();
+    EXPECT_TRUE(wasThrottleRaised());
+    EXPECT_EQ(rcData[THROTTLE], 1000);
+}
+
+TEST_F(OffboardModeTest, ApiModeDoesNotRequireRcOffboardSwitch)
+{
+    analyzeModeActivationConditions();
+    mockHostRequested = true;
+    processRxModes(10000);
+    EXPECT_TRUE(FLIGHT_MODE(OFFBOARD_MODE));
+    EXPECT_FALSE(IS_RC_MODE_ACTIVE(BOXOFFBOARD));
+}
+
+TEST_F(OffboardModeTest, AngleTakesOverInSameRxCycle)
+{
+    mode(BOXANGLE);
+    ENABLE_FLIGHT_MODE(OFFBOARD_MODE);
+    processRxModes(10000);
+    EXPECT_FALSE(FLIGHT_MODE(OFFBOARD_MODE));
+    EXPECT_TRUE(FLIGHT_MODE(ANGLE_MODE));
+    EXPECT_TRUE(ARMING_FLAG(ARMED));
+}
+
+TEST_F(OffboardModeTest, HoldModesTakeOverInSameRxCycleAfterApiTakeoff)
+{
+    raisedHostThrottle();
+    mode(BOXPOSHOLD);
+    ENABLE_FLIGHT_MODE(OFFBOARD_MODE);
+    processRxModes(10000);
+    EXPECT_FALSE(FLIGHT_MODE(OFFBOARD_MODE));
+    EXPECT_TRUE(FLIGHT_MODE(POS_HOLD_MODE));
+    mode(BOXALTHOLD);
+    ENABLE_FLIGHT_MODE(OFFBOARD_MODE);
+    processRxModes(20000);
+    EXPECT_TRUE(FLIGHT_MODE(ALT_HOLD_MODE));
+}
+
+TEST_F(OffboardModeTest, RescueAlwaysPreemptsHostInSameRxCycle)
+{
+    mode(BOXGPSRESCUE);
+    mockHostRequested = true;
+    ENABLE_FLIGHT_MODE(OFFBOARD_MODE);
+    processRxModes(10000);
+    EXPECT_FALSE(FLIGHT_MODE(OFFBOARD_MODE));
+    EXPECT_TRUE(FLIGHT_MODE(GPS_RESCUE_MODE));
+    EXPECT_TRUE(ARMING_FLAG(ARMED));
+}
+
 // STUBS
 extern "C" {
+    bool customLinkHasControl(void) { return mockHostControl; }
+    float customLinkGetThrottle(void) { return mockHostThrottle; }
+    bool customLinkIsControlFresh(void) { return true; }
+    bool customLinkIsModeRequested(void) { return mockHostRequested; }
+    bool customLinkHostArmActive(void) { return false; }
+    void customLinkUpdateRcModes(bool) {}
     void sincosf_approx(float x, float *out_s, float *out_c) {
         *out_s = sin_approx(x);
         *out_c = cos_approx(x);

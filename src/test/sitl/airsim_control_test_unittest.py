@@ -14,6 +14,15 @@ import sitl_joystick as joystick
 
 
 class ControlRunnerTest(unittest.TestCase):
+    def test_pilot_mode_takeover_requires_actual_mode_and_arming_not_offboard(self):
+        for mode, modes in (("ACRO", {0}), ("ANGLE", {0, 1}), ("HORIZON", {0, 2}),
+                            ("ALTHOLD", {0, 1, 3}), ("POSHOLD+ALTHOLD", {0, 1, 3, 11})):
+            with self.subTest(mode=mode):
+                self.assertTrue(offboard.pilot_mode_active({"modes": modes}, mode))
+                self.assertFalse(offboard.pilot_mode_active({"modes": modes | {58}}, mode))
+                self.assertFalse(offboard.pilot_mode_active({"modes": modes | {56}}, mode))
+                self.assertFalse(offboard.pilot_mode_active({"modes": modes - {0}}, mode))
+
     def test_offboard_host_controller_uses_flu_pitch_and_vertical_feedback(self):
         rates, throttle = offboard.rate_throttle(5, 5, 2, 0, 2, 0.59)
         self.assertLess(rates[0], 0)
@@ -30,6 +39,17 @@ class ControlRunnerTest(unittest.TestCase):
         rates, throttle = offboard.rate_throttle(30, 30, -10, 10, 2, 0.59, (2, 0.35))
         self.assertEqual(rates, (-0.5, 0.5, 0.35))
         self.assertEqual(throttle, 0.78)
+
+    def test_offboard_horizontal_braking_uses_body_heading_and_preserves_rate_override(self):
+        for velocity, heading, axis, sign in (((1, 0), 0, 1, -1), ((0, 1), 0, 0, -1),
+                                             ((1, 0), 90, 0, 1), ((0, 1), 90, 1, -1)):
+            with self.subTest(velocity=velocity, heading=heading):
+                rates, _ = offboard.rate_throttle(0, 0, 2, 0, 2, 0.17,
+                                                   horizontal_velocity=velocity, heading_deg=heading)
+                self.assertGreater(rates[axis] * sign, 0)
+                rates, _ = offboard.rate_throttle(0, 0, 2, 0, 2, 0.17, (axis, 0.2),
+                                                   velocity, heading)
+                self.assertEqual(rates[axis], 0.2)
 
     def test_offboard_touchdown_requires_fresh_ground_contact_and_low_velocity(self):
         collision = SimpleNamespace(has_collided=True, time_stamp=200, normal=SimpleNamespace(z_val=-1))
@@ -110,17 +130,34 @@ class ControlRunnerTest(unittest.TestCase):
 
     def test_provisioning_uses_airsim_gps_and_hover_throttle(self):
         gps = SimpleNamespace(latitude=47, longitude=8, altitude=500)
-        config = control.configuration(gps, 1590)
+        config = control.configuration(gps, 1211)
         waypoint = next(line for line in config if line.startswith("waypoint insert"))
         values = waypoint.split()
         self.assertAlmostEqual(float(values[3]), 47 + 20 / 111319.49, places=7)
         self.assertEqual(float(values[4]), 8)
         self.assertEqual(int(values[5]), 50500)
-        self.assertIn("set ap_hover_throttle = 1590", config)
-        self.assertEqual(config[7:14], list(joystick.CLI_CONFIG_LINES))
-        self.assertIn("aux 6 56 5 1700 2100 0 0", config)
+        self.assertIn("set ap_hover_throttle = 1211", config)
+        self.assertIn("set ap_throttle_min = 1050", config)
+        self.assertIn("set airmode_start_throttle_percent = 15", config)
+        self.assertEqual([line for line in config if line.startswith(("map ", "aux "))][:-1],
+                         list(joystick.CLI_CONFIG_LINES))
+        self.assertIn("aux 7 56 5 1700 2100 0 0", config)
+        self.assertEqual([line for line in config if line.startswith("aux 6 ")],
+                         ["aux 6 46 0 1900 2100 0 0"])
         self.assertFalse(any(line.startswith("aux ") and line.split()[2:4] == ["3", "4"]
                              for line in config))
+
+    def test_f70_hover_preserves_headroom_below_hover_and_correct_neutral_stick(self):
+        hover = (1211 - 1050) / 950
+        rotor_signal = 0.055 + 0.945 * hover
+        self.assertAlmostEqual(rotor_signal * 4 * 22.76123465, 2 * 9.80665, delta=0.03)
+        self.assertEqual(control.alt_hold_neutral_pwm(1211), 1250)
+        self.assertLess(15, (1211 - 1050) * 100 / 950)
+        _, thrust = offboard.rate_throttle(0, 0, 2, 0, 2, hover)
+        self.assertAlmostEqual(thrust, hover)
+        _, descent = offboard.rate_throttle(0, 0, 3, 0, 2, hover)
+        self.assertLess(descent, hover)
+        self.assertEqual(offboard.rate_throttle(0, 0, 10, -10, 0, hover)[1], 0)
 
     def test_gps_fix_is_a_nonzero_state_bitmask(self):
         for fix in (0, 2):
@@ -165,6 +202,23 @@ class ControlRunnerTest(unittest.TestCase):
             self.assertEqual(rc.channels, state.channels())
         finally:
             rc.close()
+
+    def test_waypoint_dwell_covers_delayed_drift_and_altitude_rollback(self):
+        msp = Mock()
+        msp.request.return_value = bytes((0, 3, 11, 56))
+        runner = control.ControlTest(Mock(), "Copter", msp, Mock(), Mock())
+        runner.origin = (0.0, 0.0, 0.0)
+        runner.wait = Mock()
+        runner.mission()
+        predicate = runner.wait.call_args.args[1]
+        self.assertEqual(runner.wait.call_args.kwargs["dwell"], 60)
+        state = {"position": (20, 0, -5), "velocity": (0, 0, 0), "modes": [0, 3, 11, 56]}
+        self.assertTrue(predicate(state))
+        self.assertFalse(predicate({**state, "position": (20, 0, -3)}))
+        with self.assertRaisesRegex(AssertionError, "drift"):
+            predicate({**state, "position": (30, 0, -5)})
+        with self.assertRaisesRegex(AssertionError, "lost"):
+            predicate({**state, "modes": [0, 3, 11]})
 
     def test_landing_uses_full_low_throttle_without_disarming_early(self):
         rc = control.RcStream("127.0.0.1")

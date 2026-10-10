@@ -13,6 +13,8 @@ import json
 import math
 from pathlib import Path
 import socket
+import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -147,9 +149,11 @@ def configuration(gps, hover_pwm):
         "set failsafe_procedure = AUTO-LAND",
         "set custom_link_motors_stream = ON",
         f"set ap_hover_throttle = {hover_pwm}",
+        "set ap_throttle_min = 1050",
+        "set airmode_start_throttle_percent = 15",
         *joystick.CLI_CONFIG_LINES,
         # Test-only mission switch: keep the radio's first eight channels unchanged.
-        "aux 6 56 5 1700 2100 0 0",
+        "aux 7 56 5 1700 2100 0 0",
         f"waypoint insert 0 {latitude:.7f} {gps.longitude:.7f} "
         f"{round((gps.altitude + 5) * 100)} 250 flyover 0 none",
     ]
@@ -285,10 +289,10 @@ class ControlTest:
         self.origin = origin
         self.rc.set(arm=joystick.RC_MAX_US)
         self.wait("armed", lambda s: 0 in s["modes"], timeout=8)
-        self.rc.set(throttle=min(1900, hover_pwm + 40))
+        self.rc.set(throttle=min(1900, hover_pwm + (10 if hover_pwm < 1200 else 40)))
         self.wait("climbed 3 m in AirSim", lambda s: origin[2] - s["position"][2] > 3,
                   timeout=25)
-        self.rc.set(throttle=hover_pwm)
+        self.rc.set(throttle=alt_hold_neutral_pwm(hover_pwm))
         self.rc.set_mode("POSHOLD+ALTHOLD")
         self.wait("ALTHOLD + POSHOLD active", lambda s: {3, 11} <= set(s["modes"]))
         anchor = self.sample()["position"]
@@ -330,9 +334,20 @@ class ControlTest:
         target = (origin[0] + 20, origin[1])
         self.wait("20 m north waypoint reached (AirSim ground truth)",
                   lambda s: math.dist(s["position"][:2], target) < 4, timeout=60)
-        self.wait("parked near waypoint for 5 s",
+        self.wait("parked near waypoint for 3 s",
                   lambda s: math.dist(s["position"][:2], target) < 6
-                  and math.hypot(*s["velocity"][:2]) < 1, timeout=35, dwell=5)
+                  and math.hypot(*s["velocity"][:2]) < 1, timeout=35, dwell=3)
+        self.stage = "waypoint-dwell"
+        def held(state):
+            distance = math.dist(state["position"][:2], target)
+            if distance > 8:
+                raise AssertionError(f"post-arrival waypoint drift: {distance:.2f} m")
+            if not {0, 56, 3, 11} <= set(state["modes"]):
+                raise AssertionError("lost armed navigation/hold modes during waypoint dwell")
+            return distance < 6 and math.hypot(*state["velocity"][:2]) < 1 \
+                and abs(state["position"][2] - (origin[2] - 5)) < 1.5
+        self.wait("continuous 60 s waypoint dwell (position, altitude, speed and modes)",
+                  held, timeout=80, dwell=60)
 
     def land(self):
         origin = self.origin
@@ -361,6 +376,19 @@ def provision(binary, directory, lines, name="config", log_name=None):
             or "###ERROR" in result.stdout or "###ERROR" in result.stderr:
         raise RuntimeError(f"SITL provisioning failed; see {log_path}")
     return result.stdout
+
+
+def read_hover_pwm(binary, directory):
+    text = provision(binary, directory, ["get ap_hover_throttle"], "inspect-hover")
+    match = re.search(r"^ap_hover_throttle = (\d+)\s*$", text, re.MULTILINE)
+    if match is None or not 1100 <= int(match[1]) <= 1700:
+        raise RuntimeError("invalid configured ap_hover_throttle")
+    return int(match[1])
+
+
+def alt_hold_neutral_pwm(hover_pwm, mincheck=1050):
+    # Linear default RC curve: mincheck..2000 -> rcCommand 1000..2000.
+    return round(mincheck + (2000 - mincheck) * (hover_pwm - 1000) / 1000)
 
 
 def stop_process(process):
@@ -426,16 +454,18 @@ def flight_session(binary, client, vehicle, directory, lines, stream_rc=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--eeprom", type=Path, default=Path("eeprom.bin"),
+                        help="source EEPROM to clone, preserving calibrated PID tuning")
     parser.add_argument("--vehicle", default="Copter")
     parser.add_argument("--host", default="127.0.0.1", help="AirSim RPC host (SITL runs locally)")
     parser.add_argument("--rpc-port", type=int, default=41451)
     parser.add_argument("--scenario", choices=("sensors", "hover", "mission", "all"), default="all")
-    parser.add_argument("--hover-pwm", type=int, default=1590,
-                        help="FC hover throttle; ~59%% for BetaFlightParams' 1 kg / 4 x 4.18 N")
+    parser.add_argument("--hover-pwm", type=int, default=1211,
+                        help="ALT HOLD hover PWM for 2 kg F70/HQ7040 and default PWM endpoints")
     parser.add_argument("--output", type=Path, help="new artifact directory (must not already exist)")
     args = parser.parse_args()
-    if not args.binary.is_file() or not 1100 <= args.hover_pwm <= 1700:
-        parser.error("binary must exist and --hover-pwm must be between 1100 and 1700")
+    if not args.binary.is_file() or not args.eeprom.is_file() or not 1100 <= args.hover_pwm <= 1700:
+        parser.error("binary and EEPROM must exist; --hover-pwm must be between 1100 and 1700")
     try:
         import cosysairsim as airsim
         from msgpackrpc.error import RPCError
@@ -456,6 +486,7 @@ def main():
         if not isinstance(gps_data, airsim.GpsData):
             raise RuntimeError("AirSim returned invalid GPS data")
         lines = configuration(gps_data.gnss.geo_point, args.hover_pwm)
+        shutil.copy2(args.eeprom.resolve(), output / "eeprom.bin")
         with flight_session(args.binary.resolve(), client, args.vehicle, output, lines) as test:
             test.sensors()
             if args.scenario != "sensors":

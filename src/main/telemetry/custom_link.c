@@ -267,9 +267,9 @@ static void customLinkInjectRc(const clPayloadHostRc_t *rc)
 #if ENABLE_RX_UDP
     // RC arbitration: a live UDP RC bridge (host joystick tool on the
     // simulator's port 9004) owns the channels while it streams, so two
-    // sources cannot fight over the shared latch; rxUdpBridgeRcFresh()
-    // hands authority back once the bridge goes quiet.
-    if (rxUdpBridgeRcFresh()) {
+    // sources cannot fight over the shared latch. After pilot takeover,
+    // fallback HOST_RC must not undo it when the bridge goes quiet.
+    if (rxUdpBridgeRcFresh() || controlState.apiBlocked) {
         return;
     }
     // Same entry point as the UDP RC bridge: latches the channel array and
@@ -294,12 +294,9 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
         }
         cachedThrottle = (controlState.throttle - 1000) * 0.001f;
 
-        // Host arming authority is conditional: arm requests only take effect
-        // while the pilot holds the BOXOFFBOARD switch and still pass every
-        // tryArm() safety check. Disarm is honored for as long as the host
-        // holds authority (switch on or mode engaged).
+        // After pilot takeover, stale host disarm requests have no authority.
         if (event == CL_EVENT_DISARM_REQUEST &&
-            (IS_RC_MODE_ACTIVE(BOXOFFBOARD) || FLIGHT_MODE(OFFBOARD_MODE))) {
+            (customLinkIsModeRequested() || FLIGHT_MODE(OFFBOARD_MODE))) {
             disarm(DISARM_REASON_OFFBOARD);
         }
         break;
@@ -392,16 +389,31 @@ bool customLinkIsControlFresh(void)
 
 bool customLinkHasControl(void)
 {
-    return controlActive;
+    return controlActive && FLIGHT_MODE(OFFBOARD_MODE);
+}
+
+void customLinkUpdateRcModes(bool pilotModesValid)
+{
+    uint32_t pilotModes = 0;
+    for (boxId_e mode = BOXANGLE; mode < BOXOFFBOARD; mode++) {
+        if (IS_RC_MODE_ACTIVE(mode)) {
+            pilotModes |= 1U << mode;
+        }
+    }
+    clControlUpdateAuthority(&controlState, pilotModes, pilotModesValid,
+        IS_RC_MODE_ACTIVE(BOXOFFBOARD), IS_RC_MODE_ACTIVE(BOXGPSRESCUE),
+        IS_RC_MODE_ACTIVE(BOXARM), ARMING_FLAG(ARMED), customLinkIsControlFresh());
+}
+
+bool customLinkIsModeRequested(void)
+{
+    return clControlModeRequested(&controlState);
 }
 
 bool customLinkHostArmActive(void)
 {
-    // Level semantics: a fresh stream holding arm=1 counts as an armed
-    // request equivalent to the pilot's ARM switch (processRcStickPositions
-    // disarms whenever the ARM box is inactive, which would otherwise fight
-    // and flap against host-initiated arming).
-    return linkEnabled && controlState.arm && customLinkIsControlFresh();
+    return linkEnabled && clControlHostArmActive(&controlState,
+        ARMING_FLAG(ARMED), customLinkIsControlFresh());
 }
 
 float customLinkGetRateSetpoint(int axis)

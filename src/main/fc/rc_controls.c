@@ -178,10 +178,7 @@ void processRcStickPositions(void)
 
     // perform actions
     if (!isUsingSticksToArm) {
-        // A fresh custom-link stream holding arm=1 counts as an armed request:
-        // the pilot already expressed handover intent with the BOXOFFBOARD
-        // switch, and the box-off branch below would otherwise immediately
-        // disarm again, flapping against host-initiated arming.
+        // Authorized host arming or an already-armed pilot takeover also counts.
         if (IS_RC_MODE_ACTIVE(BOXARM)
 #ifdef USE_CUSTOM_LINK
             || customLinkHostArmActive()

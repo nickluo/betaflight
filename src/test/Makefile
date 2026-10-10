@@ -60,7 +60,10 @@ arming_prevention_unittest_SRC := \
 		$(USER_DIR)/flight/gps_rescue_multirotor.c
 
 arming_prevention_unittest_DEFINES := \
-            USE_GPS_RESCUE=
+            USE_GPS_RESCUE= \
+            USE_CUSTOM_LINK= \
+            USE_ALTITUDE_HOLD= \
+            USE_POSITION_HOLD=
 
 atomic_unittest_SRC := \
 		$(USER_DIR)/build/atomic.c \

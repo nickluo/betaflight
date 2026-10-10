@@ -841,7 +841,12 @@ bool processRx(timeUs_t currentTimeUs)
     }
 
     const bool throttleActive = calculateThrottleStatus() != THROTTLE_LOW;
-    const uint8_t throttlePercent = calculateThrottlePercentAbs();
+    uint8_t throttlePercent = calculateThrottlePercentAbs();
+#ifdef USE_CUSTOM_LINK
+    if (customLinkHasControl()) {
+        throttlePercent = MAX(throttlePercent, (uint8_t)lrintf(customLinkGetThrottle() * 100.0f));
+    }
+#endif
     const bool launchControlActive = isLaunchControlActive();
     static bool isAirmodeActive;
 
@@ -1030,6 +1035,10 @@ void processRxModes(timeUs_t currentTimeUs)
 
     updateActivatedModes();
 
+#ifdef USE_CUSTOM_LINK
+    customLinkUpdateRcModes(rxAreFlightChannelsValid());
+#endif
+
 #ifdef USE_DSHOT
     if (crashFlipModeActive) {
         beeper(BEEPER_CRASHFLIP_MODE);
@@ -1042,12 +1051,16 @@ void processRxModes(timeUs_t currentTimeUs)
 
     bool canUseHorizonMode = true;
 #ifdef USE_CUSTOM_LINK
-    // OFFBOARD (host control) has priority over the level and hold modes:
-    // while it is engaged ANGLE/HORIZON (and ALT_HOLD/POS_HOLD further below)
-    // must stay off so the host rate setpoints reach the PID loop unmodified
-    // (pidLevel would otherwise overwrite them). When OFFBOARD disengages,
-    // the switch-selected mode re-engages on the next cycle.
-    const bool offboardHasPriority = FLIGHT_MODE(OFFBOARD_MODE);
+    const bool offboardHasPriority = ARMING_FLAG(ARMED)
+        && customLinkIsModeRequested() && customLinkIsControlFresh()
+        && !failsafeIsActive()
+        && !IS_RC_MODE_ACTIVE(BOXGPSRESCUE) && !IS_RC_MODE_ACTIVE(BOXAUTOPILOT)
+        && !FLIGHT_MODE(GPS_RESCUE_MODE | AUTOPILOT_MODE)
+        && !flightPlanNavIsRescueDescentActive();
+    // Release host PID/throttle authority before activating the pilot's modes.
+    if (!offboardHasPriority) {
+        DISABLE_FLIGHT_MODE(OFFBOARD_MODE);
+    }
 #else
     const bool offboardHasPriority = false;
 #endif
@@ -1224,17 +1237,7 @@ void processRxModes(timeUs_t currentTimeUs)
 #endif
 
 #ifdef USE_CUSTOM_LINK
-    // OFFBOARD: host (companion computer) control. The pilot's BOXOFFBOARD
-    // switch expresses intent; control engages only while armed, with a fresh
-    // host control stream (custom_link_watchdog_ms), no active failsafe, and
-    // no safety autonomy claiming priority (GPS rescue, autopilot mission).
-    // OFFBOARD preempts ACRO/ANGLE/HORIZON/ALT_HOLD/POS_HOLD - the blocks
-    // above stand down while it is engaged, and turning the switch off
-    // reverts to the mode selected by the remaining switches.
-    if (ARMING_FLAG(ARMED)
-        && IS_RC_MODE_ACTIVE(BOXOFFBOARD)
-        && customLinkIsControlFresh()
-        && !failsafeIsActive()
+    if (offboardHasPriority
         && !FLIGHT_MODE(GPS_RESCUE_MODE | AUTOPILOT_MODE)) {
         if (!FLIGHT_MODE(OFFBOARD_MODE)) {
             ENABLE_FLIGHT_MODE(OFFBOARD_MODE);

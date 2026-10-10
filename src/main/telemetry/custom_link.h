@@ -33,8 +33,8 @@
 // serial function (telemetry_baudrateIndex selects the baud, BAUD_AUTO
 // means 921600). Downlink streams run as three scheduler tasks
 // (200/100/10 Hz). Uplink control frames arm/disarm and, while the
-// BOXOFFBOARD switch is active and the stream is fresh, drive the PID
-// rate setpoints and throttle (OFFBOARD_MODE).
+// pilot's BOXOFFBOARD switch or an API mode request owns authority and the
+// stream is fresh, drive the PID rate setpoints and throttle (OFFBOARD_MODE).
 
 struct serialPort_s;
 
@@ -49,8 +49,12 @@ bool customLinkIsControlFresh(void);
 // the single condition the PID and mixer hot paths check.
 bool customLinkHasControl(void);
 
-// True while a fresh host stream holds arm=1. Treated like an active pilot
-// ARM switch by the arming state machine (rc_controls.c).
+// Update source-aware mode authority after evaluating valid pilot channels.
+void customLinkUpdateRcModes(bool pilotModesValid);
+bool customLinkIsModeRequested(void);
+
+// A fresh authorized arm request, or continuity of an already-armed pilot
+// takeover. Never re-arms after takeover landing; a pilot ARM falling edge wins.
 bool customLinkHostArmActive(void);
 
 // Host rate setpoint for an axis in deg/s (0.1 deg/s protocol units scaled).

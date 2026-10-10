@@ -35,11 +35,13 @@ box ids from msp_box.c; export with --print-config):
     aux 3 3  0 1500 1900 0 0   # ALT HOLD on AUX1 dial positions 4 and 5
     aux 4 11 0 1700 1900 0 0   # POS HOLD on AUX1 dial position 5
     aux 5 58 1 1700 2100 0 0   # OFFBOARD on AUX2 3-position high
+    aux 6 46 0 1900 2100 0 0   # GPS RESCUE on AUX1 dial position 6
 
 Arming notes: this fork defaults enable_stick_arming = OFF, so the ARM
 switch (AUX3, exposed as a joystick button) is the arming path; the FC additionally requires throttle
 below mincheck (1050 us) and the mode dial outside the ALT HOLD / POS HOLD
-positions when arming.
+positions or GPS RESCUE when arming. GPS Rescue requires a valid GPS/home
+position and requests return-home/landing when engaged in flight.
 
 Usage:
     python3 sitl_joystick.py --probe                 # inspect the device
@@ -104,11 +106,12 @@ CLI_CONFIG_LINES = (
     "aux 3 3 0 1500 1900 0 0",
     "aux 4 11 0 1700 1900 0 0",
     "aux 5 58 1 1700 2100 0 0",
+    "aux 6 46 0 1900 2100 0 0",
 )
 
 # 6-pos switch values: the firmware's native 200 us bands over 900..2100
 MODE6_VALUES_US = [1000, 1200, 1400, 1600, 1800, 2000]
-MODE6_NAMES = ["ACRO", "ANGLE", "HORIZON", "ALTHOLD", "POSHOLD+ALTHOLD", "reserved"]
+MODE6_NAMES = ["ACRO", "ANGLE", "HORIZON", "ALTHOLD", "POSHOLD+ALTHOLD", "GPSRESCUE"]
 SWITCH3_VALUES_US = [RC_MIN_US, RC_MID_US, RC_MAX_US]
 SWITCH3_NAMES = ["LOW", "MID", "HIGH"]
 

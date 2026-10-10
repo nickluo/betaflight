@@ -61,13 +61,14 @@ sources fighting.
 
 `sitl_joystick.py` is the shared source of the channel indices and CLI table:
 ARM is AUX3, not AUX1. The dial's positions are ACRO / ANGLE / HORIZON /
-ALTHOLD / POSHOLD+ALTHOLD / reserved at 1000/1200/1400/1600/1800/2000 us.
+ALTHOLD / POSHOLD+ALTHOLD / GPSRESCUE at 1000/1200/1400/1600/1800/2000 us.
 The fifth detent holds both horizontal position and altitude. ARM follows
 the switch level (button value 1 -> 2000 us, value 0 -> 1000 us), including
 initial device-state events; it no longer toggles on each press. AUX2 high
 requests OFFBOARD; AUX4 remains an unbound Trigger.
 For AirSim, also enable GPS with the VIRTUAL provider, set `trust_mag = ON`
-and use the appropriate `ap_hover_throttle` (1590 for the default 1 kg frame).
+and use the appropriate `ap_hover_throttle` (1211 for the calibrated 2 kg
+F70/HQ7040 frame, with `ap_throttle_min=1050`).
 Apply configuration with SITL stopped, then restart it from the same working
 directory so it loads the updated `eeprom.bin`.
 
@@ -98,7 +99,8 @@ vehicle: both would overwrite the same virtual sensors.
     python3 src/test/sitl/airsim_control_test.py \
         --binary obj/main/betaflight_SITL.elf --vehicle Copter --scenario all
 
-The script provisions and launches its own SITL in a new artifact directory;
+The script clones `--eeprom eeprom.bin` (including the calibrated PID profile),
+provisions and launches its own SITL in a new artifact directory;
 it never kills existing instances or overwrites your normal `eeprom.bin`.
 It checks sensor/heading agreement before arming, then takeoff, a sustained
 hover, roll/pitch/yaw direction, a 20 m northbound waypoint and landing.
@@ -111,17 +113,39 @@ The automatic test uses the fifth detent for combined altitude/position hold
 and adds only AUTOPILOT on AUX6 for missions, without changing the radio's
 mode dial, ARM switch or Trigger. AUX5 remains unused. The additional mission
 switch is test-only and is not part of the exported joystick configuration.
+Its AUX-rule slot is 7; canonical slot 6 belongs to the sixth-detent Rescue
+switch and must not be overwritten by a test mission rule.
 
 Artifacts include `config.txt`, `provision.log`, `sitl.log`,
 `trajectory.csv` (AirSim and FC attitude, position, velocity, modes and
 arming flags), and `report.json`. Use `--output <new-directory>` to select
 their location.
 
-`--hover-pwm` defaults to 1590 for AirSim's 1 kg BetaFlight QuadX with four
-4.18 N rotors (about 59% collective), not the harness plant's 30% hover
-thrust. Different mass/rotors require a matching value. The test enforces
+`--hover-pwm` defaults to 1211 for AirSim's 2 kg F70/HQ7040 QuadX with four
+22.761 N rotors. At sea level each rotor needs about 21.54% of maximum thrust.
+With PWM endpoints 1055..2000 (`motor_idle=550`), mixer/OFFBOARD collective
+is 16.976%; `altitudeControl` maps that through 1050..2000 to 1211 us.
+Use `ap_throttle_min=1050` for descent headroom and
+`airmode_start_throttle_percent=15` so a low-throttle takeoff can latch
+wasThrottleRaised and activate the level/hold loops (the default 25% exceeds
+the new hover collective). The default linear RC curve
+maps 1250 us input to the 1211 us ALTHOLD neutral point; the test uses this
+conversion instead of applying the hover parameter directly to the stick.
+Different mass/rotors/RC curves/endpoints require matching values. The test enforces
 a 15 m height / 45 m horizontal / 45 degree tilt envelope. These are
 simulation-only tests, not hardware flight procedures.
+
+The F70 model also has substantially higher roll/pitch thrust and Yaw torque
+than the former rotor model. The validated 2 kg frame uses profile-0
+roll P/I/D/F=10/17/6/26, pitch=12/21/8/31, Yaw=30/0/0/24, d_max_roll=9,
+d_max_pitch=11 and feedforward_yaw_hold_gain=30. Do not run the low-thrust
+model's former high gains with the new rotors: measured rates/output can
+saturate when POSHOLD starts steering. These are simulation regression
+settings, not general hardware defaults; no firmware PID defaults changed.
+Navigation regression now requires continuous 60 s waypoint dwell, including
+altitude retention after the completion callback clears its target. Landing
+uses a bounded velocity-driven altitude reference; its far-below sentinel
+must not become a large altitude-P error that forces idle/freefall.
 
 In active ALTHOLD (including the fifth POSHOLD+ALTHOLD detent), full-low
 throttle requests descent at `alt_hold_climb_rate`; it is not a command to
@@ -158,7 +182,7 @@ It verifies host arming with AUX3 ARM low, OFFBOARD with the firmware's
 angle/altitude/position loops inactive, a 2 m takeoff/hover/landing and body-rate tracking in both
 Yaw directions plus roll/pitch. Python rate commands are FLU rad/s; AirSim
 ground-truth FRD rates negate pitch and Yaw. The script supplies an explicit
-small host attitude/altitude loop using `moveByAngleRatesThrottleAsync`;
+small host attitude/altitude loop with horizontal velocity damping using `moveByAngleRatesThrottleAsync`;
 the adapter does not implement high-level takeoff/hover/position commands,
 and OFFBOARD itself disables the firmware's level/altitude/position loops.
 
@@ -171,6 +195,29 @@ not just reaching the launch point's height. Completing a Python rate command
 does not stop the adapter's 100 Hz heartbeat: the last command persists while
 API control is enabled. Send a neutral command, disarm and disable API control
 explicitly when handing control back.
+
+API OFFBOARD uses the `0x20` mode request, not an injected AUX2 switch.
+Changing the radio dial preempts API-entered OFFBOARD without requiring
+neutral sticks or low throttle. Old API heartbeats cannot take control back;
+disable/re-enable API control for an explicit new request. The real AUX2
+OFFBOARD switch retains its previous priority over ordinary dial modes.
+GPS Rescue preempts both paths and releases host PID/throttle authority
+before the Rescue/hold controllers activate. API throttle also counts
+towards the existing throttle-raised latch after arming.
+
+An API-armed flight stays armed on pilot takeover even if AUX3 was low.
+A subsequent ARM high-to-low edge explicitly disarms, and Rescue's automatic
+disarm is not undone by old API arm requests. Pilot RX loss still invokes
+normal failsafe; stale HOST_RC fallback does not overwrite the selected mode.
+
+To test all radio detents, explicit switch behavior and API-to-GPS Rescue:
+
+    python3 src/test/sitl/airsim_offboard_test.py \
+        --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin \
+        --vehicle Copter --takeover
+
+This adds real UDP RC (never synthetic FDM), requires about 40 m of clear
+flight area and keeps the old API heartbeat active through Rescue landing.
 
 ### Automatic real-AirSim Yaw tuning
 
@@ -216,3 +263,33 @@ are simulation-specific and do not certify hardware or aggressive maneuvers.
 Offline scoring/persistence checks:
 
     PYTHONPATH=src/test/sitl python3 -m unittest airsim_yaw_tune_unittest
+
+### Sixth-detent GPS Rescue / one-switch return home
+
+The sixth AUX1 detent (2000 us) selects permanent box id 46, GPS Rescue.
+Use `src/test/sitl/airsim_rescue_test.py` with UE Play, GPS ready, API control
+disabled and no other RC sender:
+
+    python3 src/test/sitl/airsim_rescue_test.py \
+        --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin --vehicle Copter
+
+The test clones the source EEPROM, takes off, flies >30 m using ordinary
+pilot RC in POSHOLD+ALTHOLD, brakes, then changes only the mode dial to
+GPSRESCUE with neutral sticks. It verifies actual return near the arming
+point, a fresh ground contact, automatic disarm and no unintended re-arm.
+No outbound mission, OFFBOARD controller or synthetic GPS/pose is used.
+The flight corridor must be clear for about 40 m and up to 12 m high.
+
+The temporary simulation profile uses FIXED_ALT=8 m, 2.5 m/s return speed,
+1.5 m/s ascent and 0.5 m/s descent. The test never changes the source EEPROM.
+To explicitly persist this simulation-only profile after reviewing it:
+
+    python3 src/test/sitl/airsim_rescue_test.py --print-config > rescue.cfg
+    obj/main/betaflight_SITL.elf --config rescue.cfg
+
+Restart SITL from the same working directory. Keep the mode dial out of
+Rescue when arming, wait for GPS fix/home, and keep ARM high during return.
+With ENABLE_RESCUE_PLAN (default on this SITL), the GPS Rescue switch invokes
+a synthesized climb/home/land mission; MSP shows AUTOPILOT+ALTHOLD+POSHOLD
+instead of the legacy GPS_RESCUE flight-mode bit. Loss of GPS/home can cause
+degraded landing rather than return. The 8 m profile is not for real aircraft.

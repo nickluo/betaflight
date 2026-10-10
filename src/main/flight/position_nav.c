@@ -73,6 +73,7 @@ void positionNavSetTargetEf(
 
     cmd.targetPosEfM = *targetPosEfM;
     cmd.includeAltitude = includeAltitude;
+    cmd.altitudeVelocityOnly = false;
     cmd.cruiseSpeedMps = cruiseSpeedMps;
     cmd.acceptanceRadiusM = acceptanceRadiusM;
     cmd.completionSpeedMps = completionSpeedMps;
@@ -130,6 +131,11 @@ void positionNavSetAccelLimits(float maxAccelMps2, float maxDecelMps2)
 void positionNavSetAltitudeArrivalRequired(bool required)
 {
     cmd.altitudeArrivalRequired = required;
+}
+
+void positionNavSetAltitudeVelocityOnly(bool enabled)
+{
+    cmd.altitudeVelocityOnly = enabled;
 }
 
 void positionNavSetAutoClearOnReach(bool autoClear)

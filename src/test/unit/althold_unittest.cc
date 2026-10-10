@@ -308,6 +308,46 @@ TEST_F(AltholdControlUnittest, NavigationAltitudeStillOverridesFullLowThrottle)
     EXPECT_EQ(debug[6], 75);
 }
 
+TEST_F(AltholdControlUnittest, LandingSentinelUsesBoundedDescentInsteadOfMinimumThrottle)
+{
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 800.0f;
+    testNavActive = true;
+    testNavCommand.includeAltitude = true;
+    testNavCommand.altitudeVelocityOnly = true;
+    testNavCommand.targetPosEfM.z = -192.0f; // landing target 200 m below current altitude
+    testNavVelocityCmS.z = -50.0f;
+    rcCommand[THROTTLE] = 1500.0f;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+
+    EXPECT_EQ(debug[2], 800);
+    EXPECT_EQ(debug[6], -25);
+    EXPECT_GT(getAutopilotThrottle(), 0.4f);
+
+    for (int i = 0; i < 200; i++) {
+        updateAltHold(currentTimeUs); // stopped descent must not wind target toward the sentinel
+    }
+    EXPECT_GE(debug[2], 750);
+    EXPECT_GT(getAutopilotThrottle(), 0.4f);
+}
+
+TEST_F(AltholdControlUnittest, ClearingCompletedNavigationRetainsItsAltitude)
+{
+    debugMode = DEBUG_AUTOPILOT_ALTITUDE;
+    testAltitudeCm = 1000.0f;
+    testNavActive = true;
+    testNavCommand.includeAltitude = true;
+    testNavCommand.targetPosEfM.z = 12.0f;
+    rcCommand[THROTTLE] = 1500.0f;
+    flightModeFlags = ALT_HOLD_MODE;
+    updateAltHold(currentTimeUs);
+    ASSERT_EQ(debug[2], 1200);
+    testNavActive = false; // completion callback clears target before the next altitude task
+    updateAltHold(currentTimeUs);
+    EXPECT_EQ(debug[2], 1200);
+}
+
 // STUBS
 
 extern "C" {

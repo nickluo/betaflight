@@ -290,7 +290,7 @@ def main():
                 (1, -32767, None, "ACRO"),
                 (2, -19660, BOX_ANGLE, "ANGLE"),
                 (3, -6554, BOX_HORIZON, "HORIZON"),
-                (6, 32767, None, "reserved"),
+                (6, 32767, None, "GPSRESCUE (disarmed)"),
                 (1, -32767, None, "back to ACRO")):
             state.feed(ev(True, 4, raw))
             want_us = sj.MODE6_VALUES_US[pos - 1]

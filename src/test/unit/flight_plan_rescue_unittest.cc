@@ -158,6 +158,11 @@ void positionNavSetAltitudeArrivalRequired(bool required)
     g_altitudeArrivalRequired = required;
 }
 
+void positionNavSetAltitudeVelocityOnly(bool enabled)
+{
+    (void)enabled;
+}
+
 bool positionEstimatorGetGpsOrigin(gpsLocation_t *out)
 {
     if (!g_stubGpsOriginSet || out == NULL) {

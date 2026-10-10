@@ -174,6 +174,10 @@ clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, u
     }
 
     state->arm = cmd.arm ? 1 : 0;
+    if (cmd.mode_req == 2 && state->modeReq != 2) {
+        state->apiRequestPending = true;
+    }
+    state->modeReq = cmd.mode_req;
     state->lastHostTsUs = cmd.host_ts_us;
     state->lastCmdSeq = cmd.cmd_seq;
     state->throttle = cmd.throttle < 1000 ? 1000 : (cmd.throttle > 2000 ? 2000 : cmd.throttle);
@@ -191,6 +195,62 @@ bool clControlIsFresh(const clControlState_t *state, uint32_t nowMs, uint16_t wa
     // unsigned subtraction tolerates millis() wraparound; fresh while the age
     // has not yet exceeded the watchdog window
     return state->haveFrame && (uint32_t)(nowMs - state->lastFrameMs) <= watchdogMs;
+}
+
+void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
+    bool pilotModesValid, bool offboardSwitch, bool rescueSwitch, bool pilotArm, bool armed, bool fresh)
+{
+    const bool newApiRequest = state->apiRequestPending;
+    if (newApiRequest) {
+        state->apiBlocked = false;
+        state->pilotDisarmed = false;
+        state->apiRequestPending = false;
+    }
+
+    const bool modeChanged = pilotModesValid && state->havePilotModes
+        && state->pilotModes != pilotModes;
+    const bool pilotDisarm = pilotModesValid && state->havePilotModes
+        && state->pilotArm && !pilotArm;
+    const bool apiTakeover = (state->authority == CL_AUTHORITY_API || newApiRequest) && modeChanged;
+    const bool rcTakeover = state->authority == CL_AUTHORITY_RC && !offboardSwitch;
+    if (apiTakeover || rcTakeover || rescueSwitch) {
+        state->apiBlocked = true;
+        state->handoverArm |= armed && state->arm;
+    }
+    if (pilotDisarm) {
+        state->pilotDisarmed = true;
+        state->apiBlocked = true;
+        state->handoverArm = false;
+    }
+    if (!armed) {
+        state->handoverArm = false;
+    }
+
+    if (pilotModesValid) {
+        state->pilotModes = pilotModes;
+        state->pilotArm = pilotArm;
+        state->havePilotModes = true;
+    }
+    if (fresh && !rescueSwitch && !state->pilotDisarmed && offboardSwitch) {
+        state->authority = CL_AUTHORITY_RC;
+    } else if (fresh && !rescueSwitch && !state->apiBlocked && state->modeReq == 2) {
+        state->authority = CL_AUTHORITY_API;
+        state->handoverArm = false;
+    } else {
+        state->authority = CL_AUTHORITY_NONE;
+    }
+}
+
+bool clControlModeRequested(const clControlState_t *state)
+{
+    return state->authority == CL_AUTHORITY_RC
+        || (state->authority == CL_AUTHORITY_API && state->modeReq == 2 && !state->apiBlocked);
+}
+
+bool clControlHostArmActive(const clControlState_t *state, bool armed, bool fresh)
+{
+    return (armed && state->handoverArm && !state->pilotDisarmed)
+        || (fresh && state->arm && !state->pilotDisarmed && clControlModeRequested(state));
 }
 
 #endif // USE_CUSTOM_LINK

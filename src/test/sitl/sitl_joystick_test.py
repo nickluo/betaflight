@@ -49,6 +49,7 @@ class TestMappingHelpers(unittest.TestCase):
             [3, 3, sj.RC_CHANNEL_INDICES["mode6"] - 4, 1500, 1900, 0, 0],
             [4, 11, sj.RC_CHANNEL_INDICES["mode6"] - 4, 1700, 1900, 0, 0],
             [5, 58, sj.RC_CHANNEL_INDICES["switch3"] - 4, 1700, 2100, 0, 0],
+            [6, 46, sj.RC_CHANNEL_INDICES["mode6"] - 4, 1900, 2100, 0, 0],
         ])
 
     def test_fifth_detent_activates_position_and_altitude_hold(self):
@@ -62,8 +63,9 @@ class TestMappingHelpers(unittest.TestCase):
         self.assertEqual(modes_at(1400), {2})
         self.assertEqual(modes_at(1600), {3})
         self.assertEqual(modes_at(1800), {3, 11})
-        self.assertEqual(modes_at(2000), set())
+        self.assertEqual(modes_at(2000), {46})
         self.assertEqual(sj.MODE6_NAMES[4], "POSHOLD+ALTHOLD")
+        self.assertEqual(sj.MODE6_NAMES[5], "GPSRESCUE")
 
     def test_axis_to_us_extremes_and_center(self):
         self.assertEqual(sj.axis_to_us(-32767), 1000)

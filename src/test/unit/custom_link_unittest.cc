@@ -513,6 +513,189 @@ TEST(CustomLinkControlTest, TestNonControlFramesIgnored)
     EXPECT_FALSE(state.haveFrame);
 }
 
+TEST(CustomLinkControlTest, StoresApiModeRequest)
+{
+    clControlState_t state;
+    clControlReset(&state);
+    clFrame_t frame = {};
+    frame.msgId = CUSTOM_LINK_MSG_HOST_CONTROL;
+    frame.len = sizeof(clPayloadControl_t);
+    clPayloadControl_t cmd = {};
+    cmd.mode_req = 2;
+    memcpy(frame.payload, &cmd, sizeof(cmd));
+    clControlApplyFrame(&state, &frame, 1000);
+    EXPECT_EQ(state.modeReq, 2);
+}
+
+class CustomLinkAuthorityTest : public ::testing::Test {
+protected:
+    clControlState_t state = {};
+    void command(uint8_t mode = 2, uint8_t arm = 1)
+    {
+        clFrame_t frame = {};
+        frame.msgId = CUSTOM_LINK_MSG_HOST_CONTROL;
+        frame.len = sizeof(clPayloadControl_t);
+        clPayloadControl_t cmd = {};
+        cmd.mode_req = mode;
+        cmd.arm = arm;
+        cmd.throttle = 1800;
+        cmd.rate_x10[FD_YAW] = 1000;
+        memcpy(frame.payload, &cmd, sizeof(cmd));
+        clControlApplyFrame(&state, &frame, 1000);
+    }
+    void update(uint32_t modes, bool rcOffboard = false, bool rescue = false,
+        bool pilotArm = false, bool armed = true, bool fresh = true, bool valid = true)
+    {
+        clControlUpdateAuthority(&state, modes, valid, rcOffboard, rescue, pilotArm, armed, fresh);
+    }
+};
+
+TEST_F(CustomLinkAuthorityTest, ApiEntryDoesNotRequireOffboardSwitch)
+{
+    command();
+    update(1);
+    EXPECT_EQ(state.authority, CL_AUTHORITY_API);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    EXPECT_TRUE(clControlHostArmActive(&state, false, true));
+}
+
+TEST_F(CustomLinkAuthorityTest, EveryPilotModeChangePreemptsApiWithoutStickOrThrottleGates)
+{
+    for (uint32_t modes : {0U, 1U, 2U, 4U, 12U, 16U}) {
+        clControlReset(&state);
+        command();
+        update(32);
+        update(modes);
+        EXPECT_FALSE(clControlModeRequested(&state));
+        EXPECT_TRUE(state.apiBlocked);
+        EXPECT_TRUE(clControlHostArmActive(&state, true, true));
+    }
+}
+
+TEST_F(CustomLinkAuthorityTest, OldHeartbeatsAndWatchdogRecoveryCannotRecapturePilot)
+{
+    command();
+    update(0);
+    update(1);
+    command();
+    update(1);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    update(1, false, false, false, true, false);
+    update(1);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+    command(0, 0);
+    update(1);
+    EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+    command();
+    update(1);
+    EXPECT_TRUE(clControlModeRequested(&state));
+}
+
+TEST_F(CustomLinkAuthorityTest, ExplicitRcSwitchKeepsPriorityOverOrdinaryDialChanges)
+{
+    command();
+    update(0, true);
+    update(1, true);
+    EXPECT_EQ(state.authority, CL_AUTHORITY_RC);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    update(1);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    command();
+    update(1);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    update(1, true);
+    EXPECT_TRUE(clControlModeRequested(&state));
+}
+
+TEST_F(CustomLinkAuthorityTest, PilotModeChangeWinsEvenWhenNewApiRequestArrivesInSameCycle)
+{
+    command();
+    update(0);
+    update(1);
+    command(0);
+    update(1);
+    command();
+    update(2);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    EXPECT_TRUE(state.apiBlocked);
+    EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+}
+
+TEST_F(CustomLinkAuthorityTest, NewApiSessionDoesNotRetainPilotArmContinuity)
+{
+    command();
+    update(0);
+    update(1);
+    command(0, 0);
+    update(1);
+    EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+    command(2, 0);
+    update(1);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    EXPECT_FALSE(clControlHostArmActive(&state, true, true));
+}
+
+TEST_F(CustomLinkAuthorityTest, RescuePreemptsEitherEntryPath)
+{
+    for (bool rcSwitch : {false, true}) {
+        clControlReset(&state);
+        command();
+        update(0, rcSwitch);
+        update(16, rcSwitch, true);
+        EXPECT_FALSE(clControlModeRequested(&state));
+        EXPECT_TRUE(state.apiBlocked);
+        EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+        update(16, rcSwitch, true, false, false);
+        EXPECT_FALSE(clControlHostArmActive(&state, false, true));
+    }
+}
+
+TEST_F(CustomLinkAuthorityTest, PilotArmLowAtTakeoverDoesNotDisarmButFallingEdgeDoes)
+{
+    command();
+    update(0);
+    update(1);
+    EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+    update(1, false, false, true);
+    update(1);
+    EXPECT_FALSE(clControlHostArmActive(&state, true, true));
+    command();
+    update(1);
+    EXPECT_FALSE(clControlHostArmActive(&state, false, true));
+}
+
+TEST_F(CustomLinkAuthorityTest, LandingDisarmCannotBeUndoneByHeldApiArm)
+{
+    command();
+    update(0);
+    update(1);
+    EXPECT_FALSE(clControlHostArmActive(&state, false, true));
+    update(1, false, false, false, false);
+    command();
+    update(1, false, false, false, false);
+    EXPECT_FALSE(clControlHostArmActive(&state, false, true));
+}
+
+TEST_F(CustomLinkAuthorityTest, InvalidPilotChannelsDoNotGhostSwitchApiModes)
+{
+    command();
+    update(0);
+    update(1, false, false, false, true, true, false);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    update(1);
+    EXPECT_FALSE(clControlModeRequested(&state));
+}
+
+TEST_F(CustomLinkAuthorityTest, WatchdogStillDropsHostAuthorityWithoutPilotTakeover)
+{
+    command();
+    update(0);
+    update(0, false, false, false, true, false);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    EXPECT_FALSE(clControlHostArmActive(&state, true, false));
+}
+
 TEST(CustomLinkStructTest, TestPackedLayout)
 {
     EXPECT_EQ(sizeof(clPayloadFast_t), 22u);

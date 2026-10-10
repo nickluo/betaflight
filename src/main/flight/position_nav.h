@@ -34,6 +34,7 @@ typedef struct positionNavCommand_s {
 
     vector3_t targetPosEfM;         // target position, metres, ENU (index by ENU_E/ENU_N/ENU_U)
     bool includeAltitude;           // when false, ENU_U is ignored for nav, arrival, and alt coupling
+    bool altitudeVelocityOnly;      // landing sentinel is a velocity generator, not an altitude setpoint
 
     float cruiseSpeedMps;           // maximum cruise speed (m/s)
     float acceptanceRadiusM;        // arrival zone radius (metres)
@@ -83,6 +84,7 @@ void positionNavSetAutoClearOnReach(bool autoClear);
 // not reached the commanded altitude; station-keeping targets (hold, land)
 // keep the altitude gate. Defaults to true on each new target.
 void positionNavSetAltitudeArrivalRequired(bool required);
+void positionNavSetAltitudeVelocityOnly(bool enabled);
 
 // Called each control cycle; reads current estimate, computes target velocity,
 // and checks arrival conditions.

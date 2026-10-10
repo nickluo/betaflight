@@ -66,6 +66,7 @@ struct CapturedTarget {
     float acceptanceRadiusM;
     float completionSpeedMps;
     bool includeAltitude;
+    bool altitudeVelocityOnly;
     positionNavReachedCallbackFn callback;
     void *userData;
     bool valid;
@@ -108,6 +109,7 @@ void positionNavSetTargetEf(
     g_lastTarget.acceptanceRadiusM = acceptanceRadiusM;
     g_lastTarget.completionSpeedMps = completionSpeedMps;
     g_lastTarget.includeAltitude = includeAltitude;
+    g_lastTarget.altitudeVelocityOnly = false;
     g_lastTarget.callback = callback;
     g_lastTarget.userData = userData;
     g_lastTarget.valid = true;
@@ -145,6 +147,11 @@ static bool g_altitudeArrivalRequired;
 void positionNavSetAltitudeArrivalRequired(bool required)
 {
     g_altitudeArrivalRequired = required;
+}
+
+void positionNavSetAltitudeVelocityOnly(bool enabled)
+{
+    g_lastTarget.altitudeVelocityOnly = enabled;
 }
 
 bool positionEstimatorGetGpsOrigin(gpsLocation_t *out)
@@ -1081,6 +1088,7 @@ TEST_F(FlightPlanNavTest, LandWaypointTouchdownDisarmsAndCompletes)
     flightPlanNavEngage();
     triggerReached();
     ASSERT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+    ASSERT_TRUE(g_lastTarget.altitudeVelocityOnly);
     const int dispatchesBeforeTouchdown = g_setTargetCalls;
 
     // Descent establishes (above 25% of the commanded rate).

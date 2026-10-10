@@ -823,6 +823,7 @@ static void startLanding(timeUs_t currentTimeUs, float targetEastM, float target
 
     const float descentMps = MAX(FP_LANDING_MIN_RATE_MPS, landingDescentRateCmS() * 0.01f);
     positionNavSetTargetEf(&targetM, descentMps, 1.0f, 0.1f, true, NULL, NULL);
+    positionNavSetAltitudeVelocityOnly(true);
 
     fp.state = FP_NAV_LANDING;
     fp.landingStartUs = currentTimeUs;

@@ -252,14 +252,29 @@ typedef enum {
     CL_EVENT_DISARM_REQUEST,    // host arm bit went 1 -> 0
 } clEvent_e;
 
+typedef enum {
+    CL_AUTHORITY_NONE = 0,
+    CL_AUTHORITY_API,
+    CL_AUTHORITY_RC,
+} clAuthority_e;
+
 typedef struct {
     uint64_t lastHostTsUs;
     uint32_t lastFrameMs;
     uint16_t lastCmdSeq;
     uint8_t arm;
+    uint8_t modeReq;
     uint16_t throttle;          // clamped to 1000-2000
     int16_t rateX10[3];
     bool haveFrame;
+    clAuthority_e authority;
+    uint32_t pilotModes;
+    bool havePilotModes;
+    bool apiRequestPending;
+    bool apiBlocked;
+    bool handoverArm;
+    bool pilotArm;
+    bool pilotDisarmed;
 } clControlState_t;
 
 void clControlReset(clControlState_t *state);
@@ -270,5 +285,11 @@ clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, u
 
 // True while the most recent control frame is younger than watchdogMs.
 bool clControlIsFresh(const clControlState_t *state, uint32_t nowMs, uint16_t watchdogMs);
+
+// pilotModes contains flight-mode boxes, excluding ARM and OFFBOARD.
+void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
+    bool pilotModesValid, bool offboardSwitch, bool rescueSwitch, bool pilotArm, bool armed, bool fresh);
+bool clControlModeRequested(const clControlState_t *state);
+bool clControlHostArmActive(const clControlState_t *state, bool armed, bool fresh);
 
 #endif // USE_CUSTOM_LINK

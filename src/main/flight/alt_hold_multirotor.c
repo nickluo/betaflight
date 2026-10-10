@@ -50,6 +50,7 @@ typedef struct {
     float targetVelocity;
     float deadband;
     bool allowStickAdjustment;
+    bool navVelocityOnly;
 } altHoldState_t;
 
 altHoldState_t altHold;
@@ -67,6 +68,7 @@ static void altHoldReset(void)
     resetAltitudeControl();
     altHold.targetAltitudeCm = getAltitudeCmControl();
     altHold.targetVelocity = 0.0f;
+    altHold.navVelocityOnly = false;
 }
 
 void altHoldInit(void)
@@ -144,26 +146,38 @@ static void altHoldUpdateTargetAltitude(void)
 
 static void altHoldUpdate(void)
 {
-    
-    if (altHoldConfig()->climbRate) {
-        altHoldUpdateTargetAltitude(); // check if the pilot has changed the target altitude using sticks
+    const positionNavCommand_t *navCmd = positionNavHasActiveTarget() ? positionNavGetActiveCommand() : NULL;
+    const bool navAltitude = navCmd && navCmd->includeAltitude;
+    if (!navAltitude && altHoldConfig()->climbRate) {
+        altHoldUpdateTargetAltitude();
     }
 
-    float targetAltitudeCm = altHold.targetAltitudeCm; 
+    float targetAltitudeCm = altHold.targetAltitudeCm;
     float targetAltitudeVelocity = altHold.targetVelocity;
 
-    if (positionNavHasActiveTarget()) {
-        const positionNavCommand_t *navCmd = positionNavGetActiveCommand();
-        if (navCmd->includeAltitude) {
-            targetAltitudeCm = navCmd->targetPosEfM.z * 100.0f;
-            if (positionNavTargetReached()) {
-                altHold.targetAltitudeCm = targetAltitudeCm; // store target altitude so Alt Hold does not revert to pre-nav target altitude on the next cycle.
-            targetAltitudeVelocity = 0.0f;
-            } else {
-                 targetAltitudeVelocity = positionNavGetTargetVelocityCmS().z; 
+    if (navAltitude) {
+        targetAltitudeVelocity = positionNavTargetReached() ? 0.0f : positionNavGetTargetVelocityCmS().z;
+        if (navCmd->altitudeVelocityOnly) {
+            const float altitude = getAltitudeCmControl();
+            if (!altHold.navVelocityOnly) {
+                altHold.targetAltitudeCm = altitude;
             }
+            targetAltitudeVelocity = constrainf(targetAltitudeVelocity, -altHoldMaxClimbRate(), altHoldMaxClimbRate());
+            // The far-below landing target prevents navigation arrival; do not
+            // feed it to altitude P. Track descent with at most one second of lag.
+            const float errorLimitCm = fmaxf(fabsf(targetAltitudeVelocity), 1.0f);
+            altHold.targetAltitudeCm = constrainf(
+                altHold.targetAltitudeCm + targetAltitudeVelocity * taskIntervalSeconds,
+                altitude - errorLimitCm, altitude + errorLimitCm);
+            targetAltitudeCm = altHold.targetAltitudeCm;
+        } else {
+            targetAltitudeCm = navCmd->targetPosEfM.z * 100.0f;
+            // A completion callback can clear the target before the altitude
+            // task sees "reached"; retain every live target for the final hold.
+            altHold.targetAltitudeCm = targetAltitudeCm;
         }
     }
+    altHold.navVelocityOnly = navAltitude && navCmd->altitudeVelocityOnly;
 
     altitudeControl(targetAltitudeCm, taskIntervalSeconds, targetAltitudeVelocity, altHoldMaxClimbRate());
 }

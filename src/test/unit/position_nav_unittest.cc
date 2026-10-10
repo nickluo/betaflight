@@ -74,6 +74,19 @@ protected:
 
 // --- Direction correctness ---
 
+TEST_F(PositionNavTest, LandingVelocityOnlyFlagDoesNotLeakToNextWaypoint)
+{
+    const vector3_t target = {{0.0f, 0.0f, -200.0f}};
+    positionNavSetTargetEf(&target, 0.5f, 1.0f, 0.1f, true, NULL, NULL);
+    positionNavSetAltitudeVelocityOnly(true);
+    ASSERT_TRUE(positionNavGetActiveCommand()->altitudeVelocityOnly);
+    positionNavSetTargetEf(&target, 1.0f, 1.0f, 0.1f, true, NULL, NULL);
+    EXPECT_FALSE(positionNavGetActiveCommand()->altitudeVelocityOnly);
+    positionNavSetAltitudeVelocityOnly(true);
+    positionNavReset();
+    EXPECT_FALSE(positionNavGetActiveCommand()->altitudeVelocityOnly);
+}
+
 TEST_F(PositionNavTest, EastTargetProducesEastwardVelocity)
 {
     const vector3_t target = {{ 10.0f, 0.0f, 0.0f }};  // 10m east

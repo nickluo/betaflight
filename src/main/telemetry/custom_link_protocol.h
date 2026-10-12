@@ -57,6 +57,7 @@ typedef enum {
     CUSTOM_LINK_MSG_FC_MEDIUM      = 0x11,   // 100 Hz baro/temperature/rc channels
     CUSTOM_LINK_MSG_FC_SLOW        = 0x12,   // 10 Hz battery/gps/flight mode
     CUSTOM_LINK_MSG_FC_MOTORS      = 0x13,   // 200 Hz mixer motor outputs (SITL)
+    CUSTOM_LINK_MSG_FC_ODOMETRY    = 0x14,   // 100 Hz ARM-relative ENU odometry
     CUSTOM_LINK_MSG_HOST_CONTROL   = 0x20,   // 100-200 Hz control setpoints
     CUSTOM_LINK_MSG_HOST_IMU       = 0x21,   // >=200 Hz simulator IMU injection (SITL)
     CUSTOM_LINK_MSG_HOST_ENV       = 0x22,   // 10-50 Hz simulator baro/GPS injection (SITL)
@@ -106,6 +107,29 @@ typedef struct __attribute__((packed)) {
     uint32_t mode_flags;        // flightModeFlags (see flightModeFlags_e)
     uint16_t status;            // bit0 = armed, bit1 = failsafe active
 } clPayloadSlow_t;
+
+// 0x14 - 100 Hz, same sampling epoch for position, velocity, attitude and gyro (64 bytes).
+// Sent only while armed with a 3D GPS fix, a GPS origin captured at ARM, and valid fusion.
+typedef struct __attribute__((packed)) {
+    uint32_t ts_us;             // FC telemetry sample timestamp
+    uint16_t flags;
+    uint16_t origin_id;         // increments on each successful ARM (wraps at 65536)
+    int32_t position_cm[3];     // ENU, relative to the ARM position
+    int16_t velocity_cms[3];    // ENU
+    int16_t attitude_cdeg[3];   // as 0x10: FLU R/P/Y; yaw CCW from North
+    int16_t gyro_dps_x10[3];    // FLU body angular velocity
+    float position_variance[3]; // m^2, ENU diagonal
+    float velocity_variance[3]; // (m/s)^2, ENU diagonal
+    int16_t arm_yaw_cdeg;       // yaw captured at ARM, CCW from North, [-18000, 18000]
+} clPayloadOdometry_t;
+
+#define CL_ODOM_GPS_3D_FIX           0x0001
+#define CL_ODOM_ARM_ORIGIN          0x0002
+#define CL_ODOM_ESTIMATE_VALID      0x0004
+#define CL_ODOM_ARMED               0x0008
+#define CL_ODOM_VALID_FLAGS         (CL_ODOM_GPS_3D_FIX | CL_ODOM_ARM_ORIGIN | CL_ODOM_ESTIMATE_VALID | CL_ODOM_ARMED)
+
+_Static_assert(sizeof(clPayloadOdometry_t) == 64, "odometry payload size");
 
 #define CL_STATUS_ARMED              0x0001
 #define CL_STATUS_FAILSAFE           0x0002

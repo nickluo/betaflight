@@ -69,6 +69,86 @@ Betaflight has the following features:
 
 See: https://betaflight.com/docs/wiki
 
+## Custom-link local odometry
+
+Custom firmware builds with `USE_CUSTOM_LINK` and `USE_GPS` add a 100 Hz
+`0x14` odometry downlink alongside `0x11`, without modifying existing payloads.
+Its 64-byte payload carries ARM-relative ENU fused position/velocity, FLU
+attitude/angular rates, covariance and per-flight origin/validity metadata,
+including yaw captured at the successful ARM edge. See
+[the protocol definition](src/main/telemetry/custom_link_protocol.h).
+The GPS origin is captured at the successful ARM edge with a fresh 3D fix;
+GPS loss pauses the stream and recovery keeps that origin. A new ARM resets it.
+No 3D fix at ARM means no odometry for that flight, rather than a late invented
+origin. Position-source settings and estimator validity/freshness remain in force.
+Old hosts can ignore the new ID. A companion bridge can publish these frames as
+ROS 2 `nav_msgs/msg/Odometry` on `/fpv/odom` at the same 100 Hz rate, rotating
+the pose into a fixed frame with X along the initial ARM heading, Y left and
+Z up. Internal flight-navigation/estimator coordinates stay ENU. GPS recovery
+keeps both the original position and heading; re-arming captures new ones.
+
+### AirSim POS HOLD odometry regression
+
+The `0x10` and `0x14` attitude/ARM yaw both use **CCW-positive mathematical
+yaw from North**. Native `attitude.values.yaw` is a clockwise compass heading
+and is negated at the telemetry boundary. Do not send native compass yaw
+unchanged in `0x14`: it mirrors the local heading frame at nonzero ARM headings
+and makes pose yaw inconsistent with body angular velocity.
+
+Virtual GPS DOP is scaled by 100 (1.0 is 100, not 10). Values below 100 are
+treated as unknown by the position estimator and previously inflated GPS
+measurement noise by 100x, causing velocity/position lag and slow hold settling.
+The virtual provider now supplies valid pDOP/hDOP/vDOP reference values.
+The altitude estimator also keeps a filtered disarmed barometer reference at
+ARM rather than making one noisy pressure sample a permanent flight-height
+offset. This changes reference capture, not the high-rate motion estimate.
+
+The synthetic magnetic field has **2 degrees east declination**. With SITL
+stopped, apply the simulator-only calibration to its working EEPROM:
+
+```bash
+obj/main/betaflight_SITL.elf --config src/test/sitl/airsim_compass.cfg
+```
+
+This sets only `mag_declination=20` (0.1 degree units), not PID gains or the
+hardware compass calibration. Keep a backup of the simulation EEPROM. Start
+SITL, AirSim and the rebuilt ROS custom-link bridge, stop other controllers,
+then in a sourced ROS workspace run:
+
+```bash
+python3 src/test/sitl/airsim_odom_hold_test.py \
+    --output /tmp/airsim_hold_run --turn --verify
+```
+
+The test arms via native RC in ACRO (required by firmware arming checks), selects
+POS HOLD+ALT HOLD before taking off, then climbs, flies forward,
+brakes, hovers, tests yaw, lands and confirms disarming. All FC control is sent
+via the custom protocol; AirSim ground truth is only used for observation.
+CSV/JSON results distinguish true lateral motion from odometry frame errors.
+Regression limits include X/Y position RMS error below 0.12/0.03 m, settled
+horizontal hover span below 0.25/0.10 m, and roll/pitch span below 1 degree.
+Use a fresh idle SITL instance for each run; the firmware deliberately latches
+RC/API source authority after a pilot disarm, so do not bypass that latch with
+repeated old RC commands. The test verifies that its mode commands are accepted
+before arming.
+
+Real UE/AirSim regression on 2026-10-12, including hold-mode takeoff, forward
+flight, braking, 20 s hover, yaw and landing, passed the above limits at multiple
+nonzero ARM headings without changing PID gains. Representative observations:
+
+| Metric | Before corrections | Corrected hold-mode takeoff run |
+|---|---:|---:|
+| Forward X position RMS error | 0.157 m | 0.089 m |
+| Forward Y position RMS error | 0.048 m | 0.008 m |
+| Post-flight hover Y position RMS error | 0.095 m | 0.016 m |
+| Hover true X/Y excursion | 0.608 / 0.131 m | 0.156 / 0.020 m |
+| Hover pitch excursion | 1.661 deg | 0.598 deg |
+
+AirSim's default GPS sensor still has 0.2 s `UpdateLatency`, so moving-position
+samples are not exact zero-latency ground truth; the test reports the remaining
+error rather than masking it. Altitude mode-entry transients are distinguished
+from steady hover by separate CSV stages.
+
 ## Support and Developers Channel
 
 There's a dedicated [Discord server](https://discord.gg/n4E6ak4u3c) for help, support and general community.

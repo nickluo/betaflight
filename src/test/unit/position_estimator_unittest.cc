@@ -24,6 +24,7 @@ extern "C" {
 void getLinearAccelENU(float *accelEast, float *accelNorth, float *accelUp);
 
 #include "io/gps.h"
+#include "io/gps_virtual.h"
 
 #include "sensors/acceleration.h"
 #include "sensors/barometer.h"
@@ -44,6 +45,7 @@ int16_t debug[DEBUG16_VALUE_COUNT];
 
 acc_t acc;
 matrix33_t rMat;
+attitudeEulerAngles_t attitude;
 gpsSolutionData_t gpsSol;
 
 static uint32_t enabledSensors = 0;
@@ -51,6 +53,7 @@ static bool rfHealthy = false;
 static float rfAltCm = 0.0f;
 static float baroAltCm = 0.0f;
 static timeUs_t fakeMicros = 0;
+static bool gps3DFix = true;
 
 bool sensors(uint32_t mask) { return (enabledSensors & mask) != 0; }
 bool rangefinderIsHealthy(void) { return rfHealthy; }
@@ -58,6 +61,7 @@ int32_t rangefinderGetLatestAltitude(void) { return lrintf(rfAltCm); }
 float getBaroAltitude(void) { return baroAltCm; }
 
 timeUs_t micros(void) { return fakeMicros; }
+bool gpsHas3DFix(void) { return STATE(GPS_FIX) && gps3DFix; }
 
 bool gpsHasNewData(uint16_t *gpsStamp)
 {
@@ -87,6 +91,7 @@ protected:
     {
         memset(&acc, 0, sizeof(acc));
         memset(&rMat, 0, sizeof(rMat));
+        memset(&attitude, 0, sizeof(attitude));
         memset(&gpsSol, 0, sizeof(gpsSol));
         memset(debug, 0, sizeof(debug));
 
@@ -107,6 +112,7 @@ protected:
         stateFlags = GPS_FIX;
         armingFlags = ARMED;
         fakeMicros = 0;
+        gps3DFix = true;
 
         positionConfigMutable()->altitude_source = ALTITUDE_SOURCE_RANGEFINDER_PREFER;
         positionConfigMutable()->altitude_prefer_baro = 100;
@@ -115,6 +121,134 @@ protected:
         positionEstimatorInit();
     }
 };
+
+TEST_F(PositionEstimatorTest, ArmOdometryRequiresThreeDFixAtArm)
+{
+    positionEstimate3d_t odom;
+    uint16_t originId;
+    stepEstimator(2);
+    EXPECT_FALSE(positionEstimatorGetArmOdometry(&odom, &originId));
+    gps3DFix = false;
+    positionEstimatorCaptureArmOrigin();
+    stepEstimator(2);
+    EXPECT_FALSE(positionEstimatorGetArmOdometry(&odom, &originId));
+    gps3DFix = true;
+    stepEstimator(2);
+    EXPECT_FALSE(positionEstimatorGetArmOdometry(&odom, &originId));
+    positionEstimatorCaptureArmOrigin();
+    stepEstimator(2);
+    ASSERT_TRUE(positionEstimatorGetArmOdometry(&odom, &originId));
+    EXPECT_EQ(originId, 2);
+    EXPECT_NEAR(odom.position.x, 0, 0.01);
+    EXPECT_NEAR(odom.position.y, 0, 0.01);
+    EXPECT_NEAR(odom.position.z, 0, 0.01);
+}
+
+TEST_F(PositionEstimatorTest, ArmHeadingIsCapturedOnceAndOnlyChangesOnRearm)
+{
+    attitude.values.yaw = 1350;
+    positionEstimatorCaptureArmOrigin();
+    stepEstimator(2);
+    EXPECT_EQ(positionEstimatorGetArmYawCdeg(), -13500);
+    attitude.values.yaw = 2700;
+    stepEstimator(2);
+    EXPECT_EQ(positionEstimatorGetArmYawCdeg(), -13500);
+    DISABLE_STATE(GPS_FIX);
+    stepEstimator(2);
+    ENABLE_STATE(GPS_FIX);
+    stepEstimator(2);
+    EXPECT_EQ(positionEstimatorGetArmYawCdeg(), -13500);
+    armingFlags = 0;
+    stepEstimator(2);
+    armingFlags = ARMED;
+    positionEstimatorCaptureArmOrigin();
+    EXPECT_EQ(positionEstimatorGetArmYawCdeg(), 9000);
+}
+
+TEST_F(PositionEstimatorTest, VirtualGpsUsesValidDopUnitsAndVelocity)
+{
+    setVirtualGPS(47.0, 8.0, 123.0, 2.0, 2.5, 90.0, 1.0, 2.0, -0.5);
+    gpsSolutionData_t solution;
+    getVirtualGPS(&solution);
+    EXPECT_EQ(solution.dop.pdop, 100);
+    EXPECT_EQ(solution.dop.hdop, 100);
+    EXPECT_EQ(solution.dop.vdop, 100);
+    EXPECT_EQ(solution.velned.velN, 100);
+    EXPECT_EQ(solution.velned.velE, 200);
+    EXPECT_EQ(solution.velned.velD, -50);
+    EXPECT_EQ(solution.llh.altCm, 12300);
+}
+
+TEST_F(PositionEstimatorTest, NoisyArmBarometerSampleDoesNotBecomePermanentOdometryOffset)
+{
+    enabledSensors = SENSOR_GPS | SENSOR_BARO;
+    positionConfigMutable()->altitude_source = ALTITUDE_SOURCE_BARO_ONLY;
+    armingFlags = 0;
+    baroAltCm = 10000.0f;
+    stepEstimator(300);
+    baroAltCm = 10100.0f; // One noisy sample immediately before ARM.
+    stepEstimator();
+    armingFlags = ARMED;
+    positionEstimatorCaptureArmOrigin();
+    positionEstimatorResetZ();
+    baroAltCm = 10000.0f;
+    stepEstimator(100);
+    positionEstimate3d_t odom;
+    uint16_t originId;
+    ASSERT_TRUE(positionEstimatorGetArmOdometry(&odom, &originId));
+    EXPECT_NEAR(odom.position.v[ENU_U], 0.0f, 3.0f);
+}
+
+TEST_F(PositionEstimatorTest, ArmOdometryPreservesOriginThroughGpsRecoveryAndRearms)
+{
+    gpsSol.llh.lon = 1000;
+    gpsSol.llh.lat = 2000;
+    gpsSol.llh.altCm = 300;
+    fakeMicros = 1;
+    positionEstimatorCaptureArmOrigin();
+    positionEstimatorResetZ();
+    stepEstimator(20);
+    gpsSol.llh.lon += 500;
+    gpsSol.llh.lat -= 300;
+    gpsSol.llh.altCm += 200;
+    baroAltCm += 200;
+    rfAltCm += 200;
+    stepEstimator(1000);
+    positionEstimate3d_t before, after;
+    uint16_t firstId, id;
+    ASSERT_TRUE(positionEstimatorGetArmOdometry(&before, &firstId));
+    EXPECT_NEAR(before.position.x, 500, 5);
+    EXPECT_NEAR(before.position.y, -300, 5);
+    EXPECT_NEAR(before.position.z, 200, 20);
+    EXPECT_GT(before.positionVariance.x, 0);
+    EXPECT_GT(before.velocityVariance.y, 0);
+    DISABLE_STATE(GPS_FIX);
+    stepEstimator(5);
+    EXPECT_FALSE(positionEstimatorGetArmOdometry(&after, &id));
+    ENABLE_STATE(GPS_FIX);
+    stepEstimator(20);
+    ASSERT_TRUE(positionEstimatorGetArmOdometry(&after, &id));
+    EXPECT_EQ(id, firstId);
+    EXPECT_NEAR(after.position.x, before.position.x, 5);
+    EXPECT_NEAR(after.position.y, before.position.y, 5);
+    fakeMicros += 60000;
+    EXPECT_FALSE(positionEstimatorGetArmOdometry(&after, &id));
+    stepEstimator();
+    ASSERT_TRUE(positionEstimatorGetArmOdometry(&after, &id));
+    armingFlags = 0;
+    positionEstimatorResetZ(); // calculateEstimatedAltitude resets Z on the disarm edge.
+    stepEstimator(5);
+    EXPECT_FALSE(positionEstimatorGetArmOdometry(&after, &id));
+    armingFlags = ARMED;
+    positionEstimatorCaptureArmOrigin();
+    positionEstimatorResetZ();
+    stepEstimator(20);
+    ASSERT_TRUE(positionEstimatorGetArmOdometry(&after, &id));
+    EXPECT_EQ(id, firstId + 1);
+    EXPECT_NEAR(after.position.x, 0, 0.01);
+    EXPECT_NEAR(after.position.y, 0, 0.01);
+    EXPECT_NEAR(after.position.z, 0, 0.01);
+}
 
 TEST_F(PositionEstimatorTest, RangefinderPreferFallsBackAndRecovers)
 {
@@ -244,4 +378,3 @@ TEST_F(PositionEstimatorTest, EastThrustProducesPositiveEastVelocity)
     // velocity is ENU; index by ENU_E so "East" is explicit rather than ".x".
     EXPECT_GT(positionEstimatorGetEstimate()->velocity.v[ENU_E], 0.0f);
 }
-

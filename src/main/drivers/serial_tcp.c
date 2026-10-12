@@ -44,6 +44,7 @@ static const struct serialPortVTable tcpVTable; // Forward
 static tcpPort_t tcpSerialPorts[SERIAL_PORT_COUNT];
 static bool tcpPortInitialized[SERIAL_PORT_COUNT];
 static bool tcpStart = false;
+static pthread_mutex_t dyadLock = PTHREAD_MUTEX_INITIALIZER;
 
 bool tcpIsStart(void)
 {
@@ -122,9 +123,6 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
         return NULL;
     }
 
-    tcpStart = true;
-    tcpPortInitialized[id] = true;
-
     s->connected = false;
     s->clientCount = 0;
     s->id = id;
@@ -138,11 +136,15 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
     } else {
         fprintf(stderr, "bind port %u for UART%u failed!!\n", (unsigned)BASE_PORT + id + 1, (unsigned)id + 1);
     }
+    tcpStart = true;
+    tcpPortInitialized[id] = true;
     return s;
 }
 
 serialPort_t *serTcpOpen(serialPortIdentifier_e identifier, serialReceiveCallbackPtr rxCallback, void *rxCallbackData, uint32_t baudRate, portMode_e mode, portOptions_e options)
 {
+    // Keep accept/data callbacks away until the UART buffers and vtable are ready.
+    pthread_mutex_lock(&dyadLock);
     tcpPort_t *s = NULL;
 
     int id = findSerialPortIndexByIdentifier(identifier);
@@ -152,6 +154,7 @@ serialPort_t *serTcpOpen(serialPortIdentifier_e identifier, serialReceiveCallbac
     }
 
     if (!s) {
+        pthread_mutex_unlock(&dyadLock);
         return NULL;
     }
 
@@ -172,6 +175,7 @@ serialPort_t *serTcpOpen(serialPortIdentifier_e identifier, serialReceiveCallbac
     s->port.baudRate = baudRate;
     s->port.options = options;
 
+    pthread_mutex_unlock(&dyadLock);
     return (serialPort_t *)s;
 }
 
@@ -246,7 +250,20 @@ static void tcpWrite(serialPort_t *instance, uint8_t ch)
     }
     pthread_mutex_unlock(&s->txLock);
 
-    tcpDataOut(s);
+    // The dyad worker drains this queue. dyad_write is not safe against
+    // dyad_update on another thread (it can reallocate the same stream buffer).
+}
+
+void tcpPoll(void)
+{
+    pthread_mutex_lock(&dyadLock);
+    dyad_update();
+    for (unsigned i = 0; i < ARRAYLEN(tcpSerialPorts); i++) {
+        if (tcpPortInitialized[i]) {
+            tcpDataOut(&tcpSerialPorts[i]);
+        }
+    }
+    pthread_mutex_unlock(&dyadLock);
 }
 
 void tcpDataOut(tcpPort_t *instance)

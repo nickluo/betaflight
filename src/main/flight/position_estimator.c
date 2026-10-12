@@ -194,6 +194,19 @@ static gpsLocation_t armLocationGps;
 static bool gpsArmLocationSet = false;
 static float gpsAltOffsetCm = 0.0f;
 static bool gpsAltOffsetSet = false;
+static gpsLocation_t odometryArmLocation;
+static bool odometryOriginSet = false;
+static timeUs_t odometryArmedAtUs;
+static uint16_t odometryOriginId;
+static int16_t odometryArmYawCdeg;
+#ifdef USE_BARO
+static float odometryArmBaroCm;
+static bool odometryArmBaroSet;
+#endif
+#ifdef USE_RANGEFINDER
+static float odometryArmRangeCm;
+static bool odometryArmRangeSet;
+#endif
 #endif
 
 #ifdef USE_BARO
@@ -237,6 +250,9 @@ void positionEstimatorInit(void)
     estimate.trustZ = 0.0f;
     estimate.isValidXY = false;
     estimate.isValidZ = false;
+    estimate.positionVariance = (vector3_t){{INITIAL_POS_VAR, INITIAL_POS_VAR, INITIAL_POS_VAR}};
+    estimate.velocityVariance = (vector3_t){{INITIAL_VEL_VAR, INITIAL_VEL_VAR, INITIAL_VEL_VAR}};
+    estimate.updatedAtUs = 0;
 
     xyEnabled = false;
     lastXYMeasurementUs = 0;
@@ -247,6 +263,9 @@ void positionEstimatorInit(void)
     gpsArmLocationSet = false;
     gpsAltOffsetCm = 0.0f;
     gpsAltOffsetSet = false;
+    odometryOriginSet = false;
+    odometryOriginId = 0;
+    odometryArmYawCdeg = 0;
 #endif
 #ifdef USE_BARO
     baroAltOffsetCm = 0.0f;
@@ -440,6 +459,10 @@ static void feedBaroMeasurements(timeUs_t nowUs)
         baroAltOffsetCm = baroAltCm;
         baroOffsetSet = true;
     }
+    if (!ARMING_FLAG(ARMED)) {
+        const float dt = HZ_TO_INTERVAL(TASK_ALTITUDE_RATE_HZ);
+        baroAltAccumulator += (dt / (1.0f + dt)) * (baroAltCm - baroAltAccumulator);
+    }
 
     // Scale R based on altitude_prefer_baro: higher value = lower baro R = more trust
     const float baroPreference = constrainf(positionConfig()->altitude_prefer_baro * 0.01f, 0.01f, 1.0f);
@@ -628,6 +651,11 @@ void positionEstimatorUpdate(void)
     estimate.velocity.v[ENU_E] = kalmanGetVelocity(&kfEast);
     estimate.velocity.v[ENU_N] = kalmanGetVelocity(&kfNorth);
     estimate.velocity.v[ENU_U] = kalmanGetVelocity(&kfUp);
+    estimate.positionVariance = (vector3_t){{kalmanGetPositionVariance(&kfEast),
+        kalmanGetPositionVariance(&kfNorth), kalmanGetPositionVariance(&kfUp)}};
+    estimate.velocityVariance = (vector3_t){{kalmanGetVelocityVariance(&kfEast),
+        kalmanGetVelocityVariance(&kfNorth), kalmanGetVelocityVariance(&kfUp)}};
+    estimate.updatedAtUs = nowUs;
 
     // Validity: based on recent measurement updates
     if (xyEnabled) {
@@ -710,9 +738,15 @@ void positionEstimatorResetZ(void)
     gpsAltOffsetSet = false;
 #endif
 #ifdef USE_BARO
-    baroAltOffsetCm = 0.0f;
-    baroAltAccumulator = 0.0f;
-    baroOffsetSet = false;
+    // Preserve the filtered pre-arm reference instead of making a noisy single
+    // barometer sample a permanent offset for the whole flight.
+    if (ARMING_FLAG(ARMED) && baroOffsetSet) {
+        baroAltOffsetCm = baroAltAccumulator;
+    } else {
+        baroAltOffsetCm = 0.0f;
+        baroAltAccumulator = 0.0f;
+        baroOffsetSet = false;
+    }
 #endif
 #ifdef USE_RANGEFINDER
     rangefinderAltOffsetCm = 0.0f;
@@ -751,6 +785,82 @@ bool positionEstimatorGetGpsOrigin(gpsLocation_t *out)
     return true;
 #else
     UNUSED(out);
+    return false;
+#endif
+}
+
+void positionEstimatorCaptureArmOrigin(void)
+{
+#ifdef USE_GPS
+    ++odometryOriginId;
+    odometryArmedAtUs = micros();
+    // Match custom-link 0x10: native compass heading is clockwise, wire yaw is CCW.
+    int32_t yawCdeg = -(int32_t)attitude.values.yaw * 10;
+    if (yawCdeg < -18000) {
+        yawCdeg += 36000;
+    }
+    odometryArmYawCdeg = (int16_t)yawCdeg;
+    odometryOriginSet = sensors(SENSOR_GPS) && gpsHas3DFix();
+    if (odometryOriginSet) {
+        odometryArmLocation = gpsSol.llh;
+    }
+#ifdef USE_BARO
+    odometryArmBaroSet = sensors(SENSOR_BARO);
+    odometryArmBaroCm = odometryArmBaroSet
+        ? (baroOffsetSet ? baroAltAccumulator : getBaroAltitude()) : 0.0f;
+#endif
+#ifdef USE_RANGEFINDER
+    odometryArmRangeSet = rangefinderSampleAltitudeCm(&odometryArmRangeCm,
+        positionConfig()->rangefinder_max_range_cm);
+#endif
+#endif
+}
+
+int16_t positionEstimatorGetArmYawCdeg(void)
+{
+#ifdef USE_GPS
+    return odometryArmYawCdeg;
+#else
+    return 0;
+#endif
+}
+
+bool positionEstimatorGetArmOdometry(positionEstimate3d_t *out, uint16_t *originId)
+{
+#ifdef USE_GPS
+    if (!out || !originId || !ARMING_FLAG(ARMED) || !odometryOriginSet ||
+        !sensors(SENSOR_GPS) || !gpsHas3DFix() || !gpsArmLocationSet ||
+        !estimate.isValidXY || !estimate.isValidZ ||
+        cmpTimeUs(estimate.updatedAtUs, odometryArmedAtUs) < 0 ||
+        cmpTimeUs(micros(), estimate.updatedAtUs) > 50000) {
+        return false;
+    }
+    *out = estimate;
+    *originId = odometryOriginId;
+    vector2_t originOffset;
+    GPS_distance2d(&odometryArmLocation, &armLocationGps, &originOffset);
+    out->position.v[ENU_E] += originOffset.v[EF_EAST];
+    out->position.v[ENU_N] += originOffset.v[EF_NORTH];
+    if (gpsAltOffsetSet) {
+        out->position.v[ENU_U] += gpsAltOffsetCm - odometryArmLocation.altCm;
+    }
+#ifdef USE_BARO
+    else if (baroOffsetSet && odometryArmBaroSet) {
+        out->position.v[ENU_U] += baroAltOffsetCm - odometryArmBaroCm;
+    }
+#endif
+#ifdef USE_RANGEFINDER
+    else if (rangefinderOffsetSet && odometryArmRangeSet) {
+        out->position.v[ENU_U] += rangefinderAltOffsetCm - odometryArmRangeCm;
+    }
+#endif
+    else {
+        return false;
+    }
+    return true;
+#else
+    UNUSED(out);
+    UNUSED(originId);
     return false;
 #endif
 }

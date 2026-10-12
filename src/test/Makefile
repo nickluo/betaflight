@@ -579,11 +579,13 @@ poshold_unittest_SRC := \
 position_estimator_unittest_SRC := \
 		$(USER_DIR)/flight/position_estimator.c \
 		$(USER_DIR)/flight/position_filter.c \
+		$(USER_DIR)/io/gps_virtual.c \
 		$(USER_DIR)/common/maths.c \
 		$(USER_DIR)/common/vector.c
 
 position_estimator_unittest_DEFINES := \
 		USE_GPS= \
+		USE_VIRTUAL_GPS= \
 		USE_BARO= \
 		USE_RANGEFINDER=
 

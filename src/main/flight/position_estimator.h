@@ -36,6 +36,9 @@ typedef struct positionEstimate3d_s {
     float trustZ;              // 0-1, derived from KF Z covariance
     bool isValidXY;            // true if at least one XY measurement source active
     bool isValidZ;             // true if at least one Z measurement source active
+    vector3_t positionVariance; // cm^2, diagonal ENU covariance
+    vector3_t velocityVariance; // (cm/s)^2, diagonal ENU covariance
+    timeUs_t updatedAtUs;
 } positionEstimate3d_t;
 
 void positionEstimatorInit(void);
@@ -64,3 +67,11 @@ void positionEstimatorResetXY(void);
 // Returns the GPS location captured when XY estimation became active (arm point).
 // Returns false if no GPS origin has been captured yet.
 bool positionEstimatorGetGpsOrigin(gpsLocation_t *out);
+
+// Separate telemetry reference: capture at the successful ARM edge, never at a later GPS fix.
+void positionEstimatorCaptureArmOrigin(void);
+// Heading at the same ARM edge, 0.01 degree CCW from North (native compass heading negated).
+int16_t positionEstimatorGetArmYawCdeg(void);
+// Returns a fresh, valid GPS-backed estimate relative to that ARM point.
+// The origin survives estimator XY resets during GPS loss/recovery.
+bool positionEstimatorGetArmOdometry(positionEstimate3d_t *out, uint16_t *originId);

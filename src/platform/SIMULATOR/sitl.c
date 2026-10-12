@@ -566,12 +566,10 @@ static void* tcpThread(void* data)
 {
     UNUSED(data);
 
-    dyad_init();
-    dyad_setTickInterval(0.2f);
-    dyad_setUpdateTimeout(0.01f);
-
     while (workerRunning) {
-        dyad_update();
+        tcpPoll();
+        const struct timespec wait = { .tv_sec = 0, .tv_nsec = 1000000 };
+        nanosleep(&wait, NULL); // Wait outside the dyad lock so UART setup can register streams.
     }
 
     dyad_shutdown();
@@ -602,6 +600,10 @@ void systemInit(void)
         exit(1);
     }
 
+    // Initialize before UART setup can register streams on the main thread.
+    dyad_init();
+    dyad_setTickInterval(0.2f);
+    dyad_setUpdateTimeout(0.0f);
     ret = pthread_create(&tcpWorker, NULL, tcpThread, NULL);
     if (ret != 0) {
         printf("Create tcpWorker error!\n");

@@ -337,6 +337,8 @@ typedef enum {
 
 extern gpsData_t gpsData;
 extern gpsSolutionData_t gpsSol;
+// UBX requires FIX_3D; NMEA additionally requires a GSA fix type of 3.
+bool gpsHas3DFix(void);
 
 #define GPS_SV_MAXSATS_LEGACY   16U
 #define GPS_SV_MAXSATS_M8N      32U                     // must be larger than MAXSATS_LEGACY

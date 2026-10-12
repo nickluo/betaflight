@@ -41,7 +41,11 @@ void setVirtualGPS(double latitude, double longitude, double altiutude, double s
     gpsVirtualData.acc.hAcc = 500; // horizontal_pos_accuracy - convert cm to mm
     gpsVirtualData.acc.vAcc = 500; // vertical_pos_accuracy - convert cm to mm
     gpsVirtualData.acc.sAcc = 400; // horizontal_vel_accuracy - convert cm to mm
-    gpsVirtualData.dop.pdop = 10; // hdop in 4.4 and earlier, pdop in 4.5 and above
+    // DOP is scaled by 100. A valid reference DOP of 1.0 must not look like
+    // an unset 0.1 value and inflate the position-estimator GPS noise by 100x.
+    gpsVirtualData.dop.pdop = 100;
+    gpsVirtualData.dop.hdop = 100;
+    gpsVirtualData.dop.vdop = 100;
     gpsVirtualData.llh.lon = (int32_t)(longitude * GPS_DEGREES_DIVIDER);
     gpsVirtualData.llh.lat = (int32_t)(latitude * GPS_DEGREES_DIVIDER);
     gpsVirtualData.llh.altCm = (int32_t)(altiutude * 100.0); // alt, cm

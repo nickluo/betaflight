@@ -45,6 +45,7 @@
 #include "flight/failsafe.h"
 #include "flight/imu.h"
 #include "flight/mixer.h"
+#include "flight/position_estimator.h"
 
 #include "io/gps.h"
 #include "io/serial.h"
@@ -558,6 +559,46 @@ void customLinkTaskMed(timeUs_t currentTimeUs)
     }
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_MEDIUM, &med, sizeof(med));
 
+#ifdef USE_GPS
+    positionEstimate3d_t estimate;
+    uint16_t originId;
+    if (positionEstimatorGetArmOdometry(&estimate, &originId)) {
+        clPayloadOdometry_t odom = {0};
+        odom.ts_us = (uint32_t)currentTimeUs;
+        odom.flags = CL_ODOM_VALID_FLAGS;
+        odom.origin_id = originId;
+        odom.arm_yaw_cdeg = positionEstimatorGetArmYawCdeg();
+        bool valid = true;
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            const float position = estimate.position.v[axis];
+            const float velocity = estimate.velocity.v[axis];
+            valid &= isfinite(position) && fabsf(position) < INT32_MAX &&
+                isfinite(velocity) && fabsf(velocity) <= INT16_MAX &&
+                isfinite(gyro.gyroADCf[axis]) &&
+                isfinite(estimate.positionVariance.v[axis]) && estimate.positionVariance.v[axis] >= 0.0f &&
+                isfinite(estimate.velocityVariance.v[axis]) && estimate.velocityVariance.v[axis] >= 0.0f;
+            if (!valid) {
+                break;
+            }
+            odom.position_cm[axis] = lrintf(position);
+            odom.velocity_cms[axis] = lrintf(velocity);
+            odom.attitude_cdeg[axis] = attitude.raw[axis] * 10;
+            odom.gyro_dps_x10[axis] = constrain(lrintf(gyro.gyroADCf[axis] * 10.0f), INT16_MIN, INT16_MAX);
+            odom.position_variance[axis] = estimate.positionVariance.v[axis] * 0.0001f;
+            odom.velocity_variance[axis] = estimate.velocityVariance.v[axis] * 0.0001f;
+        }
+        // Keep odometry attitude identical to 0x10, not native clockwise compass heading.
+        int32_t yawCd = -(int32_t)attitude.values.yaw * 10;
+        if (yawCd < -18000) {
+            yawCd += 36000;
+        }
+        odom.attitude_cdeg[FD_YAW] = yawCd;
+        if (valid) {
+            customLinkSendFrame(CUSTOM_LINK_MSG_FC_ODOMETRY, &odom, sizeof(odom));
+        }
+    }
+#endif
+
     schedulerIgnoreTaskExecTime();
 }
 
@@ -574,7 +615,9 @@ void customLinkTaskSlow(timeUs_t currentTimeUs)
     slow.current_ma = getAmperage() * 10;                                           // 0.01 A -> mA
     const int32_t mAh = getMAhDrawn();
     slow.mah = mAh > INT16_MAX ? INT16_MAX : (int16_t)mAh;
-    slow.fix = STATE(GPS_FIX) ? 1 : 0;
+#ifdef USE_GPS
+    slow.fix = gpsHas3DFix() ? 1 : 0;
+#endif
     slow.sats = gpsSol.numSat;
     slow.lat_e7 = gpsSol.llh.lat;
     slow.lon_e7 = gpsSol.llh.lon;

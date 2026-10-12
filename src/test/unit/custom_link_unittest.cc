@@ -120,6 +120,34 @@ TEST(CustomLinkEncodeTest, TestRejectsBadInput)
     EXPECT_EQ(clEncodeFrame(0x10, 0, payload, 4, buf, 8), 0);                           // output too small
 }
 
+TEST(CustomLinkRoundtripTest, OdometryPayloadFitsFrameAndPreservesEnuFields)
+{
+    resetParser(10000);
+    clPayloadOdometry_t odom = {};
+    odom.ts_us = 123456;
+    odom.flags = CL_ODOM_VALID_FLAGS;
+    odom.origin_id = 2;
+    odom.arm_yaw_cdeg = 12340;
+    odom.position_cm[0] = 12345;
+    odom.position_cm[1] = -23456;
+    odom.position_cm[2] = 345;
+    odom.velocity_cms[0] = -100;
+    odom.attitude_cdeg[2] = -9000;
+    odom.gyro_dps_x10[1] = 200;
+    odom.position_variance[0] = 0.25f;
+    odom.velocity_variance[2] = 0.04f;
+    uint8_t bytes[CUSTOM_LINK_FRAME_MAX];
+    const uint8_t size = clEncodeFrame(CUSTOM_LINK_MSG_FC_ODOMETRY, 42, &odom, sizeof(odom), bytes, sizeof(bytes));
+    ASSERT_EQ(sizeof(odom), 64u);
+    ASSERT_EQ(size, 71);
+    feedBytes(bytes, size, 1000, 10);
+    ASSERT_EQ(testRx.frameCount, 1u);
+    ASSERT_EQ(testRx.lastFrame.msgId, CUSTOM_LINK_MSG_FC_ODOMETRY);
+    clPayloadOdometry_t decoded;
+    memcpy(&decoded, testRx.lastFrame.payload, sizeof(decoded));
+    EXPECT_EQ(memcmp(&odom, &decoded, sizeof(odom)), 0);
+}
+
 TEST(CustomLinkRoundtripTest, TestAllMessageIds)
 {
     resetParser(10000);

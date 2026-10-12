@@ -116,6 +116,7 @@
 
 #include "telemetry/telemetry.h"
 #include "telemetry/custom_link.h"
+#include "flight/position_estimator.h"
 
 #include "core.h"
 
@@ -626,6 +627,9 @@ if (isMotorProtocolDshot()) {
         mixerResetRpmLimiter();
 #endif
         ENABLE_ARMING_FLAG(ARMED);  // ***ARM NOW ***
+#if defined(USE_CUSTOM_LINK) && defined(USE_GPS)
+        positionEstimatorCaptureArmOrigin();
+#endif
 
 #ifdef USE_RC_STATS
         NotifyRcStatsArming();

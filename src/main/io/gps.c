@@ -81,6 +81,9 @@ uint32_t GPS_distanceFlownInCm;     // distance flown since armed in centimeters
 #define GPS_DISTANCE_FLOWN_MIN_SPEED_THRESHOLD_CM_S 15 // 0.54 km/h 0.335 mph
 
 gpsSolutionData_t gpsSol;
+#ifdef USE_GPS_NMEA
+static uint8_t nmeaFixType;
+#endif
 uint8_t GPS_update = 0;             // toogle to distinct a GPS position update (directly or via MSP)
 
 uint8_t GPS_numCh;                              // Details on numCh/svinfo in gps.h
@@ -398,6 +401,9 @@ static void gpsSetState(gpsState_e state)
 
 void gpsInit(void)
 {
+#ifdef USE_GPS_NMEA
+    nmeaFixType = 0;
+#endif
     gpsDataIntervalSeconds = 0.1f;
     gpsData.userBaudRateIndex = 0;
     gpsData.timeouts = 0;
@@ -1779,6 +1785,7 @@ typedef struct gpsDataNmea_s {
     int32_t latitude;
     int32_t longitude;
     uint8_t numSat;
+    uint8_t fixType;
     int32_t altitudeCm;
     uint16_t speed;
     uint16_t pdop;
@@ -1892,6 +1899,9 @@ static void parseFieldNmea(gpsDataNmea_t *data, char *str, uint8_t gpsFrame, uin
 
     case FRAME_GSA:
         switch (idx) {
+        case 2:
+            data->fixType = (uint8_t)grab_fields(str, 0);
+            break;
         case 15:
             data->pdop = grab_fields(str, 2);  // pDOP * 100
             break;
@@ -1932,6 +1942,7 @@ static bool writeGpsSolutionNmea(gpsSolutionData_t *sol, const gpsDataNmea_t *da
 #ifdef USE_DASHBOARD
         *dashboardGpsPacketLogCurrentChar = DASHBOARD_LOG_NMEA_GSA;
 #endif
+        nmeaFixType = data->fixType;
         sol->dop.pdop = data->pdop;
         sol->dop.hdop = data->hdop;
         sol->dop.vdop = data->vdop;
@@ -3053,6 +3064,17 @@ void gpsSetFixState(bool state)
     } else {
         DISABLE_STATE(GPS_FIX);
     }
+}
+
+bool gpsHas3DFix(void)
+{
+#ifdef USE_GPS_NMEA
+    if (gpsConfig()->provider == GPS_NMEA && nmeaFixType != 3) {
+        return false;
+    }
+#endif
+    return STATE(GPS_FIX) && gpsData.state == GPS_STATE_RECEIVING_DATA &&
+        cmp32(millis(), gpsData.lastNavMessage) <= GPS_TIMEOUT_MS;
 }
 
 float getGpsDataIntervalSeconds(void)

@@ -47,6 +47,7 @@ serialPort_t *serTcpOpen(serialPortIdentifier_e id, serialReceiveCallbackPtr rxC
 // tcpPort API
 void tcpDataIn(tcpPort_t *instance, uint8_t* ch, int size);
 void tcpDataOut(tcpPort_t *instance);
+void tcpPoll(void); // dyad worker only: receive events and drain buffered UART output
 
 bool tcpIsStart(void);
 bool* tcpGetUsed(void);

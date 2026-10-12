@@ -65,7 +65,7 @@ float customLinkGetThrottle(void);
 
 // Scheduler task entry points (fc/tasks.c).
 void customLinkTaskFast(timeUs_t currentTimeUs);    // 200 Hz: uplink, authority, 0x10
-void customLinkTaskMed(timeUs_t currentTimeUs);     // 100 Hz: 0x11
+void customLinkTaskMed(timeUs_t currentTimeUs);     // 100 Hz: 0x11 + GPS-valid ARM-relative 0x14
 void customLinkTaskSlow(timeUs_t currentTimeUs);    // 10 Hz: 0x12
 
 #endif // USE_CUSTOM_LINK

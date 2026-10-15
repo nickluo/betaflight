@@ -113,8 +113,10 @@ void flightPlanNavRescueDescent(bool request, timeUs_t currentTimeUs);
 bool flightPlanNavIsRescueDescentActive(void);
 
 // Vertical-velocity cap (cm/s) the alt-hold coupling applies while a rescue is
-// active: ascendRate climbing, descendRate on the LAND leg and fallback descent.
-// Returns 0 when no rescue is flying, leaving the alt-hold climbRate in force.
+// active: ascendRate climbing, the altitude-profiled rescue landing rate
+// (descendRate, slowing to landingRate below the return altitude) on the LAND
+// leg and fallback descent. Returns 0 when no rescue is flying, leaving the
+// alt-hold climbRate in force.
 float flightPlanNavGetRescueVerticalRateCmS(void);
 #else
 static inline bool flightPlanNavIsRescuePlanActive(void) { return false; }

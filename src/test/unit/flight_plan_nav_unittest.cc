@@ -1475,6 +1475,38 @@ TEST_F(FlightPlanNavSafetyTest, GroundLevelLandingFallbackDisarms)
     EXPECT_EQ(g_lastDisarmReason, DISARM_REASON_LANDING);
 }
 
+TEST_F(FlightPlanNavSafetyTest, LandingQuietTimerResetsAboveLandingAltitude)
+{
+    autopilotConfigMutable()->maxDistanceFromHomeM = 100;
+    autopilotConfigMutable()->geofenceAction = AP_GEOFENCE_LAND;
+    stateFlags |= GPS_FIX_HOME;
+    engageDistantLeg();
+    GPS_distanceToHome = 150;
+    flightPlanNavUpdate(g_stubMicros + 10'000);
+    ASSERT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+
+    g_stubEstimate.velocity.v[ENU_U] = -40.0f;
+    g_stubMicros += 1'000'000;
+    flightPlanNavUpdate(g_stubMicros);
+    g_stubEstimate.velocity.v[ENU_U] = 0.0f;
+    g_stubMicros += 100'000;
+    flightPlanNavUpdate(g_stubMicros);
+
+    g_stubBelowLandingAltitude = false;
+    g_stubMicros += 800'000;
+    flightPlanNavUpdate(g_stubMicros);
+    g_stubBelowLandingAltitude = true;
+    g_stubMicros += 300'000;
+    flightPlanNavUpdate(g_stubMicros);
+    EXPECT_EQ(g_disarmCalls, 0);
+    g_stubMicros += 900'000;
+    flightPlanNavUpdate(g_stubMicros);
+    EXPECT_EQ(g_disarmCalls, 0);
+    g_stubMicros += 200'000;
+    flightPlanNavUpdate(g_stubMicros);
+    EXPECT_EQ(g_disarmCalls, 1);
+}
+
 TEST_F(FlightPlanNavSafetyTest, LandingQuietTimerResetsIfDescentResumes)
 {
     autopilotConfigMutable()->maxDistanceFromHomeM = 100;

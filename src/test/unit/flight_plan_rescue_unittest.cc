@@ -310,6 +310,9 @@ protected:
         rescueCfg->initialClimbM = 10;
         rescueCfg->minStartDistM = 15;
         rescueCfg->altitudeMode = GPS_RESCUE_ALT_MODE_MAX;
+        rescueCfg->ascendRate = 200;
+        rescueCfg->descendRate = 200;
+        rescueCfg->landingRate = 50;
 
         flightPlanConfig_t *plan = flightPlanConfigMutable();
         memset(plan, 0, sizeof(*plan));
@@ -595,6 +598,120 @@ TEST_F(FlightPlanRescueTest, FullRescueRunToLanding)
     EXPECT_EQ(flightPlanNavGetState(), FP_NAV_COMPLETE);
 }
 
+// --- Rescue landing speed profile ---
+
+TEST_F(FlightPlanRescueTest, RescueVerticalRateFollowsLandingProfile)
+{
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+
+    // Climb/return legs: the alt-hold coupling caps at ascendRate.
+    EXPECT_NEAR(flightPlanNavGetRescueVerticalRateCmS(), 200.0f, 0.01f);
+
+    triggerReached(); // wp0 (climb) reached
+    ASSERT_EQ(flightPlanNavGetCurrentIndex(), 1);
+
+    // wp1 (fly home) advances through the executor's carrot gate.
+    g_stubMicros += 100'000;
+    flightPlanNavUpdate(g_stubMicros);
+    ASSERT_EQ(flightPlanNavGetCurrentIndex(), 2);
+
+    triggerReached(); // wp2 (LAND): starts the descent
+    ASSERT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+
+    // Above the return altitude: descendRate.
+    g_stubEstimate.position.v[ENU_U] = 4000.0f; // 40 m > 30 m return alt
+    EXPECT_NEAR(flightPlanNavGetRescueVerticalRateCmS(), 200.0f, 0.01f);
+
+    // Below the return altitude: landingRate for the gentle final descent.
+    g_stubEstimate.position.v[ENU_U] = 500.0f; // 5 m < 30 m
+    EXPECT_NEAR(flightPlanNavGetRescueVerticalRateCmS(), 50.0f, 0.01f);
+}
+
+TEST_F(FlightPlanRescueTest, LandingCruiseSpeedProfiledByAltitude)
+{
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+
+    triggerReached();
+    g_stubMicros += 100'000;
+    flightPlanNavUpdate(g_stubMicros);
+    ASSERT_EQ(flightPlanNavGetCurrentIndex(), 2);
+
+    // LAND dispatched while above the return altitude: descendRate cruise,
+    // with the alt-hold cap still slowing the descent below it.
+    g_stubEstimate.position.v[ENU_U] = 4000.0f;
+    triggerReached();
+    ASSERT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+    EXPECT_NEAR(g_lastTarget.cruiseSpeedMps, 2.0f, 0.01f);
+
+    g_stubEstimate.position.v[ENU_U] = 500.0f;
+    EXPECT_NEAR(flightPlanNavGetRescueVerticalRateCmS(), 50.0f, 0.01f);
+}
+
+TEST_F(FlightPlanRescueTest, LandingCruiseStartsSlowBelowReturnAltitude)
+{
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+
+    triggerReached();
+    g_stubMicros += 100'000;
+    flightPlanNavUpdate(g_stubMicros);
+    ASSERT_EQ(flightPlanNavGetCurrentIndex(), 2);
+
+    // LAND dispatched already below the return altitude (the usual FIXED_ALT
+    // case, where the return leg ends at the return altitude): landingRate
+    // cruise from the start of the descent.
+    g_stubEstimate.position.v[ENU_U] = 500.0f;
+    triggerReached();
+    ASSERT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+    EXPECT_NEAR(g_lastTarget.cruiseSpeedMps, 0.5f, 0.01f);
+}
+
+TEST_F(FlightPlanRescueTest, FastDescentBrakingAboveLandingAltitudeDoesNotDisarm)
+{
+    gpsRescueConfigMutable()->returnAltitudeM = 8;
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+    triggerReached();
+    g_stubMicros += 100'000;
+    flightPlanNavUpdate(g_stubMicros);
+    ASSERT_EQ(flightPlanNavGetCurrentIndex(), 2);
+
+    g_stubEstimate.position.v[ENU_U] = 1500.0f;
+    g_stubBelowLandingAltitude = false;
+    triggerReached();
+    ASSERT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+    g_stubEstimate.velocity.v[ENU_U] = -200.0f;
+    g_stubMicros += 200'000;
+    flightPlanNavUpdate(g_stubMicros);
+
+    // The 2 -> 0.5 m/s profile transition can briefly arrest the descent at 6.8 m.
+    g_stubEstimate.position.v[ENU_U] = 680.0f;
+    g_stubEstimate.velocity.v[ENU_U] = 0.0f;
+    EXPECT_NEAR(flightPlanNavGetRescueVerticalRateCmS(), 50.0f, 0.01f);
+    for (int i = 0; i < 20; ++i) {
+        g_stubMicros += 200'000;
+        flightPlanNavUpdate(g_stubMicros);
+    }
+    EXPECT_EQ(g_disarmCalls, 0);
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_LANDING);
+
+    g_stubEstimate.position.v[ENU_U] = 100.0f;
+    g_stubBelowLandingAltitude = true;
+    g_stubEstimate.velocity.v[ENU_U] = -50.0f;
+    g_stubMicros += 200'000;
+    flightPlanNavUpdate(g_stubMicros);
+    g_stubEstimate.velocity.v[ENU_U] = 0.0f;
+    g_stubMicros += 100'000;
+    flightPlanNavUpdate(g_stubMicros);
+    EXPECT_EQ(g_disarmCalls, 0);
+    g_stubMicros += 1'100'000;
+    flightPlanNavUpdate(g_stubMicros);
+    EXPECT_EQ(g_disarmCalls, 1);
+    EXPECT_EQ(g_lastDisarmReason, DISARM_REASON_LANDING);
+}
+
 // --- Fallback emergency descent (switch rescue: no fix, or plan aborted) ---
 
 TEST_F(FlightPlanRescueTest, RescueDescentDrivesLandingAndDisarms)
@@ -608,6 +725,8 @@ TEST_F(FlightPlanRescueTest, RescueDescentDrivesLandingAndDisarms)
     flightPlanNavRescueDescent(true, g_stubMicros);
     EXPECT_TRUE(flightPlanNavIsRescueDescentActive());
     EXPECT_FALSE(flightPlanNavIsActive());
+    // Estimator at 0 m, below the 30 m return altitude: landingRate cap.
+    EXPECT_NEAR(flightPlanNavGetRescueVerticalRateCmS(), 50.0f, 0.01f);
     EXPECT_EQ(g_disarmCalls, 0);
 
     // Touchdown: descent stops and the vehicle is quiet, then the timer expires.
@@ -628,6 +747,23 @@ TEST_F(FlightPlanRescueTest, RescueDescentReleaseClears)
     EXPECT_TRUE(flightPlanNavIsRescueDescentActive());
     flightPlanNavRescueDescent(false, g_stubMicros);
     EXPECT_FALSE(flightPlanNavIsRescueDescentActive());
+}
+
+TEST_F(FlightPlanRescueTest, RescueDescentStopAboveLandingAltitudeDoesNotDisarm)
+{
+    g_stubMicros = 1'000'000;
+    g_stubBelowLandingAltitude = false;
+    g_stubEstimate.position.v[ENU_U] = 1500.0f;
+    g_stubEstimate.velocity.v[ENU_U] = -200.0f;
+    flightPlanNavRescueDescent(true, g_stubMicros);
+
+    g_stubEstimate.position.v[ENU_U] = 680.0f;
+    g_stubEstimate.velocity.v[ENU_U] = 0.0f;
+    for (int i = 0; i < 10; ++i) {
+        g_stubMicros += 1'000'000;
+        flightPlanNavRescueDescent(true, g_stubMicros);
+    }
+    EXPECT_EQ(g_disarmCalls, 0);
 }
 
 // --- No staging ---

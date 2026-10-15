@@ -802,11 +802,26 @@ static void updateLegCarrot(float dtS, timeUs_t currentTimeUs, const positionEst
 // LAND leg, or the altitude-only fallback descent) honour gpsRescueConfig()'s
 // descendRate for legacy feel; every other landing (mission/geofence) keeps the
 // autopilot landingDescentRate.
+#if ENABLE_RESCUE_PLAN
+// Rescue landing profile: descendRate while above the rescue return altitude
+// (FIXED_ALT mode's fixed height above home), slowing to landingRate below it
+// for a gentle final descent. The estimator's ENU up axis is home-relative —
+// the same frame returnAltitudeM is configured in.
+static float rescueLandingDescentRateCmS(void)
+{
+    float rateCmS = (float)gpsRescueConfig()->descendRate;
+    if (positionEstimatorGetEstimate()->position.v[ENU_U] < 100.0f * (float)gpsRescueConfig()->returnAltitudeM) {
+        rateCmS = MIN(rateCmS, (float)gpsRescueConfig()->landingRate);
+    }
+    return rateCmS;
+}
+#endif
+
 static float landingDescentRateCmS(void)
 {
 #if ENABLE_RESCUE_PLAN
     if (fp.rescueDescentActive || (fp.active && fp.isRescuePlan)) {
-        return (float)gpsRescueConfig()->descendRate;
+        return rescueLandingDescentRateCmS();
     }
 #endif
     return (float)autopilotConfig()->landingDescentRate;
@@ -842,10 +857,12 @@ static void updateLanding(timeUs_t currentTimeUs)
         fp.landingDescentEstablished = true;
     }
 
-    const bool monitorTouchdown = fp.landingDescentEstablished
-        || (isBelowLandingAltitude()
-            && cmpTimeUs(currentTimeUs, fp.landingStartUs) >= (timeDelta_t)FP_LANDING_ESTABLISH_TIMEOUT_US);
+    // Braking into a slower descent can stop the vehicle well above the ground.
+    const bool monitorTouchdown = isBelowLandingAltitude()
+        && (fp.landingDescentEstablished
+            || cmpTimeUs(currentTimeUs, fp.landingStartUs) >= (timeDelta_t)FP_LANDING_ESTABLISH_TIMEOUT_US);
     if (!monitorTouchdown) {
+        fp.touchdownQuietStartUs = 0;
         return;
     }
 
@@ -1010,15 +1027,17 @@ bool flightPlanNavIsRescuePlanActive(void)
 }
 
 // Vertical-velocity cap the alt-hold coupling honours while a rescue is flying:
-// ascendRate on the climb, descendRate on the LAND leg and the fallback descent.
-// Zero everywhere else, so mission and pilot alt-hold keep the alt-hold climbRate.
+// ascendRate on the climb, the altitude-profiled rescue landing rate (descendRate,
+// slowing to landingRate below the return altitude) on the LAND leg and the
+// fallback descent. Zero everywhere else, so mission and pilot alt-hold keep the
+// alt-hold climbRate.
 float flightPlanNavGetRescueVerticalRateCmS(void)
 {
     if (fp.rescueDescentActive) {
-        return (float)gpsRescueConfig()->descendRate;
+        return rescueLandingDescentRateCmS();
     }
     if (fp.active && fp.isRescuePlan) {
-        return (fp.state == FP_NAV_LANDING) ? (float)gpsRescueConfig()->descendRate
+        return (fp.state == FP_NAV_LANDING) ? rescueLandingDescentRateCmS()
                                             : (float)gpsRescueConfig()->ascendRate;
     }
     return 0.0f;

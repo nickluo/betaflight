@@ -149,6 +149,325 @@ samples are not exact zero-latency ground truth; the test reports the remaining
 error rather than masking it. Altitude mode-entry transients are distinguished
 from steady hover by separate CSV stages.
 
+### AirSim balloon interception mission
+
+[airsim_intercept_mission.py](src/test/sitl/airsim_intercept_mission.py) runs
+SITL, `apm_bridge/sitl.launch.py`, the real YOLO/NanoTrack `airsim_tracker`,
+and `drone_interceptor/launch_relative_imm_ukf.py` on ROS domain 77.
+Use the calibrated simulation EEPROM, a rebuilt ROS workspace, and a running
+Cosys-AirSim environment with `Copter` and `TargetDrone`. AirSim connects to the
+bridge on TCP 5764; the bridge alone connects to SITL on 5763.
+
+Example for the RuralAustralia scene's open road launch point (run from this
+repository; other scenes need their own unobstructed launch coordinates):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/workspace/fpv_ws/install/setup.bash
+/usr/bin/python3 src/test/sitl/airsim_intercept_mission.py \
+    --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin \
+    --ros-ws ~/workspace/fpv_ws \
+    --launch-x 100 --launch-y -30 \
+    --balloon-x 0 --balloon-y 70 --balloon-z -45 \
+    --balloon-motion hover --pitch-aim -57.3 \
+    --no-rate-control-attenuation
+```
+
+The balloon offsets are relative to the actual grounded interceptor origin.
+Its motion script converts the common-world standoff to the target vehicle's
+spawn-local coordinates and verifies arrival. The mission aligns ground yaw,
+uses gimbal AIM, arms through the pilot switch, publishes tracker `ON`, and
+requires a sustained visual lock. A short body-rate/thrust takeoff settles at
+4 m before the `MISSION` trigger hands control to relative IMM-UKF guidance.
+Ground truth is used for setup, this takeoff handover, and scoring, not as
+target-position input to the vision-only guidance; radar is disabled.
+
+The per-run parameter file preserves the packaged profile, then applies the
+selected closing-speed and climb/descent ceilings, a 1.5/s climb gain,
+55/45 degree mid-course/terminal tilt limits and a 1 rad/s body-rate limit.
+The runner defaults to 20/20 m/s ceilings and turn-cap factor 0.8.
+The turn-radius governor and image-size proximity cap lower terminal speed
+below the cruise ceiling. `control.rate_control_attenuation` is
+**false** by default for Betaflight's inner rate loop; use
+`--rate-control-attenuation` for an A/B comparison. Keep `use_simulation=false`
+so normal collision detection remains active. These are simulation settings,
+not certified hardware tuning.
+
+Success requires a **mission-phase common-world 3D distance <= 1 m**, followed
+by sixth-detent GPS Rescue, fresh upward-facing contact at the home landing
+location (not an earlier target contact aloft), landing within 8 m of home,
+speed below 0.3 m/s, and automatic disarming. Sustained tracking loss ends the
+engagement and requests the same return path; a miss or failed return exits
+nonzero. The runner never kills unrelated processes, modifies the source
+EEPROM, or overwrites an existing artifact directory.
+
+The artifact directory contains `report.json`, the full-precision
+`trajectory.csv` (both vehicles' world positions, tracker/mission/mode states,
+bbox width and LOS age), a camera image, the effective interceptor parameters,
+and each process's log. Return-flight proximity cannot relabel a failed
+engagement as a hit.
+
+Real UE/Cosys-AirSim run on 2026-10-13, attenuation disabled: balloon horizontal
+distance **70.52 m**, height **45.32 m**, mission closest approach **0.882 m**
+after **39.02 s**. GPS Rescue returned, landed **0.0097 m** from the launch point,
+and auto-disarmed with confirmed ground contact after **123.16 s**.
+
+Offline regressions, in the same sourced ROS environment:
+
+```bash
+cd src/test/sitl
+/usr/bin/python3 -m unittest airsim_intercept_mission_unittest \
+    airsim_launcher_unittest airsim_control_test_unittest airsim_rescue_test_unittest
+```
+
+Offline regressions cover strict hit/return scoring, measured speed
+reporting, home-contact location, duplicate vision timestamps, and launcher
+separation/landing alignment. The controller's stopping, scale-invariant closure,
+and body-frame gyro integration math also have a standalone host check:
+
+```bash
+g++ -std=c++17 -DNDEBUG -I/usr/include/eigen3 -Wall -Wextra -Werror \
+    ~/workspace/fpv_ws/src/drone_interceptor/test/guidance_limits_test.cpp \
+    -o /tmp/bf_guidance_limits_test
+/tmp/bf_guidance_limits_test
+```
+
+### Camera8 auto-aiming virtual launcher
+
+The project's editor camera labelled **Camera8** is the actor
+`CineCameraActor_0` (saved UE position `(-40608, 178, 185)` cm). The launcher
+reads its runtime common-world pose; it does not assume the PIE and standalone
+NED origins are the same. Apply the tracker package's `airsim_settings.json`
+to the simulator settings and restart the rebuilt UE plugin first. It adds
+the `LauncherOverview` camera and three real geometry-query range sensors.
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/workspace/fpv_ws/install/setup.bash
+/usr/bin/python3 src/test/sitl/airsim_intercept_mission.py \
+    --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin \
+    --ros-ws ~/workspace/fpv_ws \
+    --launcher --reference-camera CineCameraActor_0 --launcher-forward 8 \
+    --balloon-x 70 --balloon-y 0 --balloon-z -45 \
+    --guidance-speed 20 --climb-speed 20 --turn-cap-factor 0.8 \
+    --no-rate-control-attenuation
+```
+
+Run this command with `--aim-only` first to check placement, pose/IMU/gravity
+agreement, obstacle clearance and real visual lock **without arming or releasing**.
+The runner resets the simulation before each trial. Balloon offsets rotate with
+Camera8's heading and the balloon starts beside the launcher rather than at an
+unrelated vehicle origin. Arrival requires both position and sustained low speed.
+
+#### Repeating trials in one UE process
+
+Keep UE in game/Play mode; rerun the same mission command with a new artifact
+directory (or let the PID-based default choose one). The runner does not close,
+restart, or rebuild UE. `--rpc-wait 30` bounds startup readiness checks and names
+the host/port in a failure; a closed game or RPC server must still be started.
+Stale ROS discovery entries are not sufficient readiness evidence: the runner
+also requires the new interceptor's successful initialization log.
+
+Each trial cancels the target's previous native task before reset. Balloon setup
+parks/disarms the target, zeros its complete kinematics, applies the requested
+scale even when it is 1, and checks a sampled 27-ray corridor around candidate
+staging points. It climbs vertically before translating at altitude. If the
+preferred launch column is blocked, nearby columns/heights are checked; if none
+is clear, the target is not armed. Collision/stagnation and failed RPC commands
+are explicit errors, not six repeated blind pushes against an obstacle.
+
+Short velocity tasks use RPC `Future.get()`, not `join()` (the latter waits but
+does not raise a failed/timed-out result in this SDK). Arrival still requires
+less than 1 m error and sustained speed below 0.25 m/s. Every exit cancels the
+UE-side task, parks the disarmed balloon with `airsim.LauncherLock.TargetDrone 1`,
+and releases API control; cleanup never flies toward a hardcoded old spawn.
+The next reset clears the parking constraint. These are simulation preparation
+and cleanup operations, not target-position inputs to interception guidance.
+
+The launcher's spawn-frame offset is remeasured **after** the reset fall has
+settled. Measuring the physics and rendered pose during the fall produced a
+spurious approximately 0.2 m offset in some repeated runs.
+
+Firmware/EEPROM changes can also invalidate previously tested tuning. The
+mission now provisions profile 0 explicitly in its **cloned** EEPROM:
+
+| Axis | P | I | D | F |
+| --- | --- | --- | --- | --- |
+| Roll | 37 | 62 | 22 | 95 |
+| Pitch | 32 | 57 | 22 | 84 |
+| Yaw | 10 | 0 | 0 | 8 |
+
+`simplified_pids_mode=OFF` prevents re-synthesis of these calibrated values.
+The runner reads P/I/D back with MSP before starting the flight stack and aborts
+on a mismatch. Reports record the measured gains plus firmware/source-EEPROM
+hashes. This is **SITL-only tuning**, never a hardware recommendation, and the
+source EEPROM is not overwritten.
+
+The rendered-camera overlay uses capture-time bbox/LOS
+(`publish_prediction:=False`), timestamp-matched camera orientation in IMM-UKF,
+and a bounded 0.25 s relative-state prediction to the control epoch. The general
+tracker still defaults to prediction mode. The simulation gimbal uses tracking
+gain 2, maximum rate 60 deg/s, acceleration 180 deg/s², filter 0.12 s, and
+`tracking_rate_feedforward=0`; body-motion stabilization remains active.
+Other gimbal profiles retain the default rate-feedforward gain of 1. A sustained
+large mid-course boresight error terminates the test and requests Rescue rather
+than allowing continued blind flight; this scoring/safety check does not steer
+the controller using ground truth. Near-pass camera error can grow as the target
+fills/leaves the frame and is reported separately from the mid-course maximum.
+
+After changing the ROS sources, rebuild the affected packages in the sourced
+workspace; no UE restart is needed:
+
+```bash
+cd ~/workspace/fpv_ws
+colcon build --packages-select apm_bridge --cmake-target custom_link_bridge_node
+colcon build --packages-select drone_interceptor --cmake-target interceptor_node_relative_imm_ukf
+colcon build --packages-select airsim_tracker --symlink-install
+```
+
+On 2026-10-15 the final repeated-run profile completed three consecutive
+20/20 m/s ceiling trials in the **same UE process**, without restarting the game:
+
+| Run | Closest 3D distance (m) | Intercept time (s) | Landing XY error (m) | Return |
+| --- | --- | --- | --- | --- |
+| 1 | 0.846894 | 6.443 | 0.01346 | Grounded, auto-disarmed |
+| 2 | 0.955311 | 6.411 | 0.01013 | Grounded, auto-disarmed |
+| 3 | 0.828669 | 6.611 | 0.00422 | Grounded, auto-disarmed |
+
+All three retained target tracking through the intercept, passed the unchanged
+1 m criterion, and left the target parked with API control disabled. The third
+run's recorded maximum mid-course camera error (range greater than 12 m) was
+5.74 degrees. Earlier debug misses are preserved as failures, not included in
+this final matrix. A separate injected obstacle at the preferred balloon staging
+point was rejected and an alternate column succeeded; a blocked endpoint failed
+before arming and cleanup still completed. An absent RPC endpoint produced the
+bounded endpoint-specific diagnostic rather than an immediate opaque retry error.
+
+#### Fast Rescue descent and touchdown detection
+
+`gps_rescue_descend_rate=200` and `gps_rescue_landing_rate=50` request 2 m/s
+descent above the Rescue return-altitude boundary and 0.5 m/s below it.
+With `gps_rescue_return_alt=8`, braking at that boundary can briefly stop the
+vehicle around 6.7 m. That is not touchdown. Once descent had been established,
+the old detector allowed quiet-time accumulation at any altitude and could
+auto-disarm during this transient.
+
+The shared mission/geofence/Rescue landing detector now requires the vehicle to
+remain below `ap_landing_altitude` (default 4 m) before accumulating touchdown
+quiet time. Leaving that near-ground envelope resets the timer. The descent-
+established check and sustained stopped-descent/vertical-velocity conditions
+still apply. The 8 m speed-transition boundary is **not** a landing-completion
+height; do not raise the landing envelope to match it. The simulation runner
+continues to require fresh physical home contact and a settled, grounded disarm.
+
+Two same-UE full-loop trials on 2026-10-15 retained the 200/200/50 cm/s
+ascend/descent/landing profile and 300 cm/s return speed. Both stayed armed
+through the stationary 6.7-6.8 m braking transient and landed with confirmed
+contact before auto-disarming. Mean descent was 1.95-1.97 m/s above 10 m and
+0.55-0.57 m/s during the final 1.5-4 m interval. Return durations were
+71.09/71.93 s; landing XY errors were 0.0099/0.0033 m. The fix is in the
+firmware: rebuild with `make TARGET=SITL` after changing it; no UE restart is
+needed.
+
+The generated base, pedestal, turntable, saddle and pitch cradle use existing UE
+cube meshes with measured unit-size normalization. AIM is fixed at
+`pitch-aim=-10`: the camera requests 80 degrees relative to the body, and the
+launcher turns/tilts the body to align that boresight with the target. The
+virtual joint's 85-degree limit and simulated 65-degree arming allowance are
+**SITL only**, not changes to the hardware model's default mechanical limits.
+
+`airsim.LauncherLock.Copter 1` constrains only the mounted Copter while its real
+sensor/controller updates continue with supporting gravity reaction. The
+first interceptor body-rate command releases it with `airsim.LauncherLock.Copter 0`;
+normal flight physics and collision response then apply. The cradle levels only after at least 5 m separation; its landing saddle is then
+centered under the original mounted launch/home position, not the displaced pivot.
+This platform path starts `MISSION` on the mount
+instead of using the legacy 4 m hover handover.
+
+The launcher-specific bridge profile allows MISSION gimbal stabilization before
+airborne confirmation. The AirSim gimbal retains a world-referenced boresight
+through body motion. The tracker discards repeated/out-of-order prediction
+timestamps instead of resetting a valid LOS, and the image-capture cache isolates
+different cameras and image request types. The interception profile uses
+short-horizon IMU axial-speed aiding and disables noisy augmented-PN acceleration
+feed-forward; no target ground truth is fed into guidance.
+
+The high-speed profile adds coordinated stopping rather than simply increasing
+the two speed ceilings:
+
+- `controller.vertical_brake_accel=6` and `vertical_brake_delay=0.5` bound the
+  vertical reference by `v*delay + v*v/(2*accel) <= abs(dz)`.
+- `controller.visual_speed_gain=600` caps axial speed by `600/bbox_size_px`,
+  independent of monocular range-scale errors. With this option enabled, the
+  vertical reference is also bounded by `axial_reference*abs(dz)/horizontal_range`.
+  Thus image-based horizontal braking cannot leave the climb running at full
+  speed and carry the vehicle above the target. The pixel gain is specific to
+  the 1536x960, 72-degree camera; recalibrate it for different optics.
+- Axial/vertical velocity gains are 1.5/4, lateral PN gain is 2.5, terminal
+  lateral decay is 0.1, and observability dither is reduced to 0.1 m/s^2.
+  Axial deadband is 0.05 m/s so low-speed terminal closure does not stall.
+  Perception position/size standard deviations are 12/3 pixels for this
+  asynchronous rendered-camera setup.
+- Estimated capture range is 0.5 m, not the old 2 m early-hold trigger.
+  This does **not** change the independent common-world 1 m hit criterion.
+
+These optional limits default to disabled in the general controller, so other
+launch profiles retain their existing behavior. The runner writes all effective
+parameters to `interceptor_parameters.yaml`; starting the generic launch without
+that overlay is not equivalent to the tested mission.
+
+The mission overlay enables `estimation.gyro_attitude_during_mission`: body-to-world
+attitude is seeded from the settled prelaunch FC orientation, then propagated
+with the measured body gyro during the short engagement. This avoids feeding
+acceleration-induced FC tilt corrections into the companion's gravity subtraction
+and velocity integration. Outside MISSION, the companion again uses FC orientation.
+Betaflight keeps its normal `imu_dcm_kp=2500` for GPS Rescue and landing; the
+temporary 500-gain experiment was not retained because return-flight drift occurred.
+Neither simulator attitude nor target ground truth is injected into guidance.
+`trajectory.csv` records the FC's ENU quaternion as well as simulator attitude,
+and controller logs include IMU axial/vertical speed for comparison.
+
+A three-ray, +/-1 m launch corridor check rejects near obstacles. Any new
+non-target collision during the engagement causes an emergency stop, not a
+continued blind return attempt. Tracking loss without collision requests Rescue;
+the test supervisor also ends a missed pass if common-world range reopens by
+more than 8 m from its closest approach. This ground-truth check only aborts the
+test and requests Rescue; it is not a guidance input. An aborted Rescue is
+reported immediately. These checks are not general-purpose
+obstacle avoidance.
+
+The earlier 12/10 m/s Camera8 trial on 2026-10-14 achieved a **0.870 m** closest approach in
+**7.75 s**, with **13.32 m/s** peak speed, and landed **0.026 m** from the
+launch point. A subsequent settled-hover-target trial also passed the strict
+1 m intercept criterion and returned.
+
+The 2026-10-14 high-speed profile was then validated in four consecutive full-loop
+trials with a settled hovering balloon approximately 70 m horizontally away and
+45 m above launch:
+
+| Guidance/climb ceilings (m/s) | Run | Closest (m) | Intercept (s) | Peak 3D speed (m/s) | Peak climb (m/s) | Landing XY error (m) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20 / 20 | 1 | 0.841938 | 6.799 | 18.039 | 10.529 | 0.0201 |
+| 25 / 25 | 1 | 0.974968 | 7.245 | 18.856 | 10.924 | 0.0491 |
+| 20 / 20 | 2 | 0.858568 | 6.837 | 17.724 | 10.626 | 0.0409 |
+| 25 / 25 | 2 | 0.922721 | 6.522 | 18.930 | 11.626 | 0.0252 |
+
+All four final trials met the unchanged 1 m common-world criterion, returned,
+made fresh upward-facing contact on the home saddle, and auto-disarmed. No
+non-target engagement collision was recorded in this final matrix. Earlier
+failed debug trials remain failures and are not included as passes.
+Repeat the command above with both speed arguments set to 25 for the second
+validated ceiling pair; the rest of the profile is identical.
+
+These numbers distinguish **configured speed ceilings** from **measured speed**.
+The short 45 m climb includes acceleration and terminal braking; these tests
+do not demonstrate an actual 20 m/s climb or certify other geometries, moving
+targets, or hardware. Do not substitute the general YAML for the mission overlay.
+
+Artifacts additionally include `aim_camera.png`, `launcher_overview.png`,
+`bridge_parameters.yaml`, mounted pose/IMU agreement, clearance distances,
+release timing and peak speed.
+
 ## Support and Developers Channel
 
 There's a dedicated [Discord server](https://discord.gg/n4E6ak4u3c) for help, support and general community.

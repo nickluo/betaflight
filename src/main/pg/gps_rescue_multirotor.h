@@ -38,6 +38,7 @@ typedef struct gpsRescue_s {
 
     uint16_t descentDistanceM; // meters
     uint16_t descendRate;
+    uint16_t landingRate; // cm/s, final descent once below the return altitude
     uint8_t  sanityChecks;
     uint8_t  minSats;
     uint8_t  allowArmingWithoutFix;

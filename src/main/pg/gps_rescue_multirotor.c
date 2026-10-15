@@ -30,20 +30,21 @@
 
 #include "gps_rescue.h"
 
-PG_REGISTER_WITH_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig, PG_GPS_RESCUE, 8);
+PG_REGISTER_WITH_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig, PG_GPS_RESCUE, 9);
 
 PG_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig,
 
     .minStartDistM = 15,
-    .altitudeMode = GPS_RESCUE_ALT_MODE_MAX,
+    .altitudeMode = GPS_RESCUE_ALT_MODE_FIXED,
     .initialClimbM = 10,
-    .ascendRate = 750,          // cm/s, for altitude corrections on ascent
+    .ascendRate = 200,          // cm/s, 2 m/s climb to the return altitude
 
-    .returnAltitudeM = 30,
-    .groundSpeedCmS = 750,
+    .returnAltitudeM = 8,
+    .groundSpeedCmS = 300,      // cm/s, 3 m/s return cruise speed
 
     .descentDistanceM = 20,
-    .descendRate = 150,         // cm/s, minimum for descent and landing phase, or for descending if starting high ascent
+    .descendRate = 200,         // cm/s, 2 m/s descent while above the return altitude
+    .landingRate = 50,          // cm/s, 0.5 m/s final descent once below the return altitude
     .sanityChecks = RESCUE_SANITY_FS_ONLY,
     .minSats = 8,
     .allowArmingWithoutFix = false,

@@ -1302,6 +1302,7 @@ void GPS_distance2d(const gpsLocation_t* /*from*/, const gpsLocation_t* /*to*/, 
     const positionEstimate3d_t *positionEstimatorGetEstimate(void) { return &stubEstimate; }
     void positionEstimatorEnableXY(bool /*enable*/) { }
     bool positionEstimatorIsValidXY(void) { return false; }
+    void positionEstimatorCaptureArmOrigin(void) { }
 
     void positionNavInit(void) { }
     void positionNavReset(void) { }

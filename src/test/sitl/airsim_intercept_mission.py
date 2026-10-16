@@ -7,10 +7,12 @@ Orchestrates the full engagement against a running Cosys-AirSim environment:
   2. apm_bridge custom_link relay (AirSim 5764 <-> bridge <-> SITL 5763)
   3. airsim_tracker (YOLO+nanotrack) + drone_interceptor (relative IMM-UKF)
   4. balloon flies to the standoff point (~70 m out, >40 m alt; separate script)
-  5. ground yaw alignment toward the balloon, ARM (props spin up)
-  6. tracker_trigger ON -> wait for visual lock -> tracker_trigger MISSION
+  5. ground yaw alignment toward the balloon, ARM (props spin up; the bridge
+     auto-publishes tracker_trigger ON on the arm edge)
+  6. wait for visual lock -> tracker_trigger MISSION
   7. interceptor flies the engagement; success = ground-truth closest approach
   8. one-key RTH: mode dial sixth detent -> GPS Rescue home + land + disarm
+     (the disarm edge auto-publishes tracker_trigger OFF)
 
 Run under the ROS 2 environment (see airsim_control_test.py for the SITL
 mechanics this builds on):
@@ -206,6 +208,8 @@ class RosInterface(Node):
                                  lambda m: setattr(self, "tracker_state", m.data), 10)
         self.create_subscription(Bool, "/fpv/mission_state",
                                  lambda m: setattr(self, "mission_state", m.data), 10)
+        self.triggers = []
+        self.create_subscription(Header, "/fpv/tracker_trigger", self.record_trigger, 10)
         self.create_subscription(Imu, "/mavros/imu/data",
                                  lambda m: (setattr(self, "imu_count", self.imu_count + 1),
                                             setattr(self, "imu_quat", (m.orientation.x, m.orientation.y,
@@ -223,6 +227,13 @@ class RosInterface(Node):
     def control_received(self, message):
         if message.armed and message.control_mode == ControlCommand.BODY_RATES:
             self.control_sequence += 1
+
+    def record_trigger(self, message):
+        self.triggers.append((time.monotonic(), message.frame_id))
+
+    def trigger_seen(self, frame_id, since=None):
+        return any(f == frame_id and (since is None or t >= since)
+                   for t, f in self.triggers)
 
     def publish_trigger(self, frame_id):
         msg = Header()
@@ -429,6 +440,15 @@ class InterceptMission:
             time.sleep(period)
         raise AssertionError(f"timeout: {description}; last modes={last['modes'] if last else None} "
                              f"dist={last['distance'] if last else None:.1f}" if last else description)
+
+    def wait_for_trigger(self, frame_id, since, timeout):
+        """Wait for a /fpv/tracker_trigger frame (bridge arm-edge or mission-published)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.ros_iface.trigger_seen(frame_id, since):
+                return True
+            time.sleep(0.05)
+        return False
 
     def ros_launch_argv(self, package, launch_file, extra=()):
         script = (f"source /opt/ros/jazzy/setup.bash && "
@@ -934,6 +954,10 @@ class InterceptMission:
         ignores RC sticks and the ground yaw alignment cannot rotate the
         airframe. Pilot-switch arming keeps stick authority until the
         interceptor's first ControlCommand arrives and OFFBOARD takes over.
+
+        Arming (props spinning) must make the bridge auto-publish
+        /fpv/tracker_trigger ON on the arm edge; verified here so a bridge
+        regression cannot silently disable the vision pipeline.
         """
         self.stage = "arm"
         self.rc.set(roll=1500, pitch=1500, yaw=1500, throttle=1000,
@@ -942,6 +966,7 @@ class InterceptMission:
                     arm=joystick.RC_MIN_US, trigger=joystick.RC_MIN_US)
         self.wait("FC arming checks clear with ARM low",
                   lambda s: s["flags"] == 0, timeout=60, dwell=.5)
+        arm_since = time.monotonic()
         self.rc.set(arm=joystick.RC_MAX_US)
         try:
             state = self.wait("pilot-switch arm accepted (props spinning)",
@@ -951,13 +976,23 @@ class InterceptMission:
             raise RuntimeError(f"arming failed; arming-disable flags=0x{flags:08x}")
         self.armed_once = True
         log(f"armed, modes={state['modes']} (props up)")
+        if not self.wait_for_trigger("ON", arm_since, 10.0):
+            raise RuntimeError("bridge did not auto-publish /fpv/tracker_trigger ON "
+                               "on the arm edge (props spinning)")
+        log("arm edge auto-published /fpv/tracker_trigger ON (bridge)")
 
-    def start_tracking(self):
+    def start_tracking(self, manual_trigger=False):
+        """Wait for the vision tracker to lock onto the balloon.
+
+        The armed path relies on the bridge's arm-edge auto ON trigger (verified
+        in arm_fc); manual_trigger covers aim-only runs that never arm.
+        """
         self.stage = "track"
         self.capture_png("0", "ground_camera.png")
         if self.launcher is not None:
             self.capture_png("LauncherOverview", "launcher_overview.png")
-        self.ros_iface.publish_trigger("ON")
+        if manual_trigger:
+            self.ros_iface.publish_trigger("ON")
         first = self.sample()
         yaw_start = self.launcher.yaw if self.launcher else None
         pitch_start = self.launcher.pitch if self.launcher else None
@@ -1259,6 +1294,7 @@ class InterceptMission:
         ground_contact_info = None
         next_log = 0.0
         lost_controller_since = None
+        disarm_since = start  # previous poll before a disarm observation
         while time.monotonic() - start < RTH_WAIT:
             state = self.sample()
             if rescue_controller(state["modes"]) is None and 0 in state["modes"]:
@@ -1293,16 +1329,24 @@ class InterceptMission:
                 next_log += 5.0
             if 0 not in state["modes"]:
                 if distance < 8 and abs(height) < 1 and velocity < 0.3 and ground_contact:
-                    log(f"RTH complete: home {distance:.1f} m, |v| {velocity:.2f} m/s, disarmed")
+                    # 落地上锁边沿必须让桥自动发布 tracker OFF（与 RTH 开头的
+                    # 手动 OFF 区分：只认上锁前一个轮询之后收到的帧）。
+                    if not self.wait_for_trigger("OFF", disarm_since, 5.0):
+                        raise RuntimeError("disarm edge did not auto-publish "
+                                           "/fpv/tracker_trigger OFF (bridge)")
+                    log(f"RTH complete: home {distance:.1f} m, |v| {velocity:.2f} m/s, disarmed "
+                        "(tracker auto-OFF confirmed)")
                     self.report["phases"]["rth"] = {
                         "outcome": "returned", "home_distance_m": distance,
                         "height_m": height, "speed_m_s": velocity,
                         "auto_disarmed": True, "ground_contact": True,
                         "ground_contact_info": ground_contact_info,
+                        "disarm_trigger_off": True,
                         "duration_s": time.monotonic() - start}
                     return
                 raise RuntimeError(f"disarmed before home landing: home={distance:.1f} m "
                                    f"height={height:.1f} m speed={velocity:.2f} m/s")
+            disarm_since = time.monotonic()
             time.sleep(0.2)
         raise RuntimeError(f"RTH did not conclude (closest home distance {closest:.1f} m)")
 
@@ -1385,7 +1429,7 @@ class InterceptMission:
             if self.launcher is not None:
                 self.check_launcher_clearance()
             if self.args.aim_only:
-                self.start_tracking()
+                self.start_tracking(manual_trigger=True)
                 self.report["phases"]["aim_check"] = {"passed": True}
             else:
                 self.arm_fc()

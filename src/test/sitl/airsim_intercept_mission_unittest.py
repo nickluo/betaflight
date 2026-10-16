@@ -6,7 +6,7 @@ import itertools
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import cosysairsim as airsim
 import airsim_balloon_target as balloon
@@ -55,6 +55,7 @@ class InterceptMissionTest(unittest.TestCase):
     def test_arm_switch_stays_low_until_firmware_checks_clear(self):
         test = self.make_mission()
         test.rc = Mock()
+        test.ros_iface = Mock()
         calls = []
 
         def wait(description, predicate, **kwargs):
@@ -73,6 +74,19 @@ class InterceptMissionTest(unittest.TestCase):
         test.arm_fc()
         self.assertEqual(len(calls), 2)
         self.assertTrue(test.armed_once)
+        test.ros_iface.trigger_seen.assert_called_once_with("ON", ANY)
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", side_effect=[0, 10, 5, 20])
+    def test_arm_without_bridge_auto_on_trigger_fails(self, _clock, _sleep):
+        test = self.make_mission()
+        test.rc = Mock()
+        test.ros_iface = Mock()
+        test.ros_iface.trigger_seen.return_value = False
+        test.wait = Mock(return_value={"modes": [0]})
+        with self.assertRaisesRegex(RuntimeError, "auto-publish /fpv/tracker_trigger ON"):
+            test.arm_fc()
+        test.ros_iface.trigger_seen.assert_called_with("ON", ANY)
 
     @patch.object(mission.time, "sleep")
     @patch.object(mission.socket, "create_connection")
@@ -376,7 +390,16 @@ class InterceptMissionTest(unittest.TestCase):
         test.return_home()
         self.assertEqual(test.report["phases"]["rth"]["outcome"], "returned")
         self.assertTrue(test.report["phases"]["rth"]["ground_contact"])
+        self.assertTrue(test.report["phases"]["rth"]["disarm_trigger_off"])
         test.ros_iface.publish_offboard.assert_called_once_with(False)
+
+    @patch.object(mission.time, "sleep")
+    def test_return_fails_without_disarm_edge_off_trigger(self, _sleep):
+        test = self.prepare_return(
+            {"pos": (100.1, -30.1, -3), "vel": (0, 0, 0), "modes": []}, 200)
+        test.wait_for_trigger = Mock(return_value=False)
+        with self.assertRaisesRegex(RuntimeError, "auto-publish /fpv/tracker_trigger OFF"):
+            test.return_home()
 
     @patch.object(mission.time, "sleep")
     def test_target_contact_aloft_cannot_count_as_home_ground_contact(self, _sleep):
@@ -597,7 +620,21 @@ class InterceptMissionTest(unittest.TestCase):
         evidence = test.report["phases"]["prelaunch_tracking"]
         self.assertGreater(evidence["target_displacement_m"], .5)
         self.assertGreater(evidence["launcher_yaw_change_deg"], .1)
+        # 起桨路径的 ON 由桥在 arm 边沿自动发布（arm_fc 已校验），此处不再手动发。
+        test.ros_iface.publish_trigger.assert_not_called()
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", side_effect=itertools.count(1, .25))
+    def test_aim_only_tracking_still_publishes_manual_on(self, _clock, _sleep):
+        test = self.make_mission()
+        test.args = SimpleNamespace(balloon_motion="hover")
+        test.ros_iface = Mock(tracker_state=2)
+        test.capture_png = Mock()
+        test.sample = Mock(return_value={
+            "target_pos": (70, 0, -45), "target_vel": (0, 0, 0), "camera_error_deg": None})
+        test.start_tracking(manual_trigger=True)
         test.ros_iface.publish_trigger.assert_called_once_with("ON")
+        self.assertIn("prelaunch_tracking", test.report["phases"])
 
     @patch.object(mission.time, "sleep")
     @patch.object(mission.time, "monotonic", side_effect=itertools.count(1))

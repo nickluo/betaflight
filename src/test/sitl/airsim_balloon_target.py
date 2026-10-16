@@ -24,6 +24,26 @@ INTERCEPTOR_NAME = "Copter"
 TARGET_NAME = "TargetDrone"
 
 
+def validate_motion(motion, radius, speed):
+    if motion not in ("hover", "orbit"):
+        raise ValueError("balloon motion must be hover or orbit")
+    if not all(math.isfinite(v) and v > 0 for v in (radius, speed)):
+        raise ValueError("orbit radius and speed must be finite and positive")
+    if radius > 10 or speed > 5:
+        raise ValueError("orbit radius must be <= 10 m and speed <= 5 m/s")
+
+
+def orbit_reference(center, radius, speed, elapsed):
+    validate_motion("orbit", radius, speed)
+    if not math.isfinite(elapsed) or elapsed < 0:
+        raise ValueError("orbit elapsed time must be finite and nonnegative")
+    angle = speed * elapsed / radius
+    position = (center[0] + radius * math.cos(angle),
+                center[1] + radius * math.sin(angle), center[2])
+    velocity = (-speed * math.sin(angle), speed * math.cos(angle), 0.0)
+    return position, velocity
+
+
 def world_to_geopoint(position, origin):
     """Invert the WGS84 local tangent frame used by AirSim's visibility API."""
     lat, lon = math.radians(origin.latitude), math.radians(origin.longitude)
@@ -111,6 +131,7 @@ class BalloonTarget:
         else:
             world = (self.spawn_offset[0], self.spawn_offset[1] + 5, self.spawn_offset[2] - 5)
         self.route = self.plan_route(world)
+        self.check_motion_clearance()
         state = airsim.KinematicsState()
         state.position = airsim.Vector3r(*(p-o for p, o in zip(self.route[0], self.spawn_offset)))
         state.orientation = airsim.Quaternionr(0, 0, 0, 1)
@@ -141,6 +162,19 @@ class BalloonTarget:
                     return route
                 print(f"[balloon] rejected obstructed staging route from {spawn}", flush=True)
         raise RuntimeError("no obstacle-clear balloon staging/climb/transit corridor; target not armed")
+
+    def check_motion_clearance(self):
+        if self.args.motion == "hover":
+            return
+        count = max(32, math.ceil(2 * math.pi * self.args.orbit_radius))
+        period = 2 * math.pi * self.args.orbit_radius / self.args.orbit_speed
+        points = [self.standoff] + [
+            orbit_reference(self.standoff, self.args.orbit_radius, self.args.orbit_speed,
+                            period * i / count)[0] for i in range(count + 1)]
+        if not self.corridor_clear(points):
+            raise RuntimeError("balloon orbit corridor is obstructed; target not armed")
+        print(f"[balloon] checked orbit: center={self.standoff}, "
+              f"radius={self.args.orbit_radius:.2f} m, speed={self.args.orbit_speed:.2f} m/s", flush=True)
 
     def command_velocity(self, velocity, duration=.2):
         if not self.client.moveByVelocityAsync(
@@ -201,36 +235,62 @@ class BalloonTarget:
         return error
 
     def hold_orbit(self):
-        """Hover at the standoff point, or orbit it with a small radius."""
-        radius, speed = self.args.orbit_radius, self.args.orbit_speed
-        omega = speed / radius if radius > 0 else 0.0
-        dt = 0.1
-        angle = 0.0
-        start = time.monotonic()
+        """Track a stationary point or a time-based circular position/velocity reference."""
+        if self.args.motion == "orbit":
+            entry, _ = orbit_reference(self.standoff, self.args.orbit_radius,
+                                        self.args.orbit_speed, 0)
+            self.fly_leg(entry)
+        start = self.client.getMultirotorState(vehicle_name=TARGET_NAME).timestamp * 1e-9
+        wall_start = time.monotonic()
+        ready_since, ready = None, False
+        first_position = self.vehicle_position(TARGET_NAME)
+        next_log = 0.0
         while not self.stop.is_set():
+            state = self.client.getMultirotorState(vehicle_name=TARGET_NAME)
+            elapsed = state.timestamp * 1e-9 - start
+            if elapsed < 0:
+                raise RuntimeError("AirSim clock reset during target motion")
+            pos = self.vehicle_position(TARGET_NAME)
+            v = state.kinematics_estimated.linear_velocity
+            speed = math.hypot(v.x_val, v.y_val, v.z_val)
             if self.args.motion == "orbit":
-                vx = speed * math.sin(angle)
-                vy = -speed * math.cos(angle)
-                state = self.client.getMultirotorState(vehicle_name=TARGET_NAME)
-                z = state.kinematics_estimated.position.z_val
-                vz = (self.local_standoff[2] - z) / dt
-                self.command_velocity((vx, vy, max(-2.0, min(2.0, vz))), duration=dt)
-                angle += omega * dt
-                if angle > 2 * math.pi:
-                    angle -= 2 * math.pi
+                goal, feedforward = orbit_reference(
+                    self.standoff, self.args.orbit_radius, self.args.orbit_speed, elapsed)
+                stable = (math.dist(pos, goal) < 1
+                          and abs(speed - self.args.orbit_speed) < max(.3, .3 * self.args.orbit_speed)
+                          and math.dist(pos, first_position) > .25)
             else:
-                pos = self.vehicle_position(TARGET_NAME)
-                self.command_velocity(tuple(.8 * (g-p) for g, p in zip(self.standoff, pos)))
-            if self.args.duration > 0 and time.monotonic() - start > self.args.duration:
-                break
-            if int(time.monotonic() - start) % 5 == 0:
-                pos = self.vehicle_position(TARGET_NAME)
+                goal, feedforward = self.standoff, (0.0, 0.0, 0.0)
+                stable = math.dist(pos, goal) < 1 and speed < .25
+            if math.dist(pos, goal) > 2.0:
+                raise RuntimeError(f"balloon left motion envelope: position={pos}, reference={goal}")
+            collision = self.client.simGetCollisionInfo(vehicle_name=TARGET_NAME)
+            if (collision.has_collided and collision.time_stamp > self.flight_timestamp
+                    and collision.object_name != INTERCEPTOR_NAME):
+                raise RuntimeError(f"balloon motion collision with {collision.object_name} at {pos}")
+            if not ready:
+                ready_since = (ready_since if ready_since is not None else elapsed) if stable else None
+                if ready_since is not None and elapsed - ready_since >= 1:
+                    print(f"[balloon] target ready: motion={self.args.motion}, "
+                          f"speed={speed:.2f} m/s, position={pos}", flush=True)
+                    ready = True
+                elif time.monotonic() - wall_start > 20:
+                    raise RuntimeError(f"balloon {self.args.motion} motion did not become ready")
+            command = tuple(ff + .8 * (g-p) for g, p, ff in zip(goal, pos, feedforward))
+            limit = max(self.args.cruise, self.args.orbit_speed * 1.5)
+            magnitude = math.hypot(*command)
+            if magnitude > limit:
+                command = tuple(v * limit / magnitude for v in command)
+            self.command_velocity(command, duration=.1)
+            if elapsed >= next_log:
                 drone = self.vehicle_position(INTERCEPTOR_NAME)
                 rel = (pos[0] - drone[0], pos[1] - drone[1], pos[2] - drone[2])
                 horiz = math.hypot(rel[0], rel[1])
-                print(f"[balloon] t={time.monotonic() - start:5.1f}s pos=({pos[0]:6.1f},{pos[1]:6.1f},{pos[2]:6.1f}) "
-                      f"rel horiz {horiz:5.1f} m alt {-rel[2]:5.1f} m", flush=True)
-                time.sleep(1.0)  # avoid duplicate prints within the same second
+                print(f"[balloon] t={elapsed:5.1f}s pos=({pos[0]:6.1f},{pos[1]:6.1f},{pos[2]:6.1f}) "
+                      f"speed {speed:.2f} m/s, rel horiz {horiz:5.1f} m alt {-rel[2]:5.1f} m", flush=True)
+                next_log = elapsed + 5
+            if self.args.duration > 0 and elapsed >= self.args.duration:
+                break
 
     def run(self):
         try:
@@ -241,6 +301,7 @@ class BalloonTarget:
                 self.route = self.plan_route(position)
                 if self.route[0] != position:
                     raise RuntimeError("current balloon position has no clear route; use --reset for staging")
+                self.check_motion_clearance()
             self.fly_to_standoff()
             self.hold_orbit()
         finally:
@@ -271,6 +332,12 @@ def main():
     parser.add_argument("--no-land", dest="land", action="store_false",
                         help="compatibility flag: cleanup now always cancels, parks and releases the target")
     args = parser.parse_args()
+    try:
+        validate_motion(args.motion, args.orbit_radius, args.orbit_speed)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not math.isfinite(args.duration) or args.duration < 0:
+        parser.error("--duration must be finite and nonnegative")
     if any(v is not None for v in (args.spawn_x, args.spawn_y, args.spawn_z)) and \
             any(v is None for v in (args.spawn_x, args.spawn_y, args.spawn_z)):
         parser.error("--spawn-x, --spawn-y and --spawn-z must be provided together")

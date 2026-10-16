@@ -2,9 +2,10 @@
 """Offline Camera8 launcher and monotonic-vision regression checks."""
 
 import math
+import itertools
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import cosysairsim as airsim
 import numpy as np
@@ -102,6 +103,26 @@ class LauncherTest(unittest.TestCase):
         client.simGetObjectPose.return_value = airsim.Pose(airsim.Vector3r(8, 4, -.2))
         launcher.refresh_spawn_offset()
         self.assertEqual(launcher.spawn_offset, (0, 0, 0))
+
+    @patch("airsim_launcher.time.monotonic", side_effect=itertools.count(1, .05))
+    def test_launcher_tracks_moving_target_without_changing_fixed_camera_aim(self, _clock):
+        launcher, client = self.make_launcher()
+        launcher.build(0)
+        for y in range(120):
+            launcher.aim_at((70, 8 + y * .02, -45))
+        first_yaw, first_pitch = launcher.yaw, launcher.pitch
+        for y in range(120):
+            launcher.aim_at((70, 12 - y * .02, -43))
+        self.assertNotEqual(launcher.yaw, first_yaw)
+        self.assertNotEqual(launcher.pitch, first_pitch)
+        desired, *_ = launcher_angles(launcher.position, (70, 9.62, -43), -10)
+        self.assertLess(abs(launcher.yaw - desired), .05)
+        self.assertEqual(launcher.aim_pitch_deg, -10)
+        launcher.release()
+        client.simSetKinematics.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "after release"):
+            launcher.aim_at((70, 20, -45))
+        client.simSetKinematics.assert_not_called()
 
 
 class MonotonicDetectionTest(unittest.TestCase):

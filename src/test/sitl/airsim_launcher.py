@@ -148,6 +148,8 @@ class AirsimLauncher:
         self.set_vehicle_pose(self.position, quaternion_rpy(0, 0, self.heading))
 
     def aim_at(self, target, client=None):
+        if self.released:
+            raise RuntimeError("cannot aim the launcher after release")
         client = client or self.client
         now = time.monotonic()
         dt = .05 if self.last_aim_time is None else max(.001, min(.1, now-self.last_aim_time))
@@ -162,6 +164,9 @@ class AirsimLauncher:
         offset = rotate(q, (0, 0, -self.MOUNT_OFFSET))
         old_position = self.position
         self.position = tuple(p+d for p, d in zip(self.pivot, offset))
+        move_actor(client, "BFLauncher_Turntable", airsim.Pose(
+            airsim.Vector3r(self.pivot[0], self.pivot[1], self.pivot[2]+.2),
+            quaternion_rpy(0, 0, self.yaw)))
         move_actor(client, "BFLauncher_Tray", airsim.Pose(airsim.Vector3r(*self.pivot), q))
         saddle = tuple(p+d for p, d in zip(self.pivot, rotate(q, (0, 0, -.25))))
         move_actor(client, "BFLauncher_Saddle", airsim.Pose(airsim.Vector3r(*saddle), q))

@@ -44,12 +44,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import airsim_control_test as control  # noqa: E402  (MspClient, RcStream, provision, ...)
 import sitl_joystick as joystick  # noqa: E402
 from airsim_launcher import AirsimLauncher, quaternion_rpy, rotate  # noqa: E402
-from airsim_balloon_target import park_target  # noqa: E402
+from airsim_balloon_target import park_target, validate_motion  # noqa: E402
 
 # Must precede the rclpy import: rmw can latch ROS_DOMAIN_ID when the library
 # loads, so setting it later would leave the orchestrator on a different domain
 # than the bridge/tracker/interceptor it launches.
-ROS_DOMAIN = "77"
+ROS_DOMAIN = os.environ.get("ROS_DOMAIN_ID", "78")
 os.environ["ROS_DOMAIN_ID"] = ROS_DOMAIN
 
 import cosysairsim as airsim  # noqa: E402
@@ -69,6 +69,20 @@ TRACK_LOCK_WAIT = 45.0
 MISSION_WAIT = 100.0
 RTH_WAIT = 240.0
 HIT_DISTANCE = 1.0  # m, common-world ground-truth intercept threshold
+
+
+def apply_interceptor_profile(params, args):
+    """Keep shared YAML tuning; apply only CLI limits and the SITL attitude source."""
+    params["estimation"]["gyro_attitude_during_mission"] = False
+    controller = params["controller"]
+    controller["v_des"] = args.guidance_speed
+    controller["v_pn_ref"] = min(args.guidance_speed, controller["v_pn_ref"])
+    controller["turn_radius_cap_factor"] = args.turn_cap_factor
+    params["control"]["rate_control_attenuation"] = args.rate_control_attenuation
+    params["physics"]["v_climb"] = args.climb_speed
+    params["physics"]["v_descent"] = args.climb_speed
+    return params
+
 
 SITL_CONFIG_BASE = (
     "profile 0",
@@ -90,6 +104,7 @@ SITL_CONFIG_BASE = (
     "set trust_mag = ON",
     "set imu_dcm_kp = 2500",
     "set small_angle = 45",
+    "set pwr_on_arm_grace = 5",
     "set failsafe_procedure = AUTO-LAND",
     "set custom_link_motors_stream = ON",
     "set airmode_start_throttle_percent = 15",
@@ -252,12 +267,7 @@ class ManagedProcess:
     def wait_for_log(self, marker, timeout):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.process is not None and self.process.poll() is not None:
-                tail = ""
-                if self.log_path and self.log_path.exists():
-                    tail = "\n" + "\n".join(self.log_path.read_text(errors="replace").splitlines()[-12:])
-                raise RuntimeError(f"{self.name} exited early (code {self.process.returncode}); "
-                                   f"log={self.log_path}{tail}")
+            self.check_running()
             if self.log_path and self.log_path.exists():
                 text = self.log_path.read_text(errors="replace")
                 if "process has died" in text:
@@ -267,6 +277,14 @@ class ManagedProcess:
                     return text
             time.sleep(0.2)
         raise TimeoutError(f"{self.name} log never showed {marker!r} within {timeout:.0f}s")
+
+    def check_running(self):
+        if self.process is not None and self.process.poll() is not None:
+            tail = ""
+            if self.log_path and self.log_path.exists():
+                tail = "\n" + "\n".join(self.log_path.read_text(errors="replace").splitlines()[-12:])
+            raise RuntimeError(f"{self.name} exited early (code {self.process.returncode}); "
+                               f"log={self.log_path}{tail}")
 
     def stop(self):
         if self.process is None:
@@ -352,6 +370,8 @@ class InterceptMission:
                 "rpy": (roll, pitch, yaw)}
 
     def sample(self):
+        if self.balloon is not None:
+            self.balloon.check_running()
         if self.launcher is not None and self.launcher.error is not None:
             raise RuntimeError(f"launcher actuator failed: {self.launcher.error}")
         if self.rc is not None and self.rc.error is not None:
@@ -378,6 +398,9 @@ class InterceptMission:
                self.ros_iface.mission_state if self.ros_iface else None,
                *target["pos"], bbox.bbox.size_x if bbox else None,
                los.header.frame_id if los else "", los_age, camera_error,
+               *target["vel"],
+               math.degrees(self.launcher.yaw) if self.launcher else None,
+               math.degrees(self.launcher.pitch) if self.launcher else None,
                *(self.ros_iface.imu_quat if self.ros_iface and self.ros_iface.imu_quat
                  else (None,) * 4))
         if self.trajectory:
@@ -386,6 +409,7 @@ class InterceptMission:
         state["flags"] = flags
         state["distance"] = distance
         state["target_pos"] = target["pos"]
+        state["target_vel"] = target["vel"]
         state["camera_error_deg"] = camera_error
         return state
 
@@ -520,6 +544,8 @@ class InterceptMission:
                                   "dist_target", "min_dist", "tracker_state", "mission_state",
                                   "target_px", "target_py", "target_pz", "bbox_width",
                                   "los_frame", "los_age", "camera_error_deg",
+                                  "target_vx", "target_vy", "target_vz",
+                                  "launcher_yaw_deg", "launcher_pitch_deg",
                                   "fc_qx", "fc_qy", "fc_qz", "fc_qw"))
 
     def start_sitl(self):
@@ -635,33 +661,7 @@ class InterceptMission:
         config_path = self.args.ros_ws / "install/drone_interceptor/share/drone_interceptor/config/relative_imm_ukf_params.yaml"
         profile = yaml.safe_load(config_path.read_text())
         params = profile["interceptor_node_relative_imm_ukf"]["ros__parameters"]
-        params["perception"]["bbox_pos_std_dev"] = 12.0
-        params["perception"]["bbox_size_std_dev"] = 3.0
-        params["estimation"]["gyro_attitude_during_mission"] = True
-        params["controller"]["v_des"] = self.args.guidance_speed
-        params["controller"]["v_pn_ref"] = min(self.args.guidance_speed, 12.0)
-        params["controller"]["K_dz_up"] = 1.5
-        params["controller"]["K_az"] = 4.0
-        params["controller"]["K_fwd"] = 1.5
-        params["controller"]["vertical_brake_accel"] = 6.0
-        params["controller"]["vertical_brake_delay"] = .5
-        params["controller"]["capture_range"] = .5
-        params["controller"]["axial_deadband"] = .05
-        params["controller"]["visual_speed_gain"] = 600.0
-        params["controller"]["lateral_decay_floor"] = .1
-        params["controller"]["dither_amp"] = .1
-        params["controller"]["use_imu_axial_speed"] = True
-        params["controller"]["K_apn"] = 0.0
-        params["controller"]["N"] = 2.5
-        params["controller"]["turn_radius_cap_factor"] = self.args.turn_cap_factor
-        params["control"]["rate_control_attenuation"] = self.args.rate_control_attenuation
-        params["collision_min_bbox_px"] = 120.0
-        params["physics"]["v_climb"] = self.args.climb_speed
-        params["physics"]["v_descent"] = self.args.climb_speed
-        params["physics"]["max_tilt_deg"] = 55.0
-        params["physics"]["max_tilt_terminal_deg"] = 45.0
-        params["physics"]["max_body_rate"] = 1.0
-        params["controller"]["max_att_rate"] = 1.0
+        apply_interceptor_profile(params, self.args)
         profile_path = self.workdir / "interceptor_parameters.yaml"
         profile_path.write_text(yaml.safe_dump(profile))
         self.report["configuration"] = {
@@ -670,6 +670,18 @@ class InterceptMission:
             "turn_cap_factor": self.args.turn_cap_factor,
             "sitl_imu_dcm_kp": 2500,
             "rate_control_attenuation": self.args.rate_control_attenuation,
+            "balloon_motion": self.args.balloon_motion,
+            "balloon_orbit_radius_m": self.args.balloon_orbit_radius,
+            "balloon_orbit_speed_m_s": self.args.balloon_orbit_speed,
+            "visual_speed_gain": params["controller"]["visual_speed_gain"],
+            "visual_speed_floor_m_s": params["controller"]["visual_speed_floor"],
+            "terminal_speed_floor_m_s": params["controller"]["terminal_speed_floor"],
+            "terminal_speed_bbox_threshold_px": params["controller"]["terminal_speed_bbox_threshold"],
+            "terminal_speed_los_rate_threshold_rad_s": params["controller"]["terminal_speed_los_rate_threshold"],
+            "vertical_brake_accel_m_s2": params["controller"]["vertical_brake_accel"],
+            "gyro_attitude_during_mission": params["estimation"]["gyro_attitude_during_mission"],
+            "target_axial_feedforward_limit_m_s": params["controller"]["target_axial_feedforward_limit"],
+            "ros_domain_id": ROS_DOMAIN,
             "hit_distance_m": HIT_DISTANCE}
         interceptor = ManagedProcess(
             "interceptor", self.ros_launch_argv(
@@ -694,7 +706,9 @@ class InterceptMission:
                 "--x", str(self.origin[0] + dx),
                 "--y", str(self.origin[1] + dy),
                 "--z", str(self.origin[2] + self.args.balloon_z),
-                "--motion", self.args.balloon_motion, "--reset"]
+                "--motion", self.args.balloon_motion,
+                "--orbit-radius", str(self.args.balloon_orbit_radius),
+                "--orbit-speed", str(self.args.balloon_orbit_speed), "--reset"]
         if self.launcher is not None:
             argv += ["--spawn-x", str(self.origin[0]-5*math.sin(self.launcher.heading)),
                      "--spawn-y", str(self.origin[1]+5*math.cos(self.launcher.heading)),
@@ -703,7 +717,7 @@ class InterceptMission:
                                       log_path=self.workdir / "balloon.log")
         self.balloon.start()
         self.processes.append(self.balloon)
-        self.balloon.wait_for_log("standoff reached", 120)
+        self.balloon.wait_for_log("target ready", 120)
         target = self.gt(TARGET)
         horizontal = math.hypot(target["pos"][0] - self.origin[0],
                                 target["pos"][1] - self.origin[1])
@@ -711,7 +725,12 @@ class InterceptMission:
         log(f"balloon at {target['pos']}: horizontal {horizontal:.1f} m, alt {altitude:.1f} m")
         self.report["phases"]["balloon"] = {
             "horizontal_distance_m": horizontal, "height_m": altitude,
-            "motion": self.args.balloon_motion}
+            "motion": self.args.balloon_motion,
+            "center_world_ned_m": (self.origin[0]+dx, self.origin[1]+dy,
+                                    self.origin[2]+self.args.balloon_z),
+            "orbit_radius_m": self.args.balloon_orbit_radius,
+            "orbit_speed_m_s": self.args.balloon_orbit_speed,
+            "ready_speed_m_s": math.hypot(*target["vel"])}
         if not 60 <= horizontal <= 80 or altitude <= 40:
             raise RuntimeError("balloon standoff geometry out of bounds")
 
@@ -920,7 +939,10 @@ class InterceptMission:
         self.rc.set(roll=1500, pitch=1500, yaw=1500, throttle=1000,
                     mode6=joystick.MODE6_VALUES_US[0 if self.launcher is not None else 1],
                     switch3=joystick.RC_MAX_US,
-                    arm=joystick.RC_MAX_US, trigger=joystick.RC_MIN_US)
+                    arm=joystick.RC_MIN_US, trigger=joystick.RC_MIN_US)
+        self.wait("FC arming checks clear with ARM low",
+                  lambda s: s["flags"] == 0, timeout=60, dwell=.5)
+        self.rc.set(arm=joystick.RC_MAX_US)
         try:
             state = self.wait("pilot-switch arm accepted (props spinning)",
                               lambda s: 0 in s["modes"], timeout=12)
@@ -936,20 +958,45 @@ class InterceptMission:
         if self.launcher is not None:
             self.capture_png("LauncherOverview", "launcher_overview.png")
         self.ros_iface.publish_trigger("ON")
-        def locked():
-            return self.ros_iface.tracker_state == 2
+        first = self.sample()
+        yaw_start = self.launcher.yaw if self.launcher else None
+        pitch_start = self.launcher.pitch if self.launcher else None
+        dynamic = getattr(self.args, "balloon_motion", "hover") == "orbit"
+        evidence = {"target_displacement_m": 0.0, "target_peak_speed_m_s": 0.0,
+                    "launcher_yaw_change_deg": 0.0, "launcher_pitch_change_deg": 0.0,
+                    "max_locked_camera_error_deg": 0.0}
         deadline, since = time.monotonic() + TRACK_LOCK_WAIT, None
         while time.monotonic() < deadline:
-            if locked():
+            state = self.sample()
+            speed = math.hypot(*state["target_vel"])
+            displacement = math.dist(state["target_pos"], first["target_pos"])
+            evidence["target_displacement_m"] = max(evidence["target_displacement_m"], displacement)
+            evidence["target_peak_speed_m_s"] = max(evidence["target_peak_speed_m_s"], speed)
+            if self.launcher:
+                evidence["launcher_yaw_change_deg"] = max(evidence["launcher_yaw_change_deg"],
+                    abs(math.degrees(self.launcher.yaw-yaw_start)))
+                evidence["launcher_pitch_change_deg"] = max(evidence["launcher_pitch_change_deg"],
+                    abs(math.degrees(self.launcher.pitch-pitch_start)))
+            camera_ok = self.launcher is None or (
+                state["camera_error_deg"] is not None and state["camera_error_deg"] < 5)
+            moving = not dynamic or speed > .5 * self.args.balloon_orbit_speed
+            if self.ros_iface.tracker_state == 2 and camera_ok and moving:
+                if state["camera_error_deg"] is not None:
+                    evidence["max_locked_camera_error_deg"] = max(
+                        evidence["max_locked_camera_error_deg"], state["camera_error_deg"])
                 if since is None:
                     since = time.monotonic()
-                if time.monotonic() - since >= 1.0:
-                    log("tracker locked (TRACKING sustained 1 s)")
+                if time.monotonic() - since >= (3.0 if dynamic else 1.0) and (
+                        not dynamic or evidence["target_displacement_m"] > .5):
+                    self.report["phases"]["prelaunch_tracking"] = evidence
+                    log(f"tracker locked with {'moving' if dynamic else 'static'} target; "
+                        f"platform tracking={evidence}")
                     return
             else:
                 since = None
             time.sleep(0.2)
-        raise RuntimeError(f"tracker never locked; tracker_state={self.ros_iface.tracker_state}; "
+        raise RuntimeError(f"tracking/aim readiness failed; tracker_state={self.ros_iface.tracker_state}, "
+                           f"motion={self.args.balloon_motion}; "
                            f"see {self.workdir}/tracker.log")
 
     def capture_png(self, camera, filename):
@@ -1055,9 +1102,20 @@ class InterceptMission:
         next_log = 0.0
         peak_speed = 0.0
         peak_horizontal_speed, peak_climb_speed = 0.0, 0.0
+        target_start, target_previous = None, None
+        target_path = 0.0
         launch_timestamp = self.client.getMultirotorState(vehicle_name=VEHICLE).timestamp
         while time.monotonic() - start < MISSION_WAIT:
             state = self.sample()
+            if "target_vel" in state:
+                result["target_peak_speed_m_s"] = max(
+                    result.get("target_peak_speed_m_s", 0), math.hypot(*state["target_vel"]))
+                target_start = state["target_pos"] if target_start is None else target_start
+                if target_previous is not None:
+                    target_path += math.dist(state["target_pos"], target_previous)
+                target_previous = state["target_pos"]
+                result["target_path_length_m"] = target_path
+                result["target_displacement_m"] = math.dist(state["target_pos"], target_start)
             peak_speed = max(peak_speed, math.hypot(*state["vel"]))
             result["peak_speed_m_s"] = peak_speed
             peak_horizontal_speed = max(peak_horizontal_speed, math.hypot(*state["vel"][:2]))
@@ -1378,6 +1436,10 @@ def main():
     parser.add_argument("--balloon-y", type=float, default=36.0)
     parser.add_argument("--balloon-z", type=float, default=-45.0)
     parser.add_argument("--balloon-motion", choices=("hover", "orbit"), default="hover")
+    parser.add_argument("--balloon-orbit-radius", type=float, default=5.0,
+                        help="dynamic target circle radius about balloon-x/y/z (m)")
+    parser.add_argument("--balloon-orbit-speed", type=float, default=1.5,
+                        help="dynamic target tangential speed (m/s)")
     parser.add_argument("--launch-x", type=float, default=0.0,
                         help="ground launch X in Copter-local NED (m)")
     parser.add_argument("--launch-y", type=float, default=0.0,
@@ -1404,6 +1466,10 @@ def main():
     parser.add_argument("--img-w", type=int, default=1536)
     parser.add_argument("--img-h", type=int, default=960)
     args = parser.parse_args()
+    try:
+        validate_motion(args.balloon_motion, args.balloon_orbit_radius, args.balloon_orbit_speed)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not math.isfinite(args.rpc_wait) or args.rpc_wait <= 0:
         parser.error("--rpc-wait must be finite and positive")
     if args.launcher:

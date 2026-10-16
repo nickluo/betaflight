@@ -2,6 +2,8 @@
 """Offline mission regressions; run in the sourced ROS 2/AirSim environment."""
 
 import math
+import itertools
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -24,6 +26,23 @@ class InterceptMissionTest(unittest.TestCase):
             for term, gain in zip("pidf", gains):
                 self.assertIn(f"set {term}_{axis} = {gain}", mission.SITL_CONFIG_BASE)
 
+    def test_controller_profile_is_independent_of_balloon_motion(self):
+        base = dict(guidance_speed=20.0, climb_speed=20.0, turn_cap_factor=.8,
+                    rate_control_attenuation=False)
+        hover = {"balloon_motion": "hover", **base}
+        orbit = {"balloon_motion": "orbit", **base}
+        def parameters():
+            return {"controller": {"v_pn_ref": 12.0, "terminal_speed_floor": 11.0,
+                                   "visual_speed_floor": 2.6, "lateral_decay_floor": .4},
+                    "estimation": {}, "control": {}, "physics": {}}
+        hover_params, orbit_params = parameters(), parameters()
+        mission.apply_interceptor_profile(hover_params, SimpleNamespace(**hover))
+        mission.apply_interceptor_profile(orbit_params, SimpleNamespace(**orbit))
+        self.assertEqual(hover_params, orbit_params)
+        self.assertEqual(hover_params["controller"]["terminal_speed_floor"], 11.0)
+        self.assertEqual(hover_params["controller"]["visual_speed_floor"], 2.6)
+        self.assertEqual(hover_params["controller"]["v_des"], 20.0)
+
     def test_rate_profile_is_verified_from_firmware_not_only_cli_text(self):
         test = self.make_mission()
         test.msp_request = Mock(return_value=bytes([37, 62, 22, 32, 57, 22, 10, 0, 0]))
@@ -32,6 +51,28 @@ class InterceptMissionTest(unittest.TestCase):
         test.msp_request.return_value = bytes([45, 80, 30, 47, 84, 34, 45, 80, 0])
         with self.assertRaisesRegex(RuntimeError, "rate profile did not load"):
             test.verify_rate_profile()
+
+    def test_arm_switch_stays_low_until_firmware_checks_clear(self):
+        test = self.make_mission()
+        test.rc = Mock()
+        calls = []
+
+        def wait(description, predicate, **kwargs):
+            calls.append(description)
+            if len(calls) == 1:
+                self.assertEqual(test.rc.set.call_args.kwargs["arm"], mission.joystick.RC_MIN_US)
+                self.assertFalse(predicate({"flags": 0x200}))
+                self.assertFalse(predicate({"flags": 1 << 29}))
+                self.assertTrue(predicate({"flags": 0}))
+            else:
+                self.assertEqual(test.rc.set.call_args.kwargs["arm"], mission.joystick.RC_MAX_US)
+                self.assertTrue(predicate({"modes": [0]}))
+            return {"modes": [0]}
+
+        test.wait = wait
+        test.arm_fc()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(test.armed_once)
 
     @patch.object(mission.time, "sleep")
     @patch.object(mission.socket, "create_connection")
@@ -72,6 +113,36 @@ class InterceptMissionTest(unittest.TestCase):
         process.log_path.read_text.return_value = "Traceback\nRuntimeError: balloon collision with Tree"
         with self.assertRaisesRegex(RuntimeError, "balloon collision with Tree"):
             process.wait_for_log("standoff reached", 5)
+
+    def test_target_process_exit_cannot_be_mistaken_for_static_target(self):
+        test = self.make_mission()
+        test.balloon = Mock()
+        test.balloon.check_running.side_effect = RuntimeError("balloon motion collision")
+        test.gt = Mock()
+        with self.assertRaisesRegex(RuntimeError, "balloon motion collision"):
+            test.sample()
+        test.gt.assert_not_called()
+
+    @patch.object(mission, "ManagedProcess")
+    def test_runner_passes_motion_parameters_and_rotates_center_with_camera(self, process_class):
+        test = self.make_mission()
+        test.args = SimpleNamespace(
+            host="127.0.0.1", rpc_port=41451, balloon_script=Path("airsim_balloon_target.py"),
+            balloon_x=70, balloon_y=0, balloon_z=-45, balloon_motion="orbit",
+            balloon_orbit_radius=5, balloon_orbit_speed=1.5)
+        test.origin = (100, 200, -3)
+        test.workdir = Path("/tmp/not-created-by-unit-test")
+        test.launcher = SimpleNamespace(heading=math.pi / 2)
+        test.gt = Mock(return_value={"pos": (100, 270, -48), "vel": (1.5, 0, 0)})
+        test.launch_balloon()
+        argv = process_class.call_args.args[1]
+        for flag, value in (("--motion", "orbit"), ("--orbit-radius", "5"),
+                            ("--orbit-speed", "1.5")):
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertAlmostEqual(float(argv[argv.index("--x") + 1]), 100)
+        self.assertAlmostEqual(float(argv[argv.index("--y") + 1]), 270)
+        process_class.return_value.wait_for_log.assert_called_once_with("target ready", 120)
+        self.assertEqual(test.report["phases"]["balloon"]["ready_speed_m_s"], 1.5)
 
     def test_stale_ros_graph_cannot_hide_a_crashed_node(self):
         process = mission.ManagedProcess("interceptor", [])
@@ -211,6 +282,18 @@ class InterceptMissionTest(unittest.TestCase):
         self.assertEqual(result["peak_climb_speed_m_s"], 20)
 
     @patch.object(mission.time, "sleep")
+    def test_intercept_report_measures_target_motion_independently(self, _sleep):
+        test = self.prepare_intercept([
+            {"vel": (0, 0, 0), "distance": 10,
+             "target_pos": (70, 0, -45), "target_vel": (0, 1.5, 0)},
+            {"vel": (0, 0, 0), "distance": .75,
+             "target_pos": (70, 2, -45), "target_vel": (0, 1.2, 0)}])
+        result = test.run_intercept()
+        self.assertEqual(result["target_peak_speed_m_s"], 1.5)
+        self.assertEqual(result["target_path_length_m"], 2)
+        self.assertEqual(result["target_displacement_m"], 2)
+
+    @patch.object(mission.time, "sleep")
     def test_launcher_stows_only_after_five_meter_separation(self, _sleep):
         test = self.prepare_intercept([
             {"pos": (1, 0, -2), "vel": (0, 0, 0), "distance": 10},
@@ -317,7 +400,8 @@ class InterceptMissionTest(unittest.TestCase):
 
     def make_balloon(self):
         target = balloon.BalloonTarget.__new__(balloon.BalloonTarget)
-        target.args = SimpleNamespace(scale=1, cruise=8, reset=True, motion="hover")
+        target.args = SimpleNamespace(scale=1, cruise=8, reset=True, motion="hover",
+                                      orbit_radius=5, orbit_speed=1.5, duration=0)
         target.client = Mock()
         target.stop = Mock()
         target.stop.is_set.return_value = False
@@ -413,6 +497,120 @@ class InterceptMissionTest(unittest.TestCase):
         target.client.enableApiControl.assert_called_with(False, vehicle_name=balloon.TARGET_NAME)
         target.client.moveToPositionAsync.assert_not_called()
         target.client.client.close.assert_called_once()
+
+    def test_orbit_reference_stays_centered_with_exact_tangential_speed(self):
+        center = (-328, 2, -48)
+        for radius, speed in ((2, .5), (5, 1.5), (10, 3)):
+            period = 2 * math.pi * radius / speed
+            for t in (0, .35, period / 4, period / 2, period, 10 * period):
+                with self.subTest(radius=radius, speed=speed, t=t):
+                    pos, vel = balloon.orbit_reference(center, radius, speed, t)
+                    offset = tuple(p-c for p, c in zip(pos, center))
+                    self.assertAlmostEqual(math.hypot(*offset), radius)
+                    self.assertEqual(pos[2], center[2])
+                    self.assertAlmostEqual(math.hypot(*vel), speed)
+                    self.assertAlmostEqual(sum(p*v for p, v in zip(offset, vel)), 0)
+
+    def test_motion_parameters_reject_invalid_values_before_starting(self):
+        for radius, speed in ((0, 1), (-1, 1), (5, 0), (math.nan, 1), (5, math.inf),
+                              (11, 1), (5, 6)):
+            with self.subTest(radius=radius, speed=speed), self.assertRaises(ValueError):
+                balloon.validate_motion("orbit", radius, speed)
+        with self.assertRaises(ValueError):
+            balloon.orbit_reference((0, 0, 0), 5, 1, -1)
+        with self.assertRaises(ValueError):
+            balloon.validate_motion("invalid", 5, 1)
+
+    def test_orbit_clearance_covers_entry_connector_and_entire_circle(self):
+        target = self.make_balloon()
+        target.args.motion = "orbit"
+        target.corridor_clear = Mock(return_value=True)
+        target.check_motion_clearance()
+        points = target.corridor_clear.call_args.args[0]
+        self.assertEqual(points[0], target.standoff)
+        self.assertEqual(points[1], (65, 36, -45))
+        self.assertGreaterEqual(len(points), 34)
+        self.assertLess(math.dist(points[1], points[-1]), 1e-8)
+        for pos in points[1:]:
+            self.assertAlmostEqual(math.dist(pos, target.standoff), 5)
+        target.corridor_clear.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "orbit corridor is obstructed"):
+            target.check_motion_clearance()
+        target.client.armDisarm.assert_not_called()
+
+    @patch.object(balloon.time, "sleep")
+    def test_dynamic_loop_uses_simulation_time_without_log_control_pauses(self, sleep):
+        target = self.make_balloon()
+        target.args.motion = "orbit"
+        target.fly_leg = Mock()
+        target.command_velocity = Mock()
+        times = [0, .5, 1, 1.5, 2]
+        samples = [balloon.orbit_reference(target.standoff, 5, 1.5, t) for t in times]
+        states = [SimpleNamespace(
+            timestamp=int((100+t) * 1e9),
+            kinematics_estimated=SimpleNamespace(linear_velocity=airsim.Vector3r(*vel)))
+            for t, (_, vel) in zip(times, samples)]
+        target.client.getMultirotorState.side_effect = [states[0], *states]
+        positions = iter([samples[0][0], *(p for p, _ in samples)])
+        target.vehicle_position = lambda name: next(positions) if name == balloon.TARGET_NAME else (0, 0, 0)
+        target.stop.is_set.side_effect = [False] * len(times) + [True]
+        with patch("builtins.print") as output:
+            target.hold_orbit()
+        target.fly_leg.assert_called_once_with(samples[0][0])
+        for call, (_, vel) in zip(target.command_velocity.call_args_list, samples):
+            for actual, expected in zip(call.args[0], vel):
+                self.assertAlmostEqual(actual, expected)
+            self.assertEqual(call.kwargs["duration"], .1)
+        self.assertTrue(any("target ready: motion=orbit" in c.args[0] for c in output.call_args_list))
+        sleep.assert_not_called()
+
+    def test_motion_envelope_deviation_stops_before_another_command(self):
+        target = self.make_balloon()
+        target.args.motion = "orbit"
+        target.fly_leg = Mock()
+        target.command_velocity = Mock()
+        target.vehicle_position = Mock(return_value=(68, 36, -45))
+        target.client.getMultirotorState.return_value = SimpleNamespace(
+            timestamp=100_000_000_000,
+            kinematics_estimated=SimpleNamespace(linear_velocity=airsim.Vector3r()))
+        with self.assertRaisesRegex(RuntimeError, "left motion envelope"):
+            target.hold_orbit()
+        target.command_velocity.assert_not_called()
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", side_effect=itertools.count(1, .25))
+    def test_prelaunch_tracks_moving_target_before_mission(self, _clock, _sleep):
+        test = self.make_mission()
+        test.args = SimpleNamespace(balloon_motion="orbit", balloon_orbit_speed=1.5)
+        test.ros_iface = Mock(tracker_state=2)
+        test.capture_png = Mock()
+        test.launcher = SimpleNamespace(yaw=0, pitch=-.8)
+        positions = itertools.count(0, .3)
+
+        def sample():
+            y = next(positions)
+            test.launcher.yaw = y / 70
+            return {"target_pos": (70, y, -45), "target_vel": (0, 1.5, 0), "camera_error_deg": 1}
+
+        test.sample = sample
+        test.start_tracking()
+        evidence = test.report["phases"]["prelaunch_tracking"]
+        self.assertGreater(evidence["target_displacement_m"], .5)
+        self.assertGreater(evidence["launcher_yaw_change_deg"], .1)
+        test.ros_iface.publish_trigger.assert_called_once_with("ON")
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", side_effect=itertools.count(1))
+    def test_dynamic_readiness_rejects_stationary_target_even_if_tracker_locked(self, _clock, _sleep):
+        test = self.make_mission()
+        test.args = SimpleNamespace(balloon_motion="orbit", balloon_orbit_speed=1.5)
+        test.ros_iface = Mock(tracker_state=2)
+        test.capture_png = Mock()
+        test.sample = Mock(return_value={
+            "target_pos": (70, 0, -45), "target_vel": (0, 0, 0), "camera_error_deg": 0})
+        with self.assertRaisesRegex(RuntimeError, "tracking/aim readiness failed"):
+            test.start_tracking()
+        self.assertNotIn("prelaunch_tracking", test.report["phases"])
 
     def test_visibility_conversion_preserves_wgs84_local_frame(self):
         origin = SimpleNamespace(latitude=47.641468, longitude=-122.140165, altitude=122)

@@ -532,6 +532,76 @@ TEST_F(FlightPlanRescueTest, HeadingGateTimesOutToAbort)
     EXPECT_EQ(flightPlanNavGetAbortReason(), FP_ABORT_HEADING);
 }
 
+// --- One-key rescue hover gate: hover first, then return ---
+
+TEST_F(FlightPlanRescueTest, HoverGateHoldsUntilBrakeSettles)
+{
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+    ASSERT_EQ(flightPlanNavGetCurrentIndex(), 0);
+    const int callsAtWp0 = g_setTargetCalls;
+
+    // Climb-hold reached while still carrying engage-time speed (17 m/s):
+    // no handover to the return leg - hold and let the brake settle.
+    g_stubEstimate.velocity.x = 1700.0f; // cm/s
+    triggerReached();
+
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_HOLDING);
+    EXPECT_EQ(flightPlanNavGetCurrentIndex(), 0);
+    EXPECT_EQ(g_setTargetCalls, callsAtWp0); // nav target unchanged
+
+    // Still fast: the hold continues.
+    g_stubMicros += 250'000;
+    g_stubEstimate.velocity.x = 900.0f;
+    flightPlanNavUpdate(g_stubMicros);
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_HOLDING);
+    EXPECT_EQ(flightPlanNavGetCurrentIndex(), 0);
+
+    // Settled below the gate: the return leg starts.
+    g_stubMicros += 250'000;
+    g_stubEstimate.velocity.x = 100.0f; // 1 m/s < 1.5 m/s gate
+    flightPlanNavUpdate(g_stubMicros);
+
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_TARGETING);
+    EXPECT_EQ(flightPlanNavGetCurrentIndex(), 1);
+    ASSERT_TRUE(g_lastTarget.valid);
+    EXPECT_NEAR(g_lastTarget.targetEfM.x, 0.0f, 0.1f); // wp1: FLYOVER home
+    EXPECT_NEAR(g_lastTarget.targetEfM.y, 0.0f, 0.1f);
+}
+
+TEST_F(FlightPlanRescueTest, HoverGateTimesOutAndReturnsAnyway)
+{
+    g_stubMicros = 1'000'000;
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+
+    g_stubEstimate.velocity.x = 1700.0f;
+    triggerReached();
+    ASSERT_EQ(flightPlanNavGetState(), FP_NAV_HOLDING);
+
+    // Wind holds ground speed above the gate: after the timeout the return
+    // leg starts anyway rather than hovering forever.
+    g_stubMicros += 15'000'000; // FP_RESCUE_HOVER_TIMEOUT_US
+    flightPlanNavUpdate(g_stubMicros);
+
+    EXPECT_EQ(flightPlanNavGetCurrentIndex(), 1);
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_TARGETING);
+}
+
+TEST_F(FlightPlanRescueTest, HoverGateSkippedWhenAlreadySettled)
+{
+    ASSERT_TRUE(flightPlanNavStageRescuePlan());
+    flightPlanNavEngage();
+
+    // Rescued from a hover (the common low-speed case): arrival advances
+    // straight to the return leg, no artificial hold.
+    g_stubEstimate.velocity.x = 50.0f; // 0.5 m/s
+    triggerReached();
+
+    EXPECT_EQ(flightPlanNavGetCurrentIndex(), 1);
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_TARGETING);
+}
+
 TEST_F(FlightPlanRescueTest, DisengageDuringHeadingHoldReleasesPitch)
 {
     addWaypoint(200000, 0, 15000, WAYPOINT_TYPE_FLYOVER); // PG mission for the re-engage check

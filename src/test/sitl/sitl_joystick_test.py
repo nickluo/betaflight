@@ -191,6 +191,23 @@ class TestJoystickState(unittest.TestCase):
                          ["ARM switch -> ON", "ARM switch -> OFF",
                           "ARM switch -> ON", "ARM switch -> OFF"])
 
+    def test_arm_button_latch_toggles_per_press(self):
+        # Momentary buttons cannot hold a level; latch emulates a 2-pos switch.
+        st = self.make_state(arm_mode="latch")
+        self.feed_init(st)
+        self.assertEqual(st.channels()[6], 1000)
+        st.feed(ev(False, 0, 1))       # press: latch ON
+        st.feed(ev(False, 0, 0))       # release: stays latched ON
+        self.assertEqual(st.channels()[6], 2000)
+        st.feed(ev(False, 0, 1))       # repeated press edge only after release
+        st.feed(ev(False, 0, 0))
+        self.assertEqual(st.channels()[6], 1000)
+        st.feed(ev(False, 0, 1))       # press again: back ON
+        st.feed(ev(False, 0, 1))       # repeated high while held does not toggle
+        self.assertEqual(st.channels()[6], 2000)
+        self.assertEqual(st.drain_changes(),
+                         ["ARM switch -> ON", "ARM switch -> OFF", "ARM switch -> ON"])
+
     def test_arm_init_tracks_switch_without_using_trigger_toggle_mode(self):
         st = self.make_state(trigger_mode="toggle")
         st.feed(ev(False, 0, 1, init=True))

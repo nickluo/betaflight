@@ -20,7 +20,7 @@ joystick), but any joystick with enough axes works:
     Rz           ch4             Yaw       (left stick horizontal)
     5th axis     ch5 AUX1        6-position mode dial
     6th axis     ch6 AUX2        3-position toggle
-    button 0     ch7 AUX3        ARM switch (high = arm, low = disarm)
+    button 0     ch7 AUX3        ARM switch (high = arm, low = disarm; --arm-mode latch)
     button 1     ch8 AUX4        Trigger (held = high; --trigger-mode toggle)
 
 The 6-position dial uses the firmware's native 6-pos convention
@@ -41,7 +41,9 @@ Arming notes: this fork defaults enable_stick_arming = OFF, so the ARM
 switch (AUX3, exposed as a joystick button) is the arming path; the FC additionally requires throttle
 below mincheck (1050 us) and the mode dial outside the ALT HOLD / POS HOLD
 positions or GPS RESCUE when arming. GPS Rescue requires a valid GPS/home
-position and requests return-home/landing when engaged in flight.
+position and requests return-home/landing when engaged in flight. Joystick
+buttons are momentary, so sustained arming needs `--arm-mode latch` (each
+press toggles the ARM level, emulating a physical 2-position switch).
 
 Usage:
     python3 sitl_joystick.py --probe                 # inspect the device
@@ -196,10 +198,18 @@ class JoystickState:
             was = bool(self.button_values.get(number, 0))
             self.button_values[number] = 1 if pressed else 0
             if number == self.mapping["arm"]:
-                self.armed = pressed
-                if pressed != was:
-                    self.changes.append(
-                        "ARM switch -> {}".format("ON" if pressed else "OFF"))
+                # Buttons are momentary; latch mode emulates a 2-pos switch so a
+                # press-and-release leaves the ARM level high until toggled back.
+                if self.mapping.get("arm_mode", "hold") == "latch":
+                    if pressed and not was:
+                        self.armed = not self.armed
+                        self.changes.append(
+                            "ARM switch -> {}".format("ON" if self.armed else "OFF"))
+                else:
+                    self.armed = pressed
+                    if pressed != was:
+                        self.changes.append(
+                            "ARM switch -> {}".format("ON" if pressed else "OFF"))
             elif pressed and not was:
                 if number == self.mapping["trigger"]:
                     if self.mapping.get("trigger_mode", "hold") == "toggle":
@@ -292,7 +302,7 @@ def open_joystick(path):
 
 
 def default_mapping(info, overrides=None, invert=(), arm_button=0,
-                    trigger_button=1, trigger_mode="hold"):
+                    trigger_button=1, trigger_mode="hold", arm_mode="hold"):
     """Pick axis/button indices for each role from the device layout.
 
     Sticks are matched by JSIOCGAXMAP name first (Rx/Ry/Rz/Throttle, which
@@ -340,6 +350,7 @@ def default_mapping(info, overrides=None, invert=(), arm_button=0,
     picked["arm"] = arm_button
     picked["trigger"] = trigger_button
     picked["trigger_mode"] = trigger_mode
+    picked["arm_mode"] = arm_mode
     return picked
 
 
@@ -393,7 +404,8 @@ def print_mapping(info, mapping):
         idx = mapping[role]
         nm = axmap.get(idx) or "?"
         print("  {:<12} <- axis {} (kernel name {}) -> {}".format(label, idx, nm, ch))
-    print("  {:<12} <- button {} -> ch7/AUX3 (switch level)".format("ARM", mapping["arm"]))
+    print("  {:<12} <- button {} -> ch7/AUX3 ({})".format(
+        "ARM", mapping["arm"], mapping.get("arm_mode", "hold")))
     print("  {:<12} <- button {} -> ch8/AUX4 ({})".format(
         "Trigger", mapping["trigger"], mapping.get("trigger_mode", "hold")))
     if mapping.get("invert"):
@@ -404,7 +416,8 @@ def run_probe(args):
     fd, info = open_joystick(args.device)
     try:
         mapping = default_mapping(info, build_overrides(args), args.invert,
-                                  args.arm_button, args.trigger_button, args.trigger_mode)
+                                  args.arm_button, args.trigger_button,
+                                  args.trigger_mode, args.arm_mode)
         print_mapping(info, mapping)
         state = JoystickState(mapping)
         print("\nlive raw values for {} s (wiggle sticks to verify directions):".format(args.seconds))
@@ -436,7 +449,8 @@ def run_bridge(args):
     fd, info = open_joystick(args.device)
     try:
         mapping = default_mapping(info, build_overrides(args), args.invert,
-                                  args.arm_button, args.trigger_button, args.trigger_mode)
+                                  args.arm_button, args.trigger_button,
+                                  args.trigger_mode, args.arm_mode)
         print_mapping(info, mapping)
         state = JoystickState(mapping)
         sender = RcSender(state.channels, (args.host, args.port), args.rate)
@@ -481,6 +495,12 @@ def build_overrides(args):
 
 
 def main(argv=None):
+    # When a supervisor (e.g. airsim_intercept_mission.py) redirects stdout to
+    # a log file, Python block-buffers it and readiness markers like the
+    # "streaming" line would sit in the buffer forever - line-buffer instead.
+    # (io.StringIO redirections in tests have no reconfigure; skip them.)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--device", default="/dev/input/js0", help="joystick device")
     p.add_argument("--host", default="127.0.0.1", help="SITL RC destination host")
@@ -500,6 +520,8 @@ def main(argv=None):
     p.add_argument("--switch-index", type=int, help="override 3-pos toggle axis index")
     p.add_argument("--invert", default="", help="comma list of roles to invert")
     p.add_argument("--arm-button", type=int, default=0, help="ARM button index")
+    p.add_argument("--arm-mode", choices=["hold", "latch"], default="hold",
+                   help="ARM button behaviour: level while held, or toggle per press")
     p.add_argument("--trigger-button", type=int, default=1, help="Trigger button index")
     p.add_argument("--trigger-mode", choices=["hold", "toggle"], default="hold",
                    help="Trigger button behaviour")

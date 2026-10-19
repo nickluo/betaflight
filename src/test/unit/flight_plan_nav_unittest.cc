@@ -1233,6 +1233,54 @@ TEST_F(FlightPlanNavSafetyTest, MovingAwayPastMarginAbortsAsFlyaway)
     EXPECT_EQ(flightPlanNavGetAbortReason(), FP_ABORT_FLYAWAY);
 }
 
+TEST_F(FlightPlanNavSafetyTest, HighSpeedEngageToleratesStoppingDistance)
+{
+    engageDistantLeg();
+
+    // A plan engaged mid-course at 17 m/s heading away from its target: braking
+    // room 17^2/(2*3) ~= 48 m on top of the 100 m base margin, so 130 m of
+    // opening while decelerating is navigation, not a flyaway (one-key rescue).
+    g_stubEstimate.velocity.v[ENU_N] = -1700.0f; // cm/s, away from the target
+    g_stubMicros += 500'000;
+    g_stubEstimate.position.v[ENU_N] = -130.0f * 100.0f; // cm
+    flightPlanNavUpdate(g_stubMicros);
+
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_TARGETING);
+
+    // The brake completed and the craft turned back: progress resets both the
+    // best distance and the peak-speed latch, so the allowance does not stick.
+    g_stubMicros += 500'000;
+    g_stubEstimate.velocity.v[ENU_N] = 100.0f; // 1 m/s, closing again
+    g_stubEstimate.position.v[ENU_N] = -50.0f * 100.0f; // cm
+    flightPlanNavUpdate(g_stubMicros);
+
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_TARGETING);
+
+    // From the reset best, a low-speed drift past the plain base margin
+    // (no speed allowance anymore) still aborts as a flyaway.
+    g_stubMicros += 500'000;
+    g_stubEstimate.position.v[ENU_N] = -160.0f * 100.0f; // 110 m past the new best
+    flightPlanNavUpdate(g_stubMicros);
+
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_ABORTED);
+    EXPECT_EQ(flightPlanNavGetAbortReason(), FP_ABORT_FLYAWAY);
+}
+
+TEST_F(FlightPlanNavSafetyTest, HighSpeedFlyawayStillAbortsPastStoppingMargin)
+{
+    engageDistantLeg();
+
+    // Speed held high while opening range: past base + stopping distance the
+    // guard still fires - the allowance covers braking, not unbounded flight.
+    g_stubEstimate.velocity.v[ENU_N] = -1700.0f;
+    g_stubMicros += 500'000;
+    g_stubEstimate.position.v[ENU_N] = -180.0f * 100.0f; // 180 m > 100 + 48
+    flightPlanNavUpdate(g_stubMicros);
+
+    EXPECT_EQ(flightPlanNavGetState(), FP_NAV_ABORTED);
+    EXPECT_EQ(flightPlanNavGetAbortReason(), FP_ABORT_FLYAWAY);
+}
+
 TEST_F(FlightPlanNavSafetyTest, HeadingFaultParksWingsLevel)
 {
     engageDistantLeg();

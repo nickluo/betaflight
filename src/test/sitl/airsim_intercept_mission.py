@@ -14,6 +14,18 @@ Orchestrates the full engagement against a running Cosys-AirSim environment:
   8. one-key RTH: mode dial sixth detent -> GPS Rescue home + land + disarm
      (the disarm edge auto-publishes tracker_trigger OFF)
 
+Interactive mode (--interactive) hands the phase-5..8 pilot decisions to a
+human on a physical radio bridged by sitl_joystick.py: ch7/AUX3 arms (props
+spin up), a >=0.5 s ch8/AUX4 pulse starts MISSION once vision is locked (a
+second pulse stops it - the bridge's native RC trigger path owns start/stop
+and links MISSION entry/exit to OFFBOARD on the FC), and turning the ch5/AUX1
+6-pos dial to its sixth detent requests GPS-Rescue RTH at any moment (the
+firmware strips host authority the instant that switch is active).  The
+script still provisions everything, launches the joystick bridge (unless one
+is already streaming on UDP 9004), verifies the arm-edge tracker ON trigger,
+restarts the tracker after a stop pulse and supervises every engaged mission
+with the same safety watchdogs as the automated run.
+
 Run under the ROS 2 environment (see airsim_control_test.py for the SITL
 mechanics this builds on):
 
@@ -21,6 +33,9 @@ mechanics this builds on):
     source <fpv_ws>/install/setup.bash
     /usr/bin/python3 airsim_intercept_mission.py --binary <SITL.elf> \
         --balloon-script airsim_balloon_target.py
+
+    /usr/bin/python3 airsim_intercept_mission.py --binary <SITL.elf> \
+        --interactive --joystick-device /dev/input/js0
 """
 
 import argparse
@@ -63,6 +78,7 @@ from geometry_msgs.msg import TwistStamped  # noqa: E402
 from sensor_msgs.msg import Imu  # noqa: E402
 from std_msgs.msg import Bool, Header, Int8  # noqa: E402
 from vision_msgs.msg import Detection2D  # noqa: E402
+from mavros_msgs.msg import RCIn  # noqa: E402
 
 VEHICLE = "Copter"
 TARGET = "TargetDrone"
@@ -71,6 +87,22 @@ TRACK_LOCK_WAIT = 45.0
 MISSION_WAIT = 100.0
 RTH_WAIT = 240.0
 HIT_DISTANCE = 1.0  # m, common-world ground-truth intercept threshold
+
+# RC switch thresholds on the bridge-mirrored channels (us): above the lower
+# bound of every aux band used here; the dial's GPS-Rescue detent is 2000.
+RC_SWITCH_HIGH_US = 1700
+RC_DIAL_RTH_US = 1900
+
+INTERACTIVE_CONTROLS = (
+    "interactive mode - pilot controls via sitl_joystick.py:",
+    "  ch7 AUX3  ARM switch      high = arm / props up (momentary button: pass",
+    "                            --joystick-args \"--arm-mode latch\" to toggle per press)",
+    "  ch8 AUX4  trigger button  hold >=0.5 s: start MISSION when vision locks /",
+    "                            stop a running MISSION (tracker auto-restarts)",
+    "  ch5 AUX1  6-pos dial      detent 6 = one-key GPS-Rescue RTH, anytime",
+    "  sticks                    manual flight while no MISSION is engaged",
+    "  OFFBOARD engages at MISSION and releases when it ends (bridge linkage)",
+)
 
 
 def apply_interceptor_profile(params, args):
@@ -84,6 +116,20 @@ def apply_interceptor_profile(params, args):
     params["physics"]["v_climb"] = args.climb_speed
     params["physics"]["v_descent"] = args.climb_speed
     return params
+
+
+def apply_bridge_profile(profile, launcher_mounted):
+    """SITL bridge parameters for the mounted-launcher gimbal tuning."""
+    params = profile["custom_link_bridge"]["ros__parameters"]
+    if launcher_mounted:
+        gimbal = params["gimbal"]
+        gimbal["pitch_aim"], gimbal["pitch_max"] = -10.0, 85.0
+        gimbal["mission_on_ground"] = True
+        gimbal.update(tracking_gain=2.0, tracking_max_rate=60.0,
+                      tracking_max_accel=180.0, tracking_filter_tau=.12,
+                      tracking_rate_feedforward=0.0,
+                      max_angle_speed=120.0)
+    return profile
 
 
 SITL_CONFIG_BASE = (
@@ -139,6 +185,18 @@ def rescue_controller(modes):
 def mission_passed(phases, error):
     return (error is None and phases.get("intercept", {}).get("outcome") == "hit"
             and phases.get("rth", {}).get("outcome") == "returned")
+
+
+def interactive_passed(phases, error):
+    """Interactive session: clean end, every launched mission a hit (a pilot
+    RTH abort is a deliberate end, not a miss), RTH once used must return."""
+    if error is not None:
+        return False
+    missions = phases.get("interactive_missions", [])
+    if any(m.get("outcome") not in ("hit", "user_rth") for m in missions):
+        return False
+    rth = phases.get("rth")
+    return rth is None or rth.get("outcome") in ("returned", "not-launched-home")
 
 
 def log(message):
@@ -223,6 +281,14 @@ class RosInterface(Node):
             lambda m: (setattr(self, "gimbal_quat", (m.orientation.x, m.orientation.y,
                                                      m.orientation.z, m.orientation.w)),
                        setattr(self, "gimbal_stamp", time.monotonic())), 10)
+        # The bridge mirrors the FC's 16 RC channels (100 Hz) from the custom
+        # link medium frames; interactive mode watches the pilot's switches here.
+        self.rc_in = None
+        self.rc_in_stamp = 0.0
+        self.create_subscription(RCIn, "/mavros/rc/in",
+                                 lambda m: (setattr(self, "rc_in", list(m.channels)),
+                                            setattr(self, "rc_in_stamp", time.monotonic())),
+                                 qos_profile_sensor_data)
 
     def control_received(self, message):
         if message.armed and message.control_mode == ControlCommand.BODY_RATES:
@@ -349,6 +415,7 @@ class InterceptMission:
         self.launcher = None
         self.hard_collision = False
         self.world_ready = False
+        self.external_rc = False  # interactive: a user bridge already streams UDP 9004
 
     # ---------------------------------------------------------------- helpers
 
@@ -450,6 +517,30 @@ class InterceptMission:
             time.sleep(0.05)
         return False
 
+    def rc_channel(self, role, max_age=1.0):
+        """Live RC channel value (us) mirrored by the bridge, or None if stale."""
+        iface = self.ros_iface
+        index = joystick.RC_CHANNEL_INDICES[role]
+        if iface is None or iface.rc_in is None or len(iface.rc_in) <= index \
+                or time.monotonic() - iface.rc_in_stamp > max_age:
+            return None
+        return iface.rc_in[index]
+
+    def rth_dial_active(self):
+        """True while the pilot holds the 6-pos dial in the GPS-Rescue detent."""
+        dial = self.rc_channel("mode6")
+        return (dial or 0) >= RC_DIAL_RTH_US
+
+    def envelope_exceeded(self, state):
+        """(horizontal, height) when the flight leaves the safety envelope, else None."""
+        horizontal = math.hypot(state["pos"][0] - self.origin[0],
+                                state["pos"][1] - self.origin[1])
+        height = self.origin[2] - state["pos"][2]
+        if horizontal > 300 or height > 150 or max(abs(state["rpy"][0]),
+                                                   abs(state["rpy"][1])) > 85:
+            return horizontal, height
+        return None
+
     def ros_launch_argv(self, package, launch_file, extra=()):
         script = (f"source /opt/ros/jazzy/setup.bash && "
                   f"source {shlex.quote(str(self.args.ros_ws / 'install/setup.bash'))} && "
@@ -480,7 +571,15 @@ class InterceptMission:
             self.report["inputs"]["source_eeprom_sha256"] = hashlib.sha256(
                 self.args.eeprom.read_bytes()).hexdigest()
         control.require_free_ports()
-        control.require_quiet_rc()
+        if self.args.interactive:
+            # Adopt a user-run joystick bridge when one is already streaming;
+            # otherwise start_sitl launches sitl_joystick.py itself.
+            self.external_rc = control.rc_sender_active()
+            log("interactive: adopting the RC sender already streaming on UDP 9004"
+                if self.external_rc else
+                f"interactive: joystick bridge will start on {self.args.joystick_device}")
+        else:
+            control.require_quiet_rc()
         self.client = connect_airsim(self.args.host, self.args.rpc_port, self.args.rpc_wait)
         self.client.confirmConnection()
         self.client.cancelLastTask(vehicle_name=TARGET)
@@ -600,9 +699,32 @@ class InterceptMission:
         self.msp = control.MspClient(sock)
         self.box_ids = list(self.msp_request(119))
         self.verify_rate_profile()
-        self.rc = control.RcStream("127.0.0.1")
-        self.rc.thread.start()
+        if self.args.interactive:
+            self.rc = None  # the pilot's joystick owns the RC link
+            self.start_joystick_bridge()
+        else:
+            self.rc = control.RcStream("127.0.0.1")
+            self.rc.thread.start()
         log("SITL up (MSP 5761), RC streaming on UDP 9004")
+
+    def start_joystick_bridge(self):
+        """Interactive RC: launch sitl_joystick.py unless the user runs one."""
+        if self.external_rc:
+            log("interactive: using the RC sender already streaming on UDP 9004")
+            return
+        argv = [sys.executable,
+                str(Path(__file__).resolve().parent / "sitl_joystick.py"),
+                "--device", self.args.joystick_device,
+                # momentary buttons cannot hold the ARM level; latch emulates a
+                # 2-pos switch (explicit --joystick-args after this still win)
+                # "--arm-mode", "latch",
+                *shlex.split(self.args.joystick_args)]
+        bridge = ManagedProcess("joystick", argv, log_path=self.workdir / "joystick.log")
+        bridge.start()
+        self.processes.append(bridge)
+        bridge.wait_for_log("streaming", 10)
+        log(f"joystick bridge streaming from {self.args.joystick_device} "
+            f"(device mapping in joystick.log)")
 
     def verify_rate_profile(self):
         actual = list(self.msp_request(112)[:9])  # MSP_PID: roll/pitch/yaw P,I,D.
@@ -625,13 +747,7 @@ class InterceptMission:
         bridge_args = [] if self.args.pitch_aim is None else [f"pitch_aim:={self.args.pitch_aim}"]
         if self.launcher is not None:
             profile = yaml.safe_load(bridge_parameters.read_text())
-            gimbal = profile["custom_link_bridge"]["ros__parameters"]["gimbal"]
-            gimbal["pitch_aim"], gimbal["pitch_max"] = -10.0, 85.0
-            gimbal["mission_on_ground"] = True
-            gimbal.update(tracking_gain=2.0, tracking_max_rate=60.0,
-                          tracking_max_accel=180.0, tracking_filter_tau=.12,
-                          tracking_rate_feedforward=0.0,
-                          max_angle_speed=120.0)
+            apply_bridge_profile(profile, True)
             bridge_parameters = self.workdir / "bridge_parameters.yaml"
             bridge_parameters.write_text(yaml.safe_dump(profile))
             bridge_args.append(f"parameters:={bridge_parameters}")
@@ -1113,7 +1229,10 @@ class InterceptMission:
             f"tracker={self.ros_iface.tracker_state}")
         self.airborne_timestamp = self.client.getMultirotorState(vehicle_name=VEHICLE).timestamp
 
-    def run_intercept(self):
+    def run_intercept(self, abort=None, publish_mission=True):
+        """Fly one engagement; `abort` (interactive RTH dial) ends it early.
+        publish_mission=False supervises a MISSION another party already
+        published (interactive: the bridge's RC trigger pulse)."""
         self.stage = "mission"
         self.min_distance = None
         # Hold the hover while the vision lock re-establishes (spin-up shake
@@ -1127,7 +1246,8 @@ class InterceptMission:
             raise RuntimeError(f"vision lock did not recover at handover "
                                f"(tracker_state={self.ros_iface.tracker_state})")
         control_before_launch = self.ros_iface.control_sequence
-        self.ros_iface.publish_trigger("MISSION")
+        if publish_mission:
+            self.ros_iface.publish_trigger("MISSION")
         start = time.monotonic()
         airborne_deadline = start + 20
         result = {"took_off": False, "terminated_by_node": False}
@@ -1142,6 +1262,13 @@ class InterceptMission:
         launch_timestamp = self.client.getMultirotorState(vehicle_name=VEHICLE).timestamp
         while time.monotonic() - start < MISSION_WAIT:
             state = self.sample()
+            if abort is not None and abort():
+                result["outcome"] = "user_rth"
+                result["closest_distance_m"] = self.min_distance
+                result["duration_s"] = time.monotonic() - start
+                log(f"pilot RTH requested mid-mission at min distance "
+                    f"{self.min_distance:.2f} m; handing over to GPS Rescue")
+                return result
             if "target_vel" in state:
                 result["target_peak_speed_m_s"] = max(
                     result.get("target_peak_speed_m_s", 0), math.hypot(*state["target_vel"]))
@@ -1179,7 +1306,10 @@ class InterceptMission:
                 self.report["phases"]["collision"] = {
                     "object": collision.object_name, "time_s": elapsed, "position": state["pos"]}
                 self.ros_iface.publish_trigger("OFF")
-                self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, switch3=joystick.RC_MIN_US)
+                if self.rc is not None:
+                    self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, switch3=joystick.RC_MIN_US)
+                else:
+                    log("PILOT: host control cut - disarm now (AUX3 low)")
                 self.ros_iface.publish_offboard(False)
                 raise RuntimeError(f"non-target collision with {collision.object_name}; emergency stop")
             if getattr(self.args, "launcher", False) and self.ros_iface.gimbal_quat is not None:
@@ -1253,12 +1383,10 @@ class InterceptMission:
                     log(f"airborne at t+{elapsed:.1f}s (height {height:.1f} m)")
                 elif time.monotonic() > airborne_deadline:
                     raise RuntimeError("interceptor never took off after MISSION trigger")
-            horizontal = math.hypot(state["pos"][0] - self.origin[0],
-                                    state["pos"][1] - self.origin[1])
-            if horizontal > 300 or height > 150 or max(abs(state["rpy"][0]),
-                                                       abs(state["rpy"][1])) > 85:
-                raise RuntimeError(f"safety envelope exceeded: horiz={horizontal:.0f} m "
-                                   f"height={height:.0f} m attitude={state['rpy'][:2]}")
+            envelope = self.envelope_exceeded(state)
+            if envelope:
+                raise RuntimeError(f"safety envelope exceeded: horiz={envelope[0]:.0f} m "
+                                   f"height={envelope[1]:.0f} m attitude={state['rpy'][:2]}")
             if elapsed >= next_log:
                 log(f"t+{elapsed:5.1f}s alt {height:5.1f} m dist {distance:5.1f} m "
                     f"min {self.min_distance:5.1f} m tracker={self.ros_iface.tracker_state} "
@@ -1267,18 +1395,25 @@ class InterceptMission:
             time.sleep(0.05)
         raise RuntimeError("mission timeout: intercept did not conclude")
 
-    def return_home(self):
+    def return_home(self, dial_engaged=False):
+        """One-key RTH. dial_engaged: the pilot's own mode dial already selected
+        GPS Rescue (interactive); otherwise the script drives its RC stream."""
         self.stage = "rth"
         if self.launcher is not None and not self.launcher.released and self.launcher.pivot is not None:
-            self.rc.set(arm=joystick.RC_MIN_US, throttle=1000)
+            if self.rc is not None:
+                self.rc.set(arm=joystick.RC_MIN_US, throttle=1000)
+            else:
+                log("launcher never released; disarm via the AUX3 switch when done")
             self.report["phases"]["rth"] = {"outcome": "not-launched-home"}
             return
         self.ros_iface.publish_trigger("OFF")
-        self.rc.set(roll=1500, pitch=1500, yaw=1500, switch3=joystick.RC_MIN_US)
-        self.rc.set_mode("GPSRESCUE")
+        if not dial_engaged and self.rc is not None:
+            self.rc.set(roll=1500, pitch=1500, yaw=1500, switch3=joystick.RC_MIN_US)
+            self.rc.set_mode("GPSRESCUE")
         time.sleep(0.2)
         self.ros_iface.publish_offboard(False)
-        log("one-key RTH engaged (mode dial sixth detent, OFFBOARD released)")
+        log("one-key RTH engaged ({}OFFBOARD released)".format(
+            "pilot dial sixth detent, " if dial_engaged else "mode dial sixth detent, "))
         try:
             state = self.wait("GPS Rescue controller engaged",
                               lambda s: rescue_controller(s["modes"]) is not None, timeout=20)
@@ -1349,6 +1484,141 @@ class InterceptMission:
             disarm_since = time.monotonic()
             time.sleep(0.2)
         raise RuntimeError(f"RTH did not conclude (closest home distance {closest:.1f} m)")
+
+    # ------------------------------------------------------------ interactive
+
+    def interactive_armed(self, state, since=None):
+        """Verify the pilot-switch arm path end to end (props up + bridge ON).
+
+        `since` anchors the ON-trigger wait. It must be the last sample time
+        the craft was observed DISarmed: the bridge publishes ON at the
+        physical arm edge, which can precede this loop's (much slower)
+        detection of the armed mode — anchoring at detection time would miss
+        an already-delivered ON frame."""
+        self.armed_once = True
+        arm_since = time.monotonic() if since is None else since
+        height = self.origin[2] - state["pos"][2]
+        log(f"pilot armed {'at {:.1f} m altitude'.format(height) if height > 2 else 'on the ground'} "
+            "(props spinning)")
+        if not self.wait_for_trigger("ON", arm_since, 10.0):
+            raise RuntimeError("bridge did not auto-publish /fpv/tracker_trigger ON "
+                               "on the arm edge (props spinning)")
+        log("arm edge auto-published /fpv/tracker_trigger ON (bridge)")
+        if self.launcher is None and height <= 2:
+            log("take off and hover above 2 m on sticks (ANGLE recommended), "
+                "then hold AUX4 >=0.5 s to launch MISSION")
+        else:
+            log("hold AUX4 >=0.5 s to launch MISSION")
+
+    def supervise_interactive_mission(self):
+        """A MISSION trigger frame arrived (pilot AUX4 pulse through the
+        bridge): supervise the engagement with the standard watchdogs; the
+        RTH dial aborts it mid-flight. The bridge already engaged OFFBOARD."""
+        state = self.sample()
+        height = self.origin[2] - state["pos"][2]
+        if self.launcher is None and height < 2.0:
+            log("WARNING: MISSION triggered below 2 m - ground-launch guidance "
+                "can trip the interceptor's collision detector; hover above 2 m "
+                "before triggering")
+        log("supervising MISSION (pilot AUX4 pulse; bridge engaged OFFBOARD)")
+        result = self.run_intercept(publish_mission=False, abort=self.rth_dial_active)
+        self.report["phases"].setdefault("interactive_missions", []).append(result)
+        log(f"MISSION finished: outcome={result['outcome']} "
+            f"closest={result.get('closest_distance_m')}")
+        if result["outcome"] != "user_rth":
+            # OFFBOARD already dropped at the mission_state falling edge and on
+            # any OFF pulse (bridge); re-assert for robustness. The tracker
+            # stays ON so a later pulse can re-trigger once locked again.
+            self.ros_iface.publish_offboard(False)
+
+    def interactive_return_home(self):
+        """Dial detent 6: the FC already switched to GPS Rescue (host authority
+        stripped firmware-side); release OFFBOARD and monitor it home."""
+        if self.launcher is not None and not self.launcher.released and self.launcher.pivot is not None:
+            log("RTH skipped: launcher never released (nothing airborne)")
+            self.report["phases"]["rth"] = {"outcome": "not-launched-home"}
+            return
+        log("pilot one-key RTH: dial detent 6 (GPS Rescue engaged by the FC)")
+        self.return_home(dial_engaged=True)
+
+    def interactive_mission(self):
+        """Pilot-in-the-loop session: AUX3 arming is watched on the FC status,
+        MISSION start/stop pulses arrive as tracker_trigger frames from the
+        bridge, and the AUX1 dial's sixth detent requests one-key RTH."""
+        self.stage = "interactive"
+        for line in INTERACTIVE_CONTROLS:
+            log(line)
+        self.report["phases"]["interactive"] = {
+            "controls": "AUX3 arm, AUX4 MISSION pulse, AUX1 detent-6 RTH",
+            "started_s": round(time.monotonic() - self.t0, 1)}
+        deadline = time.monotonic() + self.args.interactive_timeout
+        armed_prev = False
+        unarmed_since = time.monotonic()  # last sample observed DISarmed
+        warned_no_rc = False
+        warned_dial_blocks_arming = False
+        mission_mark = time.monotonic()   # MISSION frames older than this: seen
+        restart_mark = 0.0                # last tracker-restart OFF already handled
+        try:
+            while time.monotonic() < deadline:
+                state = self.sample()
+                sampled_at = time.monotonic()
+                rth_dial = self.rth_dial_active()
+                if self.ros_iface.rc_in is None:
+                    if not warned_no_rc:
+                        warned_no_rc = True
+                        log("no RC mirror on /mavros/rc/in yet - is the joystick "
+                            "bridge streaming UDP 9004?")
+                else:
+                    warned_no_rc = False
+                armed = 0 in state["modes"]
+                if armed and not armed_prev:
+                    self.interactive_armed(state, unarmed_since)
+                elif not armed and armed_prev:
+                    height = self.origin[2] - state["pos"][2]
+                    if height > 2.0:
+                        raise RuntimeError(f"pilot disarmed in flight at {height:.1f} m "
+                                           "(motors stopped)")
+                    log(f"pilot disarmed on the ground ({height:.1f} m); "
+                        "interactive session complete")
+                    break
+                elif rth_dial and not armed and not warned_dial_blocks_arming:
+                    warned_dial_blocks_arming = True
+                    log("dial sits on detent 6 (GPS Rescue) - move it back to "
+                        "ACRO/ANGLE before arming")
+                if armed and rth_dial:
+                    self.interactive_return_home()
+                    break
+                if armed and self.ros_iface.trigger_seen("MISSION", mission_mark):
+                    mission_mark = time.monotonic()
+                    self.supervise_interactive_mission()
+                    armed_prev = armed
+                    continue
+                triggers = self.ros_iface.triggers
+                if (armed and triggers and triggers[-1][1] == "OFF"
+                        and triggers[-1][0] > restart_mark
+                        and self.ros_iface.mission_state is not True):
+                    # A stop pulse ended the mission and switched the tracker
+                    # off; bring the vision pipeline back so the pilot can
+                    # re-trigger once it locks again.
+                    restart_mark = triggers[-1][0]
+                    log("tracker stopped while armed (stop pulse); restarting "
+                        "vision pipeline (ON)")
+                    self.ros_iface.publish_trigger("ON")
+                if not armed:
+                    unarmed_since = sampled_at
+                armed_prev = armed
+                envelope = self.envelope_exceeded(state)
+                if envelope:
+                    raise RuntimeError(f"safety envelope exceeded: "
+                                       f"horiz={envelope[0]:.0f} m "
+                                       f"height={envelope[1]:.0f} m "
+                                       f"attitude={state['rpy'][:2]}")
+                time.sleep(0.05)
+            else:
+                raise TimeoutError("interactive session timed out; "
+                                   "raise --interactive-timeout")
+        except KeyboardInterrupt:
+            log("interactive session ended by user (Ctrl-C)")
 
     def teardown(self, error=None):
         stage_reached = self.stage
@@ -1431,6 +1701,8 @@ class InterceptMission:
             if self.args.aim_only:
                 self.start_tracking(manual_trigger=True)
                 self.report["phases"]["aim_check"] = {"passed": True}
+            elif self.args.interactive:
+                self.interactive_mission()
             else:
                 self.arm_fc()
                 self.post_arm_yaw_check()
@@ -1443,20 +1715,29 @@ class InterceptMission:
             error = exc
             log(f"FAIL: {exc}")
         finally:
-            if self.armed_once and not self.hard_collision:
-                try:
-                    self.return_home()
-                except Exception as exc:
-                    log(f"RTH FAIL: {exc}")
-                    self.report["phases"]["rth"] = {"outcome": "failed", "error": str(exc)}
-                    error = error or exc
+            if self.args.interactive:
+                # The pilot owns recovery (dial detent 6); the script must not
+                # grab the RC stream it never had to attempt an automatic RTH.
+                if self.armed_once and error is not None and not self.hard_collision:
+                    log("PILOT ADVISORY: script exits after a failure with motors "
+                        "possibly spinning - take control or dial detent 6 for RTH")
+                self.report["check_type"] = "interactive"
+                self.report["passed"] = interactive_passed(self.report["phases"], error)
             else:
-                log("collision emergency stop; RTH inhibited" if self.hard_collision
-                    else "never armed; skipping RTH")
-            self.report["check_type"] = "aim-only" if self.args.aim_only else "intercept"
-            self.report["passed"] = (
-                error is None and self.report["phases"].get("aim_check", {}).get("passed", False)
-                if self.args.aim_only else mission_passed(self.report["phases"], error))
+                if self.armed_once and not self.hard_collision:
+                    try:
+                        self.return_home()
+                    except Exception as exc:
+                        log(f"RTH FAIL: {exc}")
+                        self.report["phases"]["rth"] = {"outcome": "failed", "error": str(exc)}
+                        error = error or exc
+                else:
+                    log("collision emergency stop; RTH inhibited" if self.hard_collision
+                        else "never armed; skipping RTH")
+                self.report["check_type"] = "aim-only" if self.args.aim_only else "intercept"
+                self.report["passed"] = (
+                    error is None and self.report["phases"].get("aim_check", {}).get("passed", False)
+                    if self.args.aim_only else mission_passed(self.report["phases"], error))
             self.teardown(error)
         return 0 if self.report.get("passed") else 1
 
@@ -1492,6 +1773,16 @@ def main():
                         help="use a Camera8-referenced auto-aiming virtual platform")
     parser.add_argument("--aim-only", action="store_true",
                         help="verify mounted pose, clearance and vision lock without arming or releasing")
+    parser.add_argument("--interactive", action="store_true",
+                        help="pilot-in-the-loop mode via sitl_joystick.py: AUX3 arm, "
+                             "AUX4 MISSION trigger, AUX1 dial detent 6 one-key RTH")
+    parser.add_argument("--joystick-device", default="/dev/input/js0",
+                        help="interactive mode: joystick device for the launched bridge")
+    parser.add_argument("--joystick-args", default="",
+                        help="interactive mode: extra sitl_joystick.py args as one "
+                             "quoted string (e.g. \"--invert pitch\")")
+    parser.add_argument("--interactive-timeout", type=float, default=900.0,
+                        help="interactive mode: session wall-clock cap in seconds")
     parser.add_argument("--reference-camera", default="CineCameraActor_0",
                         help="UE actor name for Camera8 (its editor label is Camera8)")
     parser.add_argument("--launcher-forward", type=float, default=8.0,
@@ -1520,6 +1811,10 @@ def main():
         if args.pitch_aim is not None and args.pitch_aim != -10.0:
             parser.error("virtual launcher uses fixed --pitch-aim=-10")
         args.pitch_aim = -10.0
+    if args.interactive and args.aim_only:
+        parser.error("--interactive and --aim-only are mutually exclusive")
+    if not math.isfinite(args.interactive_timeout) or args.interactive_timeout <= 0:
+        parser.error("--interactive-timeout must be finite and positive")
     if not 0 < args.guidance_speed <= 40 or not 0 < args.climb_speed <= 25:
         parser.error("guidance speed must be in (0,40], climb speed in (0,25]")
     if not .3 <= args.turn_cap_factor <= 1:

@@ -166,14 +166,20 @@ def require_free_ports():
             if probe.connect_ex(("127.0.0.1", port)) == 0:
                 raise RuntimeError(f"TCP {port} is occupied; stop the existing SITL explicitly")
 
-def require_quiet_rc():
+def rc_sender_active(timeout=0.3):
+    """True when some RC sender (e.g. a manual joystick bridge) is on UDP 9004."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
         probe.bind(("127.0.0.1", 9004))
-        probe.settimeout(0.3)
+        probe.settimeout(timeout)
         try:
             probe.recvfrom(64)
         except socket.timeout:
-            return
+            return False
+    return True
+
+
+def require_quiet_rc():
+    if rc_sender_active():
         raise RuntimeError("another RC sender is streaming on UDP 9004; stop the joystick bridge first")
 
 

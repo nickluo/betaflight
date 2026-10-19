@@ -70,13 +70,19 @@
 // distance-to-target by FP_PROGRESS_EPSILON_M within FP_STALL_TIMEOUT_US, and
 // the current distance may never exceed the best by the flyaway margin.
 // The margin scales with the leg (approach speed, and therefore legitimate
-// overshoot, grows with distance-to-target) between fixed bounds.
+// overshoot, grows with distance-to-target) between fixed bounds, plus the
+// stopping distance for the fastest ground speed since the last progress: a
+// plan engaged mid-course (one-key rescue at closing speed) points away from
+// its target and needs v^2/(2a) of room to turn before the range closes
+// again - that overshoot is navigation, not a flyaway. The brake accel is
+// deliberately below the nav's real deceleration so the allowance errs wide.
 // The DELAY modifier's cruise floor (0.1 m/s) still clears the stall window.
 #define FP_PROGRESS_EPSILON_M     2.0f
 #define FP_STALL_TIMEOUT_US       30000000u
 #define FP_FLYAWAY_MARGIN_MIN_M   20.0f
 #define FP_FLYAWAY_MARGIN_MAX_M   100.0f
 #define FP_FLYAWAY_LEG_FRACTION   0.25f
+#define FP_FLYAWAY_BRAKE_ACCEL_MSS 3.0f
 
 // Approach braking: caps the nav velocity target to sqrt(2*decel*distance) so
 // legs decelerate into the waypoint instead of carrying cruise speed into the
@@ -142,6 +148,13 @@
 #define FP_PATTERN_START_SPEED_MPS  1.5f
 #define FP_PATTERN_START_TIMEOUT_US 5000000u
 
+// One-key rescue hover gate: the return leg must not start until the craft has
+// settled into the leading climb-hold (same settle threshold as pattern start).
+// Wind can hold ground speed above the gate indefinitely - time out and start
+// the return anyway rather than hover forever.
+#define FP_RESCUE_HOVER_GATE_MPS   FP_PATTERN_START_SPEED_MPS
+#define FP_RESCUE_HOVER_TIMEOUT_US 15000000u
+
 #if ENABLE_RESCUE_PLAN
 // Legacy PITCH_FORWARD gives up after 15 s of heading recovery
 #define FP_RESCUE_HEADING_TIMEOUT_US 15000000u
@@ -183,6 +196,7 @@ static struct {
     bool isRescuePlan;          // the active injected plan is a failsafe rescue
     bool rescueHeadingHold;     // pitch-forward heading recovery in progress
     timeUs_t rescueHeadingStartUs;
+    bool rescueHoverPending;    // leading hold is braking to a hover before the return leg
     bool rescueDescentActive;   // altitude-only fallback descent (no executor)
 #endif
 
@@ -199,6 +213,7 @@ static struct {
     // Leg progress tracking for stall/flyaway detection
     float bestDistanceToTargetM;
     float flyawayMarginM;
+    float maxSpeedSinceProgressMps; // fastest ground speed since the last progress
     timeUs_t lastProgressUs;
 
     // Heading-fault detector integrator, and the timestamp the per-cycle dt is
@@ -443,6 +458,7 @@ static bool dispatchWaypoint(void)
     fp.state = FP_NAV_TARGETING;
     fp.holdDurationDs = effective.duration;
     fp.bestDistanceToTargetM = FLT_MAX;
+    fp.maxSpeedSinceProgressMps = 0.0f;
     fp.lastProgressUs = micros();
     fp.hdgFaultTimeS = 0.0f;
     return true;
@@ -491,21 +507,33 @@ static void navWaypointDeltaEnuM(const positionEstimate3d_t *est, vector3_t *del
 
 // Stall/flyaway sanity against a distance-to-goal. The carrot path passes the
 // distance to the waypoint (not the leading carrot, which never converges);
-// the point path passes the distance to the nav target.
-static void updateProgressTracking(float distanceM, timeUs_t currentTimeUs)
+// the point path passes the distance to the nav target. Both pass the current
+// horizontal ground speed for the stopping-distance allowance.
+static void updateProgressTracking(float distanceM, float speedMps, timeUs_t currentTimeUs)
 {
     if (fp.bestDistanceToTargetM == FLT_MAX) {
         fp.flyawayMarginM = constrainf(distanceM * FP_FLYAWAY_LEG_FRACTION,
                                        FP_FLYAWAY_MARGIN_MIN_M, FP_FLYAWAY_MARGIN_MAX_M);
     }
+    if (speedMps > fp.maxSpeedSinceProgressMps) {
+        fp.maxSpeedSinceProgressMps = speedMps;
+    }
 
     if (distanceM < fp.bestDistanceToTargetM - FP_PROGRESS_EPSILON_M) {
         fp.bestDistanceToTargetM = distanceM;
         fp.lastProgressUs = currentTimeUs;
+        fp.maxSpeedSinceProgressMps = 0.0f;
         return;
     }
 
-    if (fp.bestDistanceToTargetM != FLT_MAX && distanceM > fp.bestDistanceToTargetM + fp.flyawayMarginM) {
+    // Stopping-distance allowance: a plan engaged mid-course at speed (one-key
+    // rescue at closing speed) points away from its target, and arresting that
+    // speed legitimately opens the range by v^2/(2a) before it closes again.
+    // Latched at the fastest speed since the last progress, so a genuine
+    // flyaway still aborts once past even the widened margin.
+    const float stoppingDistanceM = sq(fp.maxSpeedSinceProgressMps) / (2.0f * FP_FLYAWAY_BRAKE_ACCEL_MSS);
+    if (fp.bestDistanceToTargetM != FLT_MAX
+        && distanceM > fp.bestDistanceToTargetM + fp.flyawayMarginM + stoppingDistanceM) {
         abortMission(FP_ABORT_FLYAWAY);
         return;
     }
@@ -515,12 +543,17 @@ static void updateProgressTracking(float distanceM, timeUs_t currentTimeUs)
     }
 }
 
+static float horizontalGroundSpeedMps(const positionEstimate3d_t *est)
+{
+    return sqrtf(sq(est->velocity.v[ENU_E]) + sq(est->velocity.v[ENU_N])) * 0.01f;
+}
+
 static void checkLegProgress(timeUs_t currentTimeUs, const positionEstimate3d_t *est)
 {
     if (!positionNavHasActiveTarget()) {
         return;
     }
-    updateProgressTracking(distanceToNavTargetM(est), currentTimeUs);
+    updateProgressTracking(distanceToNavTargetM(est), horizontalGroundSpeedMps(est), currentTimeUs);
 }
 
 static float wrapDeg180f(float deg)
@@ -646,7 +679,7 @@ static void updateLegCarrot(float dtS, timeUs_t currentTimeUs, const positionEst
 
     // Stall/flyaway sanity is measured against the waypoint, not the leading
     // carrot (which never converges to zero distance).
-    updateProgressTracking(distM, currentTimeUs);
+    updateProgressTracking(distM, horizontalGroundSpeedMps(est), currentTimeUs);
     if (fp.state != FP_NAV_TARGETING) {
         return;   // the sanity check aborted the mission
     }
@@ -679,7 +712,7 @@ static void updateLegCarrot(float dtS, timeUs_t currentTimeUs, const positionEst
     }
     const float craftAlongM = (craft.x - fp.legStartEnuM.x) * legDir.x + (craft.y - fp.legStartEnuM.y) * legDir.y;
 
-    const float horizSpeedMps = sqrtf(sq(est->velocity.v[ENU_E]) + sq(est->velocity.v[ENU_N])) * 0.01f;
+    const float horizSpeedMps = horizontalGroundSpeedMps(est);
     if (!fp.measFiltValid || dtS <= 0.0f) {
         fp.alongFiltM = craftAlongM;
         fp.speedFiltMps = horizSpeedMps;
@@ -1010,6 +1043,7 @@ bool flightPlanNavStageRescuePlan(void)
         fp.abortReason = FP_ABORT_NONE;
         fp.isRescuePlan = true;
         fp.rescueHeadingHold = false;
+        fp.rescueHoverPending = false;
         fp.stagedCount = 0;
         clearModifierState();
         dispatchWaypoint();
@@ -1234,6 +1268,17 @@ static void onWaypointReached(void *userData)
         pitchForwardOverride(true);
         return;
     }
+
+    // Hover first, then return: the leading climb-hold must not hand the plan
+    // to the return leg while the craft still carries engage-time speed. Enter
+    // the holding state; the update loop releases it once the brake settles.
+    if (fp.isRescuePlan && fp.currentIndex == 0 && activePlanCount() > 1
+        && horizontalGroundSpeedMps(positionEstimatorGetEstimate()) >= FP_RESCUE_HOVER_GATE_MPS) {
+        fp.rescueHoverPending = true;
+        fp.holdStartUs = micros();
+        fp.state = FP_NAV_HOLDING;
+        return;
+    }
 #endif
 
     // A LAND duration is a pre-descent loiter and a TAKEOFF duration a
@@ -1298,6 +1343,7 @@ void flightPlanNavInit(void)
     fp.stagedCount = 0;
     fp.isRescuePlan = false;
     fp.rescueHeadingHold = false;
+    fp.rescueHoverPending = false;
     fp.rescueDescentActive = false;
 #endif
     clearModifierState();
@@ -1346,6 +1392,7 @@ void flightPlanNavEngage(void)
 #if ENABLE_RESCUE_PLAN
     fp.isRescuePlan = false;
     fp.rescueHeadingHold = false;
+    fp.rescueHoverPending = false;
     if (fp.stagedCount > 0) {
         // A staged failsafe rescue plan replaces the PG mission entirely;
         // rescue waypoint 0 is dispatched, never PG waypoint 0.
@@ -1545,7 +1592,19 @@ void flightPlanNavUpdate(timeUs_t currentTimeUs)
         }
         const uint32_t holdUs = (uint32_t)fp.holdDurationDs * 100000u;
         const uint32_t elapsedUs = (uint32_t)(currentTimeUs - fp.holdStartUs);
-        if (elapsedUs >= holdUs) {
+        bool holdExpired = elapsedUs >= holdUs;
+#if ENABLE_RESCUE_PLAN
+        if (fp.rescueHoverPending) {
+            // Waiting for the engage-time speed to bleed off at the hold point;
+            // the timeout hands over regardless (wind, estimator noise).
+            if (horizontalGroundSpeedMps(positionEstimatorGetEstimate()) < FP_RESCUE_HOVER_GATE_MPS
+                || elapsedUs >= FP_RESCUE_HOVER_TIMEOUT_US) {
+                fp.rescueHoverPending = false;
+            }
+        }
+        holdExpired = holdExpired && !fp.rescueHoverPending;
+#endif
+        if (holdExpired) {
             const waypoint_t *wp = currentWaypoint();
             if (wp != NULL && wp->type == WAYPOINT_TYPE_LAND) {
                 startLandingAtNavTarget(currentTimeUs);

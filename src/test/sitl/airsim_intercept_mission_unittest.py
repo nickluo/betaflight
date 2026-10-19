@@ -3,6 +3,8 @@
 
 import math
 import itertools
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -263,6 +265,234 @@ class InterceptMissionTest(unittest.TestCase):
             {"intercept": {"outcome": "lost"}, "rth": {"outcome": "returned"}}, None))
         self.assertFalse(mission.mission_passed(
             {"intercept": {"outcome": "hit"}, "rth": {"outcome": "failed"}}, None))
+
+    # ------------------------------------------------------------ interactive
+
+    def make_interactive(self, samples, dials, timeout=100, **ros):
+        test = self.make_mission()
+        test.args = SimpleNamespace(interactive_timeout=timeout)
+        test.t0 = 0
+        test.origin = (0, 0, 0)
+        test.launcher = None
+        test.rc = None
+        ros.setdefault("tracker_state", 2)
+        ros.setdefault("mission_state", False)
+        ros.setdefault("rc_in", [1000] * 16)
+        ros.setdefault("triggers", [])
+        test.ros_iface = Mock(**ros)
+        test.ros_iface.trigger_seen.return_value = False
+        test.sample = Mock(side_effect=samples)
+        test.rth_dial_active = Mock(side_effect=dials)
+        test.envelope_exceeded = Mock(return_value=None)
+        return test
+
+    def test_interactive_pass_criteria(self):
+        self.assertTrue(mission.interactive_passed({}, None))
+        self.assertTrue(mission.interactive_passed(
+            {"interactive_missions": [{"outcome": "hit"}]}, None))
+        self.assertTrue(mission.interactive_passed(
+            {"interactive_missions": [{"outcome": "user_rth"}],
+             "rth": {"outcome": "returned"}}, None))
+        self.assertTrue(mission.interactive_passed(
+            {"rth": {"outcome": "not-launched-home"}}, None))
+        self.assertFalse(mission.interactive_passed(
+            {"interactive_missions": [{"outcome": "lost"}]}, None))
+        self.assertFalse(mission.interactive_passed(
+            {"interactive_missions": [{"outcome": "hit"}, {"outcome": "hit"}],
+             "rth": {"outcome": "failed"}}, None))
+        self.assertFalse(mission.interactive_passed({}, RuntimeError("session crashed")))
+
+    def test_rc_channel_reads_bridge_mirror_with_staleness(self):
+        test = self.make_mission()
+        channels = [1000] * 16
+        channels[mission.joystick.RC_CHANNEL_INDICES["mode6"]] = 1900
+        test.ros_iface = SimpleNamespace(rc_in=channels, rc_in_stamp=time.monotonic())
+        self.assertEqual(test.rc_channel("mode6"), 1900)
+        self.assertTrue(test.rth_dial_active())
+        test.ros_iface.rc_in_stamp = time.monotonic() - 5
+        self.assertIsNone(test.rc_channel("mode6"))
+        self.assertFalse(test.rth_dial_active())
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_session_flies_arm_mission_rth(self, _sleep):
+        test = self.make_interactive(
+            samples=[{"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": mode}
+                     for mode in ([], [0], [0], [0])],
+            dials=[False, False, False, True])
+        test.ros_iface.trigger_seen.side_effect = [False, True]
+        test.interactive_armed = Mock()
+        test.supervise_interactive_mission = Mock()
+        test.interactive_return_home = Mock()
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            test.interactive_mission()
+        test.interactive_armed.assert_called_once()
+        # arm-edge anchor: the time of the last DISarmed sample
+        anchor = test.interactive_armed.call_args.args[1]
+        self.assertIsInstance(anchor, (int, float))
+        test.supervise_interactive_mission.assert_called_once()
+        test.interactive_return_home.assert_called_once()
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_disarm_on_ground_ends_the_session(self, _sleep):
+        test = self.make_interactive(
+            samples=[{"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []}],
+            dials=[False, False])
+        test.interactive_armed = Mock()
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            test.interactive_mission()
+        self.assertIn("interactive", test.report["phases"])
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_disarm_aloft_fails_the_session(self, _sleep):
+        test = self.make_interactive(
+            samples=[{"pos": (0, 0, -10), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, -10), "rpy": (0, 0, 0), "modes": []}],
+            dials=[False, False])
+        test.interactive_armed = Mock()
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            with self.assertRaisesRegex(RuntimeError, "disarmed in flight at 10"):
+                test.interactive_mission()
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_session_times_out(self, _sleep):
+        test = self.make_interactive(samples=[], dials=[], timeout=5)
+        with patch.object(mission.time, "monotonic", side_effect=[10, 10, 20, 30, 40]):
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                test.interactive_mission()
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_session_ctrl_c_ends_cleanly(self, _sleep):
+        test = self.make_interactive(samples=None, dials=[])
+        test.sample = Mock(side_effect=KeyboardInterrupt)
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            test.interactive_mission()  # must not raise
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_stop_pulse_restarts_the_tracker_once(self, _sleep):
+        off_time = time.monotonic()
+        test = self.make_interactive(
+            samples=[{"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []}],
+            dials=[False, False, False, False], triggers=[(off_time, "OFF")])
+        test.interactive_armed = Mock()
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            test.interactive_mission()
+        test.ros_iface.publish_trigger.assert_called_once_with("ON")
+
+    def test_interactive_armed_requires_bridge_auto_on(self):
+        test = self.make_mission()
+        test.origin = (0, 0, 0)
+        test.launcher = None
+        test.wait_for_trigger = Mock(return_value=False)
+        with patch.object(mission.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "auto-publish /fpv/tracker_trigger ON"):
+                test.interactive_armed({"pos": (0, 0, 0)})
+        test.wait_for_trigger = Mock(return_value=True)
+        with patch.object(mission.time, "sleep"):
+            test.interactive_armed({"pos": (0, 0, 0)})
+        self.assertTrue(test.armed_once)
+
+    def test_interactive_armed_anchors_wait_before_the_detection_sample(self):
+        # The bridge publishes ON at the physical arm edge, which can precede
+        # this loop's slower detection; the anchor must be the last DISarmed
+        # sample time, not the detection time.
+        test = self.make_mission()
+        test.origin = (0, 0, 0)
+        test.launcher = None
+        test.wait_for_trigger = Mock(return_value=True)
+        with patch.object(mission.time, "sleep"):
+            test.interactive_armed({"pos": (0, 0, 0)}, since=123.0)
+        test.wait_for_trigger.assert_called_once_with("ON", 123.0, 10.0)
+        self.assertTrue(test.armed_once)
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_supervise_warns_on_ground_launch_and_releases(self, _sleep):
+        test = self.make_interactive(samples=[{"pos": (0, 0, 0), "rpy": (0, 0, 0)}],
+                                     dials=[False])
+        test.run_intercept = Mock(return_value={"outcome": "hit", "closest_distance_m": .9})
+        test.supervise_interactive_mission()
+        test.run_intercept.assert_called_once_with(
+            publish_mission=False, abort=test.rth_dial_active)
+        test.ros_iface.publish_trigger.assert_not_called()
+        test.ros_iface.publish_offboard.assert_called_once_with(False)
+        self.assertEqual(test.report["phases"]["interactive_missions"],
+                         [{"outcome": "hit", "closest_distance_m": .9}])
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_supervise_user_rth_defers_release_to_return_home(self, _sleep):
+        test = self.make_interactive(samples=[{"pos": (0, 0, -5), "rpy": (0, 0, 0)}],
+                                     dials=[False])
+        test.run_intercept = Mock(return_value={"outcome": "user_rth",
+                                                "closest_distance_m": 5})
+        test.supervise_interactive_mission()
+        test.run_intercept.assert_called_once()
+        test.ros_iface.publish_offboard.assert_not_called()
+
+    @patch.object(mission.time, "sleep")
+    def test_run_intercept_returns_user_rth_when_pilot_dials_home(self, _sleep):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": 10}])
+        result = test.run_intercept(abort=Mock(return_value=True))
+        self.assertEqual(result["outcome"], "user_rth")
+        self.assertEqual(result["closest_distance_m"], 10)
+
+    @patch.object(mission.time, "sleep")
+    def test_run_intercept_suppresses_mission_publish_for_native_trigger(self, _sleep):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": .75}])
+        result = test.run_intercept(publish_mission=False)
+        self.assertEqual(result["outcome"], "hit")
+        test.ros_iface.publish_trigger.assert_not_called()
+
+    @patch.object(mission.time, "sleep")
+    def test_return_home_with_pilot_dial_leaves_rc_stream_alone(self, _sleep):
+        test = self.prepare_return(
+            {"pos": (100.1, -30.1, -3), "vel": (0, 0, 0), "modes": []}, 200)
+        test.return_home(dial_engaged=True)
+        test.rc.set.assert_not_called()
+        test.rc.set_mode.assert_not_called()
+        self.assertEqual(test.report["phases"]["rth"]["outcome"], "returned")
+        test.ros_iface.publish_trigger.assert_called_once_with("OFF")
+        test.ros_iface.publish_offboard.assert_called_once_with(False)
+
+    def test_non_target_collision_emergency_works_without_script_rc(self):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": 10}])
+        test.rc = None
+        test.client.simGetCollisionInfo.return_value = SimpleNamespace(
+            has_collided=True, time_stamp=2, object_name="Landscape_1")
+        with self.assertRaisesRegex(RuntimeError, "non-target collision"):
+            test.run_intercept()
+        test.ros_iface.publish_offboard.assert_called_once_with(False)
+
+    def test_interactive_return_home_skips_unreleased_launcher(self):
+        test = self.make_mission()
+        test.launcher = SimpleNamespace(released=False, pivot=(0, 0, 0))
+        test.return_home = Mock()
+        test.interactive_return_home()
+        test.return_home.assert_not_called()
+        self.assertEqual(test.report["phases"]["rth"]["outcome"], "not-launched-home")
+
+    @patch.object(mission, "ManagedProcess")
+    def test_interactive_launches_joystick_bridge_with_passthrough_args(self, process_class):
+        test = self.make_mission()
+        test.args = SimpleNamespace(
+            joystick_device="/dev/input/js1", joystick_args="--invert pitch --rate 100")
+        test.workdir = Path("/tmp/not-created-by-unit-test")
+        test.external_rc = False
+        test.start_joystick_bridge()
+        argv = process_class.call_args.args[1]
+        self.assertEqual(argv[argv.index("--device") + 1], "/dev/input/js1")
+        self.assertEqual(argv[0], sys.executable)
+        self.assertIn("--invert", argv)  # shlex-split user passthrough args
+        self.assertNotIn("--arm-mode", argv)  # latch is a user choice, not forced
+        process_class.return_value.wait_for_log.assert_called_once_with("streaming", 10)
+
+    def test_interactive_adopts_an_already_streaming_rc_sender(self):
+        test = self.make_mission()
+        test.args = SimpleNamespace(joystick_device="/dev/input/js0", joystick_args="")
+        test.external_rc = True
+        test.start_joystick_bridge()  # early return: no workdir/process needed
 
     def prepare_intercept(self, samples, mission_active=True):
         test = self.make_mission()

@@ -177,7 +177,8 @@ The balloon offsets are relative to the actual grounded interceptor origin.
 Its motion script converts the common-world standoff to the target vehicle's
 spawn-local coordinates and verifies arrival. The mission aligns ground yaw,
 uses gimbal AIM, waits with ARM low until all firmware arming checks remain
-clear for 0.5 s, arms through the pilot switch, publishes tracker `ON`, and
+clear for 0.5 s, arms through the pilot switch (the bridge auto-publishes
+tracker `ON` on the arm edge, verified by the runner), and
 requires a sustained visual lock. The cloned run configuration sets
 `pwr_on_arm_grace=5`; the runner waits out boot grace rather than bypassing it. A short body-rate/thrust takeoff settles at
 4 m before the `MISSION` trigger hands control to relative IMM-UKF guidance.
@@ -214,12 +215,51 @@ distance **70.52 m**, height **45.32 m**, mission closest approach **0.882 m**
 after **39.02 s**. GPS Rescue returned, landed **0.0097 m** from the launch point,
 and auto-disarmed with confirmed ground contact after **123.16 s**.
 
+#### Interactive pilot mode
+
+`--interactive` hands the arm/mission/return decisions to a pilot on a physical
+radio: the runner still provisions everything (SITL, bridge, tracker,
+interceptor, balloon, alignment), then launches
+[sitl_joystick.py](src/test/sitl/sitl_joystick.py) itself - or adopts a bridge
+already streaming on UDP 9004 - and supervises instead of flying:
+
+```bash
+/usr/bin/python3 src/test/sitl/airsim_intercept_mission.py \
+    --binary obj/main/betaflight_SITL.elf --eeprom eeprom.bin \
+    --ros-ws ~/workspace/fpv_ws \
+    --launch-x 100 --launch-y -30 \
+    --balloon-x 0 --balloon-y 70 --balloon-z -45 \
+    --interactive --joystick-device /dev/input/js0
+```
+
+Pilot controls (the ARM button is momentary: pass
+`--joystick-args "--arm-mode latch"` to make each press toggle the switch
+level, or hold the button for level semantics):
+
+- **ch7 AUX3** - arm / disarm. The runner verifies the bridge's arm-edge
+  tracker `ON` and fails on disarm while airborne.
+- **ch8 AUX4** - hold >= 0.5 s: a locked, idle tracker state starts a MISSION
+  (the bridge's native RC-trigger path publishes it and requests FC OFFBOARD -
+  no aux toggle needed); a second pulse stops a running mission. The runner
+  restarts the tracker after a stop pulse so the mission can re-trigger.
+- **ch5 AUX1 dial detent 6** - one-key GPS-Rescue RTH at any moment, including
+  mid-mission (the firmware strips host authority the instant that switch is
+  active); the runner releases OFFBOARD and verifies the return/landing.
+- Sticks fly manually whenever no mission is engaged; hover above 2 m before
+  the first MISSION (ground-launch guidance can trip the interceptor's
+  collision detector - the runner warns below 2 m).
+
+Watchdogs (safety envelope, non-target collision cutoff, disarm-aloft) and the
+report/scoring stay those of the automated run; a session passes when every
+triggered mission hit (a pilot RTH abort is neutral) and any used RTH returned.
+
 Offline regressions, in the same sourced ROS environment:
 
 ```bash
 cd src/test/sitl
 /usr/bin/python3 -m unittest airsim_intercept_mission_unittest \
-    airsim_launcher_unittest airsim_control_test_unittest airsim_rescue_test_unittest
+    airsim_launcher_unittest airsim_control_test_unittest airsim_rescue_test_unittest \
+    sitl_joystick_test
 ```
 
 Offline regressions cover strict hit/return scoring, measured speed

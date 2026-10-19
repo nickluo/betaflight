@@ -26,8 +26,8 @@ class RescueInputsTest(unittest.TestCase):
 
     def test_low_simulation_profile_does_not_modify_pid_or_rx_loss_policy(self):
         self.assertIn("set gps_rescue_return_alt = 8", rescue.SIM_RESCUE_CONFIG)
-        self.assertIn("set gps_rescue_ground_speed = 250", rescue.SIM_RESCUE_CONFIG)
-        self.assertIn("set gps_rescue_descend_rate = 50", rescue.SIM_RESCUE_CONFIG)
+        self.assertIn("set gps_rescue_ground_speed = 300", rescue.SIM_RESCUE_CONFIG)
+        self.assertIn("set gps_rescue_landing_rate = 50", rescue.SIM_RESCUE_CONFIG)
         self.assertIn("set gps_rescue_allow_arming_without_fix = OFF", rescue.SIM_RESCUE_CONFIG)
         self.assertFalse(any("yaw =" in line or "failsafe_procedure" in line
                              for line in rescue.SIM_RESCUE_CONFIG))

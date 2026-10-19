@@ -234,6 +234,8 @@ class Telemetry:
                 rc = struct.unpack("<16H", p[14:46])
                 self.last["baro_pa"] = pa
                 self.last["rc"] = rc
+                if len(p) >= 47:
+                    self.last["rssi_pct"] = struct.unpack("<B", p[46:47])[0]
             elif msg_id == MSG_FC_SLOW:
                 ts, vbat, cur, mah, fix, sats, lat, lon, alt, spd, crs, \
                     mode_flags, status = struct.unpack("<IHihBBiiiHHIH", p[:36])
@@ -437,9 +439,10 @@ def main():
         # ---- 7. RC injection echo ----
         print("== 7. RC injection ==")
         results["rc_echo"] = wait_for(
-            "0x11 rc[5] == 1800 (OFFBOARD switch)",
+            "0x11 rc[5] == 1800 (OFFBOARD switch) and rssi 100 (fresh UDP RC)",
             lambda: (tel.last.get("rc") is not None
-                     and tel.last["rc"][5] == 1800))
+                     and tel.last["rc"][5] == 1800
+                     and tel.last.get("rssi_pct") == 100))
 
         # ---- 8. motors frame ----
         print("== 8. motors stream ==")

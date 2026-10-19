@@ -493,7 +493,12 @@ def hold_level_direct(feed, phys, settle=7.0):
         feed.control["rates"] = (math.degrees(wx), math.degrees(wy),
                                  math.degrees(wz))
         e = phys.euler_flu()
-        if abs(math.degrees(e[0])) < 2.0 and abs(math.degrees(e[1])) < 2.0:
+        # Require the residual yaw RATE to be spent as well: returning while
+        # still spinning leaves phase B knife-edge close to its divergence
+        # guard (a fixed-yaw target arrests the spin; heading returns toward
+        # the captured value, keeping it bounded).
+        if (abs(math.degrees(e[0])) < 2.0 and abs(math.degrees(e[1])) < 2.0
+                and abs(phys.gyro_bf_dps()[2]) < 5.0):
             return True
         time.sleep(0.02)
     return False
@@ -506,6 +511,9 @@ def run_attitude_hold(feed, tel, bridge, phys, target_deg, hold_s,
     ctrl = AttitudeController(k=k)
     att0 = tel.att_deg() or (0.0, 0.0, 0.0)
     yaw0 = math.radians(att0[2]) + math.pi / 2
+    # Divergence-guard reference in the SAME frame as the physics samples
+    # (0x10 telemetry yaw is ENU-referenced; phys euler is FLU absolute).
+    phys_yaw0 = math.degrees(phys.euler_flu()[2])
     roll_t, pitch_t = target_deg
     q_des = quat_from_rpy(math.radians(roll_t), math.radians(pitch_t), yaw0)
     t_end = time.monotonic() + settle + hold_s
@@ -540,8 +548,13 @@ def run_attitude_hold(feed, tel, bridge, phys, target_deg, hold_s,
                 return True, samples
         else:
             converged_t0 = None
-        # divergence guard: any axis past 60 deg means the loop blew up
-        if any(abs(v) > 60.0 for v in samples[-1]):
+        # divergence guard: roll/pitch past 60 deg means the loop blew up.
+        # Yaw is guarded as the ERROR from this hold's own reference: phase A
+        # legitimately leaves an arbitrary heading, and an absolute-angle
+        # guard would trip on it before the controller can act.
+        r_now, p_now, y_now = samples[-1]
+        yaw_err = (y_now - phys_yaw0 + 180.0) % 360.0 - 180.0
+        if abs(r_now) > 60.0 or abs(p_now) > 60.0 or abs(yaw_err) > 90.0:
             return False, samples
         time.sleep(0.02)
     return False, samples

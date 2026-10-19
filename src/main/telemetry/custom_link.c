@@ -263,6 +263,10 @@ static void customLinkInjectEnv(const clPayloadHostEnv_t *env)
 #endif
 }
 
+// Last accepted 0x23 RC injection (millis): feeds only the 0x11 link-quality
+// report; deliberately NOT the rxUdpBridgeRcFresh() arbitration input.
+static uint32_t lastHostRcMs;
+
 static void customLinkInjectRc(const clPayloadHostRc_t *rc)
 {
 #if ENABLE_RX_UDP
@@ -270,15 +274,20 @@ static void customLinkInjectRc(const clPayloadHostRc_t *rc)
     // simulator's port 9004) owns the channels while it streams, so two
     // sources cannot fight over the shared latch. After pilot takeover,
     // fallback HOST_RC must not undo it when the bridge goes quiet.
+    // NOTE: do not mark rxUdpBridgeRcFresh() from here - that freshness IS
+    // the arbitration input and would self-block subsequent 0x23 frames.
     if (rxUdpBridgeRcFresh() || controlState.apiBlocked) {
         return;
     }
     // Same entry point as the UDP RC bridge: latches the channel array and
     // marks one RC frame complete for the rx task. Copied out of the packed
-    // payload to avoid taking the address of a packed member.
+    // payload to avoid taking the address of a packed member. lastHostRcMs
+    // only feeds the 0x11 link-quality report (accepted 0x23 frames count
+    // as a live simulator RC link too).
     uint16_t channels[ARRAYLEN(rc->rc)];
     memcpy(channels, rc->rc, sizeof(channels));
     rxUpdateUdpChannels(channels, ARRAYLEN(channels));
+    lastHostRcMs = millis();
 #else
     UNUSED(rc);
 #endif
@@ -557,6 +566,14 @@ void customLinkTaskMed(timeUs_t currentTimeUs)
     for (int chan = 0; chan < 16 && chan < MAX_SUPPORTED_RC_CHANNEL_COUNT; chan++) {
         med.rc[chan] = (uint16_t)lrintf(rcData[chan]);
     }
+#if ENABLE_RX_UDP
+    // UDP 桥 RC 无真实射频：按帧新鲜度上报链路质量（新鲜=100，停流=0），
+    // feeder 停流时下游在 failsafe 触发前就能看到质量归零；被接受的 0x23
+    // 注入帧同样算活跃链路。真机走 rx 的 RSSI 源（getRssiPercent 0..100）。
+    med.rssi_pct = (rxUdpBridgeRcFresh() || millis() - lastHostRcMs < 100) ? 100 : 0;
+#else
+    med.rssi_pct = getRssiPercent();
+#endif
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_MEDIUM, &med, sizeof(med));
 
 #ifdef USE_GPS

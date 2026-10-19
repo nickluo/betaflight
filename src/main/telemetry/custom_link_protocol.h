@@ -80,7 +80,7 @@ typedef struct __attribute__((packed)) {
                                 // north, expressed as -180.00..+180.00 deg
 } clPayloadFast_t;
 
-// 0x11 - 100 Hz barometer, temperature and RC channels (46 bytes)
+// 0x11 - 100 Hz barometer, temperature, RC channels and link quality (47 bytes)
 typedef struct __attribute__((packed)) {
     uint32_t ts_us;             // FC micros() timestamp
     uint32_t baro_pa;           // absolute pressure, Pa
@@ -89,6 +89,7 @@ typedef struct __attribute__((packed)) {
                                 // sensor > IMU > ISA estimate (20 degC at sea
                                 // level, -0.6 degC per 100 m climb)
     uint16_t rc[16];            // RC channel pulse widths, us (1000-2000)
+    uint8_t rssi_pct;           // RC link quality, percent 0..100
 } clPayloadMedium_t;
 
 // 0x12 - 10 Hz power, GPS and survey status (36 bytes)

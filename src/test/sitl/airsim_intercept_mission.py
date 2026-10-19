@@ -98,7 +98,7 @@ INTERACTIVE_CONTROLS = (
     "  ch7 AUX3  ARM switch      high = arm / props up (momentary button: pass",
     "                            --joystick-args \"--arm-mode latch\" to toggle per press)",
     "  ch8 AUX4  trigger button  hold >=0.5 s: start MISSION when vision locks /",
-    "                            stop a running MISSION (tracker auto-restarts)",
+    "                            dismiss a running MISSION (vision keeps running)",
     "  ch5 AUX1  6-pos dial      detent 6 = one-key GPS-Rescue RTH, anytime",
     "  sticks                    manual flight while no MISSION is engaged",
     "  OFFBOARD engages at MISSION and releases when it ends (bridge linkage)",
@@ -189,11 +189,12 @@ def mission_passed(phases, error):
 
 def interactive_passed(phases, error):
     """Interactive session: clean end, every launched mission a hit (a pilot
-    RTH abort is a deliberate end, not a miss), RTH once used must return."""
+    RTH abort or DISMISS pulse is a deliberate end, not a miss), RTH once used
+    must return."""
     if error is not None:
         return False
     missions = phases.get("interactive_missions", [])
-    if any(m.get("outcome") not in ("hit", "user_rth") for m in missions):
+    if any(m.get("outcome") not in ("hit", "user_rth", "dismissed") for m in missions):
         return False
     rth = phases.get("rth")
     return rth is None or rth.get("outcome") in ("returned", "not-launched-home")
@@ -596,21 +597,24 @@ class InterceptMission:
         # Approach the launch surface from above; its height differs between
         # editor Play and standalone game origins.
         if self.args.launcher:
-            settings = json.loads(self.client.getSettingsString())
-            if "LauncherOverview" not in settings.get("Vehicles", {}).get(VEHICLE, {}).get("Cameras", {}):
-                raise RuntimeError("LauncherOverview camera is not configured; apply airsim_settings.json and restart UE")
             self.launcher = AirsimLauncher(self.client, self.args.host, self.args.rpc_port,
                                            self.args.reference_camera, self.args.launcher_forward)
-            overview = airsim.Pose(airsim.Vector3r(),
-                                   quaternion_rpy(0, math.radians(10), self.launcher.heading))
-            self.client.simSetCameraPose("LauncherOverview", overview, vehicle_name=VEHICLE)
-            measured = self.client.simGetCameraInfo("LauncherOverview", vehicle_name=VEHICLE).pose.position
-            anchor = self.launcher.anchor.position
-            o = self.launcher.spawn_offset
-            overview.position = airsim.Vector3r(anchor.x_val-measured.x_val-o[0],
-                                                anchor.y_val-measured.y_val-o[1],
-                                                anchor.z_val-measured.z_val-o[2])
-            self.client.simSetCameraPose("LauncherOverview", overview, vehicle_name=VEHICLE)
+            if self.args.launcher_overview:
+                # Debug-only overhead view of the launcher; off by default for
+                # performance (settings check + two pose RPCs + a capture).
+                settings = json.loads(self.client.getSettingsString())
+                if "LauncherOverview" not in settings.get("Vehicles", {}).get(VEHICLE, {}).get("Cameras", {}):
+                    raise RuntimeError("LauncherOverview camera is not configured; apply airsim_settings.json and restart UE")
+                overview = airsim.Pose(airsim.Vector3r(),
+                                       quaternion_rpy(0, math.radians(10), self.launcher.heading))
+                self.client.simSetCameraPose("LauncherOverview", overview, vehicle_name=VEHICLE)
+                measured = self.client.simGetCameraInfo("LauncherOverview", vehicle_name=VEHICLE).pose.position
+                anchor = self.launcher.anchor.position
+                o = self.launcher.spawn_offset
+                overview.position = airsim.Vector3r(anchor.x_val-measured.x_val-o[0],
+                                                    anchor.y_val-measured.y_val-o[1],
+                                                    anchor.z_val-measured.z_val-o[2])
+                self.client.simSetCameraPose("LauncherOverview", overview, vehicle_name=VEHICLE)
             x, y = self.launcher.ground_xy
             o = self.launcher.spawn_offset
             pose.position = airsim.Vector3r(x-o[0], y-o[1],
@@ -1105,7 +1109,7 @@ class InterceptMission:
         """
         self.stage = "track"
         self.capture_png("0", "ground_camera.png")
-        if self.launcher is not None:
+        if self.launcher is not None and getattr(self.args, "launcher_overview", False):
             self.capture_png("LauncherOverview", "launcher_overview.png")
         if manual_trigger:
             self.ros_iface.publish_trigger("ON")
@@ -1370,6 +1374,10 @@ class InterceptMission:
                 result["terminated_by_node"] = True
                 outcome = ("hit" if self.min_distance <= HIT_DISTANCE
                            else "lost")
+                # A pilot DISMISS pulse cancelled the interception - deliberate
+                # end, not a capability miss (same standing as user_rth).
+                if self.ros_iface.trigger_seen("DISMISS", start):
+                    outcome = "dismissed"
                 log(f"mission terminated by interceptor: {outcome} "
                     f"(min distance {self.min_distance:.2f} m)")
                 result["outcome"] = outcome
@@ -1552,7 +1560,8 @@ class InterceptMission:
             "controls": "AUX3 arm, AUX4 MISSION pulse, AUX1 detent-6 RTH",
             "started_s": round(time.monotonic() - self.t0, 1)}
         deadline = time.monotonic() + self.args.interactive_timeout
-        armed_prev = False
+        armed_prev = None  # seeded by the first sample; pre-session arming needs a re-arm cycle
+        awaiting_rearm = False  # pre-session arming: first disarm re-arms instead of ending
         unarmed_since = time.monotonic()  # last sample observed DISarmed
         warned_no_rc = False
         warned_dial_blocks_arming = False
@@ -1571,16 +1580,28 @@ class InterceptMission:
                 else:
                     warned_no_rc = False
                 armed = 0 in state["modes"]
-                if armed and not armed_prev:
+                if armed_prev is None:
+                    armed_prev = armed
+                    if armed:
+                        awaiting_rearm = True
+                        log("craft already armed when the interactive session "
+                            "started - disarm (AUX3), then arm again so the "
+                            "arm-edge tracker ON trigger can be verified")
+                elif armed and not armed_prev:
                     self.interactive_armed(state, unarmed_since)
                 elif not armed and armed_prev:
                     height = self.origin[2] - state["pos"][2]
                     if height > 2.0:
                         raise RuntimeError(f"pilot disarmed in flight at {height:.1f} m "
                                            "(motors stopped)")
-                    log(f"pilot disarmed on the ground ({height:.1f} m); "
-                        "interactive session complete")
-                    break
+                    if awaiting_rearm:
+                        awaiting_rearm = False
+                        log("disarmed after pre-session arming - arm again "
+                            "(AUX3) to start the verified session")
+                    else:
+                        log(f"pilot disarmed on the ground ({height:.1f} m); "
+                            "interactive session complete")
+                        break
                 elif rth_dial and not armed and not warned_dial_blocks_arming:
                     warned_dial_blocks_arming = True
                     log("dial sits on detent 6 (GPS Rescue) - move it back to "
@@ -1597,11 +1618,11 @@ class InterceptMission:
                 if (armed and triggers and triggers[-1][1] == "OFF"
                         and triggers[-1][0] > restart_mark
                         and self.ros_iface.mission_state is not True):
-                    # A stop pulse ended the mission and switched the tracker
-                    # off; bring the vision pipeline back so the pilot can
-                    # re-trigger once it locks again.
+                    # A stop pulse now sends DISMISS and leaves the tracker
+                    # running; an OFF while armed is unexpected - bring the
+                    # vision pipeline back so the pilot can still re-trigger.
                     restart_mark = triggers[-1][0]
-                    log("tracker stopped while armed (stop pulse); restarting "
+                    log("tracker stopped while armed (unexpected OFF); restarting "
                         "vision pipeline (ON)")
                     self.ros_iface.publish_trigger("ON")
                 if not armed:
@@ -1787,6 +1808,9 @@ def main():
                         help="UE actor name for Camera8 (its editor label is Camera8)")
     parser.add_argument("--launcher-forward", type=float, default=8.0,
                         help="launcher distance ahead of the reference camera (m)")
+    parser.add_argument("--launcher-overview", action="store_true",
+                        help="launcher mode: frame and capture the debug LauncherOverview "
+                             "overhead camera (off by default for performance)")
     parser.add_argument("--guidance-speed", type=float, default=20.0,
                         help="interceptor desired closing speed (m/s)")
     parser.add_argument("--climb-speed", type=float, default=20.0,

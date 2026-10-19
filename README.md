@@ -240,8 +240,9 @@ level, or hold the button for level semantics):
   tracker `ON` and fails on disarm while airborne.
 - **ch8 AUX4** - hold >= 0.5 s: a locked, idle tracker state starts a MISSION
   (the bridge's native RC-trigger path publishes it and requests FC OFFBOARD -
-  no aux toggle needed); a second pulse stops a running mission. The runner
-  restarts the tracker after a stop pulse so the mission can re-trigger.
+  no aux toggle needed); a second pulse dismisses a running mission - the
+  interceptor cancels control while the tracker keeps running, so a later
+  pulse can re-trigger once still locked.
 - **ch5 AUX1 dial detent 6** - one-key GPS-Rescue RTH at any moment, including
   mid-mission (the firmware strips host authority the instant that switch is
   active); the runner releases OFFBOARD and verifies the return/landing.
@@ -282,6 +283,9 @@ reads its runtime common-world pose; it does not assume the PIE and standalone
 NED origins are the same. Apply the tracker package's `airsim_settings.json`
 to the simulator settings and restart the rebuilt UE plugin first. It adds
 the `LauncherOverview` camera and three real geometry-query range sensors.
+The `LauncherOverview` overhead view is debug-only and **off by default** for
+performance (settings check, pose RPCs and a PNG capture per run); pass
+`--launcher-overview` to frame and capture it into `launcher_overview.png`.
 
 ```bash
 source /opt/ros/jazzy/setup.bash

@@ -294,6 +294,8 @@ class InterceptMissionTest(unittest.TestCase):
             {"interactive_missions": [{"outcome": "user_rth"}],
              "rth": {"outcome": "returned"}}, None))
         self.assertTrue(mission.interactive_passed(
+            {"interactive_missions": [{"outcome": "dismissed"}]}, None))
+        self.assertTrue(mission.interactive_passed(
             {"rth": {"outcome": "not-launched-home"}}, None))
         self.assertFalse(mission.interactive_passed(
             {"interactive_missions": [{"outcome": "lost"}]}, None))
@@ -335,9 +337,10 @@ class InterceptMissionTest(unittest.TestCase):
     @patch.object(mission.time, "sleep")
     def test_interactive_disarm_on_ground_ends_the_session(self, _sleep):
         test = self.make_interactive(
-            samples=[{"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": [0]},
+            samples=[{"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []},
+                     {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": [0]},
                      {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []}],
-            dials=[False, False])
+            dials=[False, False, False])
         test.interactive_armed = Mock()
         with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
             test.interactive_mission()
@@ -353,6 +356,22 @@ class InterceptMissionTest(unittest.TestCase):
         with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
             with self.assertRaisesRegex(RuntimeError, "disarmed in flight at 10"):
                 test.interactive_mission()
+
+    @patch.object(mission.time, "sleep")
+    def test_interactive_pre_session_arming_requires_a_rearm_cycle(self, _sleep):
+        # Armed during setup (e.g. while the balloon flies out): the arm-edge
+        # ON predates the loop and cannot be verified - only a disarm->arm
+        # cycle inside the session runs the verification.
+        test = self.make_interactive(
+            samples=[{"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []},
+                     {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": [0]},
+                     {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []}],
+            dials=[False, False, False, False])
+        test.interactive_armed = Mock()
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            test.interactive_mission()
+        test.interactive_armed.assert_called_once()  # the fresh edge only
 
     @patch.object(mission.time, "sleep")
     def test_interactive_session_times_out(self, _sleep):
@@ -372,11 +391,12 @@ class InterceptMissionTest(unittest.TestCase):
     def test_interactive_stop_pulse_restarts_the_tracker_once(self, _sleep):
         off_time = time.monotonic()
         test = self.make_interactive(
-            samples=[{"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
+            samples=[{"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": []},
+                     {"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
                      {"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
                      {"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": [0]},
                      {"pos": (0, 0, 0), "rpy": (0, 0, 0), "modes": []}],
-            dials=[False, False, False, False], triggers=[(off_time, "OFF")])
+            dials=[False, False, False, False, False], triggers=[(off_time, "OFF")])
         test.interactive_armed = Mock()
         with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
             test.interactive_mission()
@@ -445,6 +465,14 @@ class InterceptMissionTest(unittest.TestCase):
         self.assertEqual(result["outcome"], "hit")
         test.ros_iface.publish_trigger.assert_not_called()
 
+    def test_run_intercept_dismiss_pulse_is_not_scored_as_a_miss(self):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": 10}],
+                                      mission_active=False)
+        test.ros_iface.trigger_seen = Mock(side_effect=lambda f, since: f == "DISMISS")
+        result = test.run_intercept()
+        self.assertEqual(result["outcome"], "dismissed")
+        self.assertTrue(result["terminated_by_node"])
+
     @patch.object(mission.time, "sleep")
     def test_return_home_with_pilot_dial_leaves_rc_stream_alone(self, _sleep):
         test = self.prepare_return(
@@ -498,6 +526,7 @@ class InterceptMissionTest(unittest.TestCase):
         test = self.make_mission()
         test.origin = (0, 0, 0)
         test.ros_iface = Mock(tracker_state=2, mission_state=mission_active, control_sequence=0)
+        test.ros_iface.trigger_seen.return_value = False
         test.rc = Mock()
         test.client = Mock()
         test.client.getMultirotorState.return_value = SimpleNamespace(timestamp=1)

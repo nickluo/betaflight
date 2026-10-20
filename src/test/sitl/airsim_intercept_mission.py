@@ -60,6 +60,7 @@ from msgpackrpc.error import TimeoutError as RpcTimeoutError, TransportError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import airsim_control_test as control  # noqa: E402  (MspClient, RcStream, provision, ...)
 import sitl_joystick as joystick  # noqa: E402
+from airsim_rescue_profile import SIM_RESCUE_CONFIG, ReturnFlightMetrics  # noqa: E402
 from airsim_launcher import AirsimLauncher, quaternion_rpy, rotate  # noqa: E402
 from airsim_balloon_target import park_target, validate_motion  # noqa: E402
 
@@ -157,17 +158,7 @@ SITL_CONFIG_BASE = (
     "set custom_link_motors_stream = ON",
     "set airmode_start_throttle_percent = 15",
     "set mag_declination = 20",
-    "set gps_rescue_min_start_dist = 15",
-    "set gps_rescue_alt_mode = FIXED_ALT",
-    "set gps_rescue_return_alt = 8",
-    "set gps_rescue_initial_climb = 3",
-    "set gps_rescue_ascend_rate = 200",
-    "set gps_rescue_descend_rate = 200",
-    "set gps_rescue_landing_rate = 50",
-    "set gps_rescue_ground_speed = 300",
-    "set gps_rescue_descent_dist = 8",
-    "set gps_rescue_min_sats = 8",
-    "set gps_rescue_allow_arming_without_fix = OFF",
+    *SIM_RESCUE_CONFIG,
     *joystick.CLI_CONFIG_LINES,
     "aux 7 56 5 1700 2100 0 0",  # flight-plan box on AUX6 (rescue plan executor)
 )
@@ -1432,6 +1423,9 @@ class InterceptMission:
                 raise RuntimeError("disarmed before RTH could engage") from None
             raise
         start = time.monotonic()
+        quality = ReturnFlightMetrics()
+        rth_report = {"quality": {}}
+        self.report["phases"]["rth"] = rth_report
         closest = None
         ground_contact = False
         ground_contact_info = None
@@ -1451,6 +1445,10 @@ class InterceptMission:
             closest = distance if closest is None else min(closest, distance)
             height = self.origin[2] - state["pos"][2]
             velocity = math.hypot(*state["vel"])
+            quality.update(time.monotonic() - start,
+                           tuple(p - o for p, o in zip(state["pos"][:2], self.origin[:2])),
+                           state["vel"], state["rpy"])
+            rth_report["quality"] = quality.summary()
             collision = self.client.simGetCollisionInfo(vehicle_name=VEHICLE)
             contact_at_home = (
                 self.airborne_timestamp is not None
@@ -1485,6 +1483,7 @@ class InterceptMission:
                         "auto_disarmed": True, "ground_contact": True,
                         "ground_contact_info": ground_contact_info,
                         "disarm_trigger_off": True,
+                        "quality": quality.summary(),
                         "duration_s": time.monotonic() - start}
                     return
                 raise RuntimeError(f"disarmed before home landing: home={distance:.1f} m "

@@ -19,24 +19,7 @@ import time
 import airsim_control_test as control
 from airsim_offboard_test import touchdown_confirmed
 import sitl_joystick as joystick
-
-
-SIM_RESCUE_CONFIG = (
-    "feature GPS",
-    "set gps_provider = VIRTUAL",
-    "set trust_mag = ON",
-    "set gps_rescue_min_start_dist = 15",
-    "set gps_rescue_alt_mode = FIXED_ALT",
-    "set gps_rescue_return_alt = 8",
-    "set gps_rescue_initial_climb = 3",
-    "set gps_rescue_ascend_rate = 200",
-    "set gps_rescue_descend_rate = 200",
-    "set gps_rescue_ground_speed = 300",
-    "set gps_rescue_landing_rate = 50",
-    "set gps_rescue_descent_dist = 8",
-    "set gps_rescue_min_sats = 8",
-    "set gps_rescue_allow_arming_without_fix = OFF",
-)
+from airsim_rescue_profile import SIM_RESCUE_CONFIG, ReturnFlightMetrics
 
 
 def distance_home(state, origin):
@@ -94,6 +77,8 @@ def complete_rescue(test, origin, departure, airborne_timestamp):
     implementation = rescue_controller(state["modes"])
     start = time.monotonic()
     deadline = start + 160
+    quality = ReturnFlightMetrics()
+    test.rescue_metrics = quality
     peak_height = 0.0
     closest = distance_home(state, origin)
     ground_contact = False
@@ -104,6 +89,9 @@ def complete_rescue(test, origin, departure, airborne_timestamp):
         if 58 in state["modes"]:
             raise AssertionError("old API command recaptured OFFBOARD during GPS Rescue")
         distance = distance_home(state, origin)
+        quality.update(time.monotonic() - start,
+                       tuple(p - o for p, o in zip(state["position"][:2], origin[:2])),
+                       state["velocity"], state["rpy"])
         closest = min(closest, distance)
         peak_height = max(peak_height, origin[2] - state["position"][2])
         controller_seen = controller_seen or bool(rescue_controller(state["modes"]))
@@ -128,12 +116,15 @@ def complete_rescue(test, origin, departure, airborne_timestamp):
     test.rc.set_mode("ACRO")
     test.wait("ARM low and leaving Rescue restore arming readiness",
               lambda s: s["arming_flags"] == 0, timeout=8, dwell=0.5)
+    quality.require_stable_cruise()
     control.log(f"PASS: one-switch Rescue landed {distance:.2f} m from home and auto-disarmed")
+    control.log(f"PASS: stable Rescue cruise: {quality.summary()}")
     return {"controller": implementation, "departure_distance_m": distance_home(departure, origin),
             "engage_latency_s": engage_latency,
             "closest_home_m": closest, "touchdown_distance_m": distance,
             "peak_height_m": peak_height, "return_duration_s": time.monotonic() - start,
-            "ground_contact": ground_contact, "auto_disarmed": True}
+            "ground_contact": ground_contact, "auto_disarmed": True,
+            "quality": quality.summary()}
 
 
 def main():
@@ -187,6 +178,8 @@ def main():
         client.client.close()
         if test is not None:
             report["last_state"] = test.last_sample
+            if hasattr(test, "rescue_metrics"):
+                report["return_quality"] = test.rescue_metrics.summary()
         report["source_eeprom_unchanged"] = hashlib.sha256(source.read_bytes()).hexdigest() == original_digest
         if not report["source_eeprom_unchanged"]:
             report["passed"] = False

@@ -28,6 +28,10 @@ class InterceptMissionTest(unittest.TestCase):
             for term, gain in zip("pidf", gains):
                 self.assertIn(f"set {term}_{axis} = {gain}", mission.SITL_CONFIG_BASE)
 
+    def test_mission_and_standalone_rescue_share_simulator_profile(self):
+        for line in mission.SIM_RESCUE_CONFIG:
+            self.assertIn(line, mission.SITL_CONFIG_BASE)
+
     def test_controller_profile_is_independent_of_balloon_motion(self):
         base = dict(guidance_speed=20.0, climb_speed=20.0, turn_cap_factor=.8,
                     rate_control_attenuation=False)
@@ -625,6 +629,7 @@ class InterceptMissionTest(unittest.TestCase):
             has_collided=True, time_stamp=contact_time, normal=SimpleNamespace(z_val=-1),
             position=airsim.Vector3r(100, -30, -3), object_name="Landscape_1")
         test.wait = Mock(return_value={"modes": [0, 3, 11, 56]})
+        state.setdefault("rpy", (0, 0, 0))
         test.sample = Mock(return_value=state)
         return test
 

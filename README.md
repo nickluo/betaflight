@@ -215,6 +215,16 @@ distance **70.52 m**, height **45.32 m**, mission closest approach **0.882 m**
 after **39.02 s**. GPS Rescue returned, landed **0.0097 m** from the launch point,
 and auto-disarmed with confirmed ground contact after **123.16 s**.
 
+The AirSim Rescue checks use a simulator-only outer-loop profile to account for the
+virtual GPS latency: `ap_position_p=6`, zero velocity drag feedforward, bearing yaw,
+25 degree navigation angle limit, and `ap_nav_accel=100`. These settings are applied
+by SITL provisioning and do not change firmware defaults or rate PID gains. The
+regression records cruise speed error, speed variation, tilt, and reverse motion
+separately from the entry climb and final landing brake. A fresh real-AirSim run on
+2026-10-20 reduced cruise speed RMS error from 1.78 to 0.34 m/s, peak tilt from 40.0
+to 13.6 degrees, and eliminated observed reverse motion; Rescue still landed and
+auto-disarmed, 0.52 m from home.
+
 #### Interactive pilot mode
 
 `--interactive` hands the arm/mission/return decisions to a pilot on a physical

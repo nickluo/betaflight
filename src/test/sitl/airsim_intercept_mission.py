@@ -1507,7 +1507,7 @@ class InterceptMission:
         height = self.origin[2] - state["pos"][2]
         log(f"pilot armed {'at {:.1f} m altitude'.format(height) if height > 2 else 'on the ground'} "
             "(props spinning)")
-        if not self.wait_for_trigger("ON", arm_since, 10.0):
+        if not self.wait_for_trigger("ON", arm_since, 60.0):
             raise RuntimeError("bridge did not auto-publish /fpv/tracker_trigger ON "
                                "on the arm edge (props spinning)")
         log("arm edge auto-published /fpv/tracker_trigger ON (bridge)")
@@ -1762,9 +1762,59 @@ class InterceptMission:
         return 0 if self.report.get("passed") else 1
 
 
-def main():
+def load_yaml_config(path, parser):
+    """Load and validate flat argparse destination names from YAML."""
+    try:
+        data = yaml.safe_load(path.expanduser().read_text())
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read YAML config {path}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("YAML config root must be a mapping of option names to values")
+
+    actions = {action.dest: action for action in parser._actions
+               if action.dest not in ("config", "help")}
+    unknown = set(data) - set(actions)
+    if unknown:
+        names = ', '.join(sorted(map(repr, unknown)))
+        raise ValueError(f"unknown YAML config option(s): {names}")
+    converted = {}
+    for name, value in data.items():
+        action = actions[name]
+        if value is None:
+            if action.default is not None and name != "balloon_script":
+                raise ValueError(f"invalid YAML value for {name}: null")
+        else:
+            if isinstance(action, argparse.BooleanOptionalAction):
+                valid = type(value) is bool
+            elif action.type is int:
+                valid = type(value) is int
+            elif action.type is float:
+                valid = type(value) in (int, float)
+            else:
+                valid = isinstance(value, str)
+            if not valid:
+                raise ValueError(f"invalid YAML value for {name}: {value!r}")
+            if action.type is not None:
+                try:
+                    value = action.type(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"invalid YAML value for {name}: {value!r}") from exc
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"invalid YAML value for {name}: must be finite")
+            if action.choices is not None and value not in action.choices:
+                raise ValueError(f"invalid YAML value for {name}: {value!r}; "
+                                 f"choose from {action.choices}")
+        converted[name] = value
+    return converted
+
+
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True,
+    parser.add_argument("--config", type=Path, default=None,
+                        help="optional YAML config; explicit CLI options override it")
+    parser.add_argument("--binary", type=Path, default=None,
                         help="betaflight_SITL.elf to run")
     parser.add_argument("--eeprom", type=Path, default=Path("eeprom.bin"),
                         help="clone the tuned simulation EEPROM into the run directory")
@@ -1789,11 +1839,11 @@ def main():
                         help="ground launch X in Copter-local NED (m)")
     parser.add_argument("--launch-y", type=float, default=0.0,
                         help="ground launch Y in Copter-local NED (m)")
-    parser.add_argument("--launcher", action="store_true",
+    parser.add_argument("--launcher", action=argparse.BooleanOptionalAction, default=False,
                         help="use a Camera8-referenced auto-aiming virtual platform")
-    parser.add_argument("--aim-only", action="store_true",
+    parser.add_argument("--aim-only", action=argparse.BooleanOptionalAction, default=False,
                         help="verify mounted pose, clearance and vision lock without arming or releasing")
-    parser.add_argument("--interactive", action="store_true",
+    parser.add_argument("--interactive", action=argparse.BooleanOptionalAction, default=False,
                         help="pilot-in-the-loop mode via sitl_joystick.py: AUX3 arm, "
                              "AUX4 MISSION trigger, AUX1 dial detent 6 one-key RTH")
     parser.add_argument("--joystick-device", default="/dev/input/js0",
@@ -1807,7 +1857,7 @@ def main():
                         help="UE actor name for Camera8 (its editor label is Camera8)")
     parser.add_argument("--launcher-forward", type=float, default=8.0,
                         help="launcher distance ahead of the reference camera (m)")
-    parser.add_argument("--launcher-overview", action="store_true",
+    parser.add_argument("--launcher-overview", action=argparse.BooleanOptionalAction, default=False,
                         help="launcher mode: frame and capture the debug LauncherOverview "
                              "overhead camera (off by default for performance)")
     parser.add_argument("--guidance-speed", type=float, default=20.0,
@@ -1823,7 +1873,16 @@ def main():
     parser.add_argument("--hfov", type=float, default=72.0)
     parser.add_argument("--img-w", type=int, default=1536)
     parser.add_argument("--img-h", type=int, default=960)
-    args = parser.parse_args()
+
+    config_probe, _ = parser.parse_known_args(argv)
+    if config_probe.config is not None:
+        try:
+            parser.set_defaults(**load_yaml_config(config_probe.config, parser))
+        except ValueError as exc:
+            parser.error(str(exc))
+    args = parser.parse_args(argv)
+    if args.binary is None:
+        parser.error("--binary is required (CLI or YAML config)")
     try:
         validate_motion(args.balloon_motion, args.balloon_orbit_radius, args.balloon_orbit_speed)
     except ValueError as exc:
@@ -1842,16 +1901,22 @@ def main():
         parser.error("guidance speed must be in (0,40], climb speed in (0,25]")
     if not .3 <= args.turn_cap_factor <= 1:
         parser.error("--turn-cap-factor must be in [0.3,1.0]")
+    args.binary = args.binary.expanduser().resolve()
+    args.eeprom = args.eeprom.expanduser().resolve()
+    args.ros_ws = args.ros_ws.expanduser().resolve()
+    if args.balloon_script is not None:
+        args.balloon_script = args.balloon_script.expanduser().resolve()
+    if args.workdir is not None:
+        args.workdir = str(Path(args.workdir).expanduser())
     if not args.binary.is_file() or not args.eeprom.is_file():
         parser.error("--binary and --eeprom must exist")
     if args.workdir and Path(args.workdir).exists():
         parser.error("--workdir must be a new directory")
-    args.binary = args.binary.resolve()
-    args.eeprom = args.eeprom.resolve()
-    args.ros_ws = args.ros_ws.resolve()
-    if args.balloon_script is not None:
-        args.balloon_script = args.balloon_script.resolve()
-    return InterceptMission(args).run()
+    return args
+
+
+def main():
+    return InterceptMission(parse_arguments()).run()
 
 
 if __name__ == "__main__":

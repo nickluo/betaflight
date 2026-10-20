@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Offline mission regressions; run in the sourced ROS 2/AirSim environment."""
 
+import argparse
+import contextlib
+import io
 import math
 import itertools
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +22,157 @@ import airsim_intercept_mission as mission
 class InterceptMissionTest(unittest.TestCase):
     def make_mission(self):
         return mission.InterceptMission(SimpleNamespace())
+
+    def test_yaml_config_loads_typed_values_and_rejects_unknown_options(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--guidance-speed", dest="guidance_speed", type=float, default=20)
+        parser.add_argument("--launcher", action=argparse.BooleanOptionalAction, default=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mission.yaml"
+            path.write_text("guidance_speed: 40\nlauncher: true\n")
+            values = mission.load_yaml_config(path, parser)
+        self.assertEqual(values, {"guidance_speed": 40.0, "launcher": True})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.yaml"
+            path.write_text("unknown_option: true\n")
+            with self.assertRaisesRegex(ValueError, "unknown YAML config option"):
+                mission.load_yaml_config(path, parser)
+
+    def test_yaml_defaults_are_overridden_by_explicit_cli_values(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--guidance-speed", dest="guidance_speed", type=float, default=20)
+        parser.add_argument("--launcher", action=argparse.BooleanOptionalAction, default=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mission.yaml"
+            path.write_text("guidance_speed: 40\nlauncher: true\n")
+            parser.set_defaults(**mission.load_yaml_config(path, parser))
+        args = parser.parse_args(["--guidance-speed", "12", "--no-launcher"])
+        self.assertEqual(args.guidance_speed, 12.0)
+        self.assertFalse(args.launcher)
+
+    def parse_config(self, text, overrides=()):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            binary, eeprom = directory / "sitl.elf", directory / "eeprom.bin"
+            binary.touch()
+            eeprom.touch()
+            config = directory / "mission.yaml"
+            config.write_text(f"binary: {binary}\neeprom: {eeprom}\n{text}")
+            return mission.parse_arguments(["--config", str(config), *overrides])
+
+    def test_yaml_entrypoint_merges_all_types_and_cli_boolean_overrides(self):
+        args = self.parse_config(
+            "launcher: true\ninteractive: true\naim_only: true\nlauncher_overview: true\n"
+            "guidance_speed: 40\nballoon_motion: orbit\nballoon_orbit_radius: 10\n"
+            "balloon_orbit_speed: 5\nros_ws: ~/workspace/fpv_ws\nimg_w: 1024\n"
+            "rate_control_attenuation: true\nballoon_script: null\nworkdir: null\n"
+            "pitch_aim: null\njoystick_args: '--invert pitch'\n",
+            ["--no-launcher", "--no-interactive", "--no-launcher-overview",
+             "--no-rate-control-attenuation", "--guidance-speed", "12", "--img-w", "800"])
+        self.assertFalse(args.launcher)
+        self.assertFalse(args.interactive)
+        self.assertFalse(args.launcher_overview)
+        self.assertFalse(args.rate_control_attenuation)
+        self.assertTrue(args.aim_only)
+        self.assertEqual(args.guidance_speed, 12)
+        self.assertEqual(args.img_w, 800)
+        self.assertEqual(args.balloon_motion, "orbit")
+        self.assertEqual(args.balloon_orbit_speed, 5)
+        self.assertEqual(args.ros_ws, (Path.home() / "workspace/fpv_ws").resolve())
+        self.assertIsNone(args.balloon_script)
+        self.assertIsNone(args.workdir)
+        self.assertIsNone(args.pitch_aim)
+        self.assertEqual(args.joystick_args, "--invert pitch")
+        self.assertEqual(args.rpc_port, 41451)
+
+    def test_yaml_schema_errors_fail_without_starting_a_mission(self):
+        invalid = ["launcher: 'false'", "img_w: 2.5", "img_h: true", "host: 123",
+                   "guidance_speed: false", "guidance_speed: .nan", "rpc_wait: null",
+                   "balloon_motion: wobble", "joystick_args: []", "config: other.yaml",
+                   "help: true", "99: bad", "eeprom: null", "guidance_speed: nope"]
+        for text in invalid:
+            with self.subTest(text=text), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as error, patch.object(mission, "InterceptMission") as run:
+                self.parse_config(text)
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+
+    def test_yaml_empty_mapping_and_bad_documents(self):
+        parser = argparse.ArgumentParser()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mission.yaml"
+            for text in ("", "# empty\n", "{}"):
+                path.write_text(text)
+                self.assertEqual(mission.load_yaml_config(path, parser), {})
+            for text in ("- not-a-mapping", "hello", "value: [unterminated"):
+                path.write_text(text)
+                with self.subTest(text=text), self.assertRaises(ValueError):
+                    mission.load_yaml_config(path, parser)
+            with self.assertRaisesRegex(ValueError, "cannot read YAML"):
+                mission.load_yaml_config(path.with_name("missing.yaml"), parser)
+
+    def test_no_config_preserves_cli_defaults_and_required_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sitl.elf"
+            binary.touch()
+            args = mission.parse_arguments(["--binary", str(binary), "--eeprom", str(binary)])
+        self.assertEqual(args.guidance_speed, 20)
+        self.assertEqual(args.balloon_motion, "hover")
+        self.assertFalse(args.launcher)
+        self.assertFalse(args.interactive)
+        self.assertIsNone(args.config)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            mission.parse_arguments([])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_packaged_yaml_loads_with_cli_overrides(self):
+        config = Path(mission.__file__).with_suffix(".yaml")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sitl.elf"
+            binary.touch()
+            args = mission.parse_arguments([
+                "--guidance-speed", "10", "--config", str(config), "--binary", str(binary),
+                "--eeprom", str(binary), "--no-interactive", "--aim-only"])
+        self.assertEqual(args.guidance_speed, 10)
+        self.assertEqual(args.balloon_orbit_speed, 5)
+        self.assertTrue(args.launcher)
+        self.assertFalse(args.interactive)
+        self.assertTrue(args.aim_only)
+        self.assertEqual(args.pitch_aim, -10)
+
+    def test_yaml_uses_existing_range_and_mode_validation(self):
+        for text in ("guidance_speed: 41", "balloon_orbit_speed: 6", "rpc_wait: 0",
+                     "interactive: true\naim_only: true", "launcher: true\npitch_aim: -5"):
+            with self.subTest(text=text), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                self.parse_config(text)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_yaml_path_expansion_precedes_file_validation(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+            directory = Path(directory)
+            binary = directory / "sitl.elf"
+            binary.touch()
+            shorthand = f"~/{directory.name}/sitl.elf"
+            config = directory / "mission.yaml"
+            config.write_text(f"binary: {shorthand}\neeprom: {shorthand}\n")
+            args = mission.parse_arguments(["--config", f"~/{directory.name}/mission.yaml"])
+        self.assertEqual(args.binary, binary.resolve())
+        self.assertEqual(args.eeprom, binary.resolve())
+
+    def test_main_runs_with_merged_yaml_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sitl.elf"
+            binary.touch()
+            config = Path(directory) / "mission.yaml"
+            config.write_text(f"binary: {binary}\neeprom: {binary}\nguidance_speed: 40\n")
+            with patch.object(sys, "argv", ["mission", "--config", str(config),
+                                           "--guidance-speed", "25"]), \
+                    patch.object(mission, "InterceptMission") as runner:
+                runner.return_value.run.return_value = 0
+                self.assertEqual(mission.main(), 0)
+                self.assertEqual(runner.call_args.args[0].guidance_speed, 25)
+                runner.return_value.run.assert_called_once_with()
 
     def test_mission_provisions_the_verified_sitl_rate_profile(self):
         self.assertIn("profile 0", mission.SITL_CONFIG_BASE)

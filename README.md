@@ -387,6 +387,28 @@ target velocity and platform angles alongside the existing target positions and
 camera error. A successful moving-target test must show actual motion, not just
 `motion=orbit` in its configuration.
 
+The mission accepts an optional flat YAML parameter file. Keys use argparse
+destination names with underscores; precedence is **CLI > YAML > built-in defaults**.
+Omitting `--config` preserves the original CLI-only behavior. YAML values use native
+numbers and `true`/`false` booleans; unknown keys, invalid types and invalid choices
+fail before simulation starts. Boolean options support `--flag`/`--no-flag`.
+For example, the packaged fast moving-target profile is
+[src/test/sitl/airsim_intercept_mission.yaml](src/test/sitl/airsim_intercept_mission.yaml):
+
+```bash
+/usr/bin/python3 src/test/sitl/airsim_intercept_mission.py \
+    --config src/test/sitl/airsim_intercept_mission.yaml \
+    --guidance-speed 30 --no-interactive
+```
+
+`binary` remains required, either in YAML or on the command line. Run the example
+from the repository root: relative paths (including paths inside YAML) are relative
+to the current working directory, not the YAML directory; `~` is expanded for paths.
+`balloon_script: null` (or an empty string) selects an external balloon;
+`pitch_aim: null` keeps automatic/default aiming, and `workdir: null` keeps the
+generated artifact directory. The sample profile enables interactive mode;
+add `--no-interactive --aim-only` for a non-arming preflight check.
+
 To isolate a test from unrelated ROS nodes, use a free domain for the **whole**
 runner, for example:
 

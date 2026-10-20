@@ -1,0 +1,40 @@
+# Fast moving-target profile; use --config to opt in. CLI overrides YAML.
+# Relative paths use the launch working directory (normally the repository root).
+binary: obj/main/betaflight_SITL.elf
+eeprom: eeprom.bin
+ros_ws: ~/workspace/fpv_ws
+host: 127.0.0.1
+rpc_port: 41451
+rpc_wait: 30.0
+workdir: null
+
+# Set balloon_script to null or "" when using an external target.
+balloon_script: src/test/sitl/airsim_balloon_target.py
+balloon_x: 70.0
+balloon_y: 0.0
+balloon_z: -45.0
+balloon_motion: orbit
+balloon_orbit_radius: 10.0
+balloon_orbit_speed: 5.0
+
+launch_x: 0.0
+launch_y: 0.0
+launcher: true
+reference_camera: CineCameraActor_0
+launcher_forward: 8.0
+launcher_overview: false
+pitch_aim: null
+hfov: 72.0
+img_w: 1536
+img_h: 960
+
+guidance_speed: 40.0
+climb_speed: 20.0
+turn_cap_factor: 0.8
+rate_control_attenuation: false
+
+aim_only: false
+interactive: true
+interactive_timeout: 900.0
+joystick_device: /dev/input/js0
+joystick_args: ""

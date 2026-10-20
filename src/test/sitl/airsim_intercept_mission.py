@@ -127,10 +127,9 @@ def apply_bridge_profile(profile, launcher_mounted):
         gimbal = params["gimbal"]
         gimbal["pitch_aim"], gimbal["pitch_max"] = -10.0, 85.0
         gimbal["mission_on_ground"] = True
-        gimbal.update(tracking_gain=2.0, tracking_max_rate=60.0,
-                      tracking_max_accel=180.0, tracking_filter_tau=.12,
-                      tracking_rate_feedforward=0.0,
-                      max_angle_speed=120.0)
+        gimbal.update(tracking_gain=2.0, tracking_max_rate=140.0,
+                      tracking_max_accel=600.0, tracking_filter_tau=.12,
+                      tracking_rate_feedforward=0.0)
     return profile
 
 

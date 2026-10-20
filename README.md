@@ -180,10 +180,42 @@ uses gimbal AIM, waits with ARM low until all firmware arming checks remain
 clear for 0.5 s, arms through the pilot switch (the bridge auto-publishes
 tracker `ON` on the arm edge, verified by the runner), and
 requires a sustained visual lock. The cloned run configuration sets
-`pwr_on_arm_grace=5`; the runner waits out boot grace rather than bypassing it. A short body-rate/thrust takeoff settles at
-4 m before the `MISSION` trigger hands control to relative IMM-UKF guidance.
+`pwr_on_arm_grace=5`; the runner waits out boot grace rather than bypassing it.
+Without a launcher, RC throttle performs takeoff and POSHOLD+ALTHOLD settles the
+craft above 2 m before the `MISSION` trigger hands control to relative IMM-UKF guidance.
 Ground truth is used for setup, this takeoff handover, and scoring, not as
 target-position input to the vision-only guidance; radar is disabled.
+
+Non-interactive runs emulate the same radio channels as a pilot: AUX3 arms,
+AUX4 stays above 1900 us for the bridge's >0.5 s one-shot MISSION latch, and AUX1
+selects the sixth detent (2000 us) for GPS Rescue. The runner requires the
+bridge's trigger acknowledgement and always releases AUX4 afterwards, including
+on errors. AUX2 remains low: the bridge, not an OFFBOARD switch or a test
+publisher, owns the MISSION/OFFBOARD linkage. Collision emergency stops and
+cleanup set ARM low immediately; they do not wait for a dismiss pulse.
+The runner creates no ROS publishers for arm, tracker triggers, OFFBOARD, or
+control commands; its ROS interface only observes telemetry, vision and bridge events.
+
+Both modes use the same arm-edge acknowledgement, engagement watchdogs, strict
+hit distance, launcher release/stow, and Rescue landing checks. The scripted
+pilot's **operation timing** is deliberately different: it waits for arming
+readiness, sustained visual lock and (without a launcher) a stable RC hover,
+then presses AUX4 and selects Rescue after the engagement. In interactive mode
+the human makes those decisions, can dismiss/retry, and selects when to return.
+These are pilot decisions, not alternate flight-controller/bridge control paths.
+Both engagement paths anchor their control-frame baseline at AUX4's rising edge.
+Once MISSION is acknowledged, supervision starts immediately even if vision
+temporarily loses lock; both modes then use the same loss watchdog. An initial
+`mission_state=false` is not treated as completion before the interceptor has
+acknowledged that engagement. Arming uses the same 60 s bridge-ON timeout.
+The automated report requires the planned hit-and-return scenario; an interactive
+report may instead record a deliberate pilot abort or a session with no launch.
+
+For `--aim-only`, a rebuilt `apm_bridge` with AirSim enabled interprets an AUX4
+pulse while disarmed as vision `ON` only, even if already locked. It never enters
+MISSION or requests OFFBOARD in that preview path. Ordinary arm/disarm edges still
+start/stop vision. In interactive mode, unexpected vision `OFF` is reported to the
+pilot instead of being masked by a synthetic host `ON`.
 
 The per-run parameter file preserves the packaged profile, then applies the
 selected closing-speed and climb/descent ceilings, a 1.5/s climb gain,
@@ -255,7 +287,8 @@ level, or hold the button for level semantics):
   pulse can re-trigger once still locked.
 - **ch5 AUX1 dial detent 6** - one-key GPS-Rescue RTH at any moment, including
   mid-mission (the firmware strips host authority the instant that switch is
-  active); the runner releases OFFBOARD and verifies the return/landing.
+  active); the bridge observes the authority change and the runner verifies
+  the return/landing without publishing a host override.
 - Sticks fly manually whenever no mission is engaged; hover above 2 m before
   the first MISSION (ground-launch guidance can trip the interceptor's
   collision detector - the runner warns below 2 m).

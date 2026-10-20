@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import ANY, MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 import cosysairsim as airsim
 import airsim_balloon_target as balloon
@@ -238,7 +238,7 @@ class InterceptMissionTest(unittest.TestCase):
         test.ros_iface.trigger_seen.assert_called_once_with("ON", ANY)
 
     @patch.object(mission.time, "sleep")
-    @patch.object(mission.time, "monotonic", side_effect=[0, 10, 5, 20])
+    @patch.object(mission.time, "monotonic", side_effect=[0, 10, 5, 80])
     def test_arm_without_bridge_auto_on_trigger_fails(self, _clock, _sleep):
         test = self.make_mission()
         test.rc = Mock()
@@ -352,6 +352,36 @@ class InterceptMissionTest(unittest.TestCase):
         self.assertIn("cannot release target", test.report["error"])
         test.client.client.close.assert_called_once()
 
+    @patch.object(mission.rclpy, "shutdown")
+    @patch.object(mission.control, "stop_process")
+    @patch.object(mission.time, "sleep")
+    def test_cleanup_confirms_rc_disarm_before_stopping_sitl(self, _sleep, stop, _shutdown):
+        test = self.make_mission()
+        test.rc = Mock()
+        test.sitl = Mock()
+        test.sitl.poll.return_value = None
+        test.modes = Mock(side_effect=[([0], 0), ([], 0)])
+        test.teardown()
+        test.rc.set.assert_called_once_with(
+            arm=1000, throttle=1000, yaw=1500, trigger=1000, switch3=1000)
+        self.assertEqual(test.modes.call_count, 2)
+        stop.assert_called_once_with(test.sitl)
+        self.assertIsNone(test.report["error"])
+
+    @patch.object(mission.rclpy, "shutdown")
+    @patch.object(mission.control, "stop_process")
+    @patch.object(mission.time, "sleep")
+    def test_cleanup_rc_disarm_timeout_is_not_hidden(self, _sleep, _stop, _shutdown):
+        test = self.make_mission()
+        test.rc = Mock()
+        test.sitl = Mock()
+        test.sitl.poll.return_value = None
+        test.modes = Mock(return_value=([0], 0))
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
+            test.teardown()
+        self.assertFalse(test.report["passed"])
+        self.assertIn("cleanup RC disarm", test.report["error"])
+
     def test_enu_heading_is_converted_to_clockwise_north_heading(self):
         test = self.make_mission()
         for heading in (0, 31, -31, 90, 179, -179):
@@ -406,14 +436,24 @@ class InterceptMissionTest(unittest.TestCase):
         self.assertEqual(test.trajectory.writerow.call_args.args[0][-4:],
                          test.ros_iface.imu_quat)
 
-    def test_hover_handover_brakes_vertical_motion(self):
+    def test_hover_handover_uses_rc_takeoff_and_fc_hold(self):
         test = self.make_mission()
         test.origin = (0, 0, 0)
-        test.publish_hover_command = Mock()
-        for vz, expected in ((0, 9.81), (-3, 4), (3, 14)):
-            with self.subTest(vz=vz):
-                test.hold_launch_hover({"pos": (0, 0, -4), "vel": (0, 0, vz)})
-                self.assertAlmostEqual(test.publish_hover_command.call_args.args[0], expected)
+        test.rc = Mock()
+        test.ros_iface = Mock()
+        test.hover_pwm = 1275
+        test.client = Mock()
+        test.gt = Mock(return_value={"pos": (0, 0, -4)})
+        test.wait = Mock()
+        test.hover_handover()
+        self.assertEqual(test.rc.set_mode.call_args_list,
+                         [call("ANGLE"), call("POSHOLD+ALTHOLD")])
+        self.assertEqual(test.rc.set.call_args_list,
+                         [call(throttle=1315), call(throttle=1311)])
+        predicate = test.wait.call_args.args[1]
+        hover = {"pos": (0, 0, -4), "vel": (0, 0, 0), "modes": [0, 3, 11]}
+        self.assertTrue(predicate(hover))
+        self.assertFalse(predicate({**hover, "modes": [0, 3, 11, 58]}))
 
     def test_success_requires_hit_return_and_no_error(self):
         passed = {"intercept": {"outcome": "hit"}, "rth": {"outcome": "returned"}}
@@ -424,6 +464,186 @@ class InterceptMissionTest(unittest.TestCase):
             {"intercept": {"outcome": "lost"}, "rth": {"outcome": "returned"}}, None))
         self.assertFalse(mission.mission_passed(
             {"intercept": {"outcome": "hit"}, "rth": {"outcome": "failed"}}, None))
+
+    @patch.object(mission.time, "sleep")
+    def test_rc_trigger_waits_for_bridge_ack_and_resets_channel(self, sleep):
+        test = self.make_mission()
+        test.rc = Mock(error=None)
+        test.ros_iface = Mock()
+        test.ros_iface.trigger_seen.side_effect = [False, False, True]
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1, .05)):
+            test.pulse_rc_trigger("MISSION")
+        self.assertEqual(test.rc.set.call_args_list,
+                         [call(trigger=1000), call(trigger=2000), call(trigger=1000)])
+        self.assertEqual(test.ros_iface.trigger_seen.call_count, 3)
+        test.ros_iface.publish_trigger.assert_not_called()
+        sleep.assert_any_call(.15)
+
+    @patch.object(mission.time, "sleep")
+    def test_rc_trigger_timeout_is_an_error_and_still_releases_switch(self, _sleep):
+        test = self.make_mission()
+        test.rc = Mock(error=None)
+        test.ros_iface = Mock()
+        test.ros_iface.trigger_seen.return_value = False
+        with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)), \
+                self.assertRaisesRegex(RuntimeError, "bridge did not emit MISSION"):
+            test.pulse_rc_trigger("MISSION")
+        self.assertEqual(test.rc.set.call_args, call(trigger=1000))
+
+    @patch.object(mission.time, "sleep")
+    def test_rc_stream_failure_cannot_fake_a_bridge_trigger(self, _sleep):
+        test = self.make_mission()
+        test.rc = Mock(error=OSError("RC send failed"))
+        test.ros_iface = Mock()
+        with self.assertRaisesRegex(RuntimeError, "RC stream failed"):
+            test.pulse_rc_trigger("MISSION")
+        self.assertEqual(test.rc.set.call_args, call(trigger=1000))
+        test.ros_iface.trigger_seen.assert_not_called()
+
+    @patch.object(mission.time, "sleep")
+    def test_rc_trigger_releases_launcher_while_waiting_for_ack(self, _sleep):
+        test = self.make_mission()
+        test.rc = Mock(error=None)
+        test.ros_iface = Mock(control_sequence=1)
+        test.ros_iface.trigger_seen.side_effect = [False, True]
+        test.launcher = Mock(released=False)
+        test.launcher.release.side_effect = lambda: setattr(test.launcher, "released", True)
+        result = {}
+        test.pulse_rc_trigger("MISSION", on_poll=lambda: test.release_launcher_on_command(0, 0, result))
+        test.launcher.release.assert_called_once()
+        self.assertIn("launcher_release_s", result)
+
+    @patch.object(mission.time, "sleep")
+    def test_collision_disarms_immediately_without_waiting_for_dismiss_pulse(self, _sleep):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": 10}])
+        test.client.simGetCollisionInfo.return_value = SimpleNamespace(
+            has_collided=True, time_stamp=2, object_name="Landscape_1")
+        with self.assertRaisesRegex(RuntimeError, "non-target collision"):
+            test.run_intercept(trigger_mission=False)
+        test.rc.set.assert_called_once_with(
+            trigger=1000, arm=1000, throttle=1000, switch3=1000)
+        test.pulse_rc_trigger.assert_not_called()
+        test.ros_iface.publish_offboard.assert_not_called()
+
+    def test_ros_observer_creates_no_function_publishers(self):
+        with patch.object(mission.Node, "__init__", return_value=None), \
+                patch.object(mission.RosInterface, "create_subscription"), \
+                patch.object(mission.RosInterface, "create_publisher") as publish:
+            mission.RosInterface()
+        publish.assert_not_called()
+
+    def make_observer(self):
+        with patch.object(mission.Node, "__init__", return_value=None), \
+                patch.object(mission.RosInterface, "create_subscription"):
+            return mission.RosInterface()
+
+    @patch.object(mission.time, "monotonic", return_value=100)
+    def test_mission_event_keeps_rc_edge_baseline_for_late_supervision(self, _clock):
+        observer = self.make_observer()
+        channels = [1000] * 16
+        observer.record_rc(SimpleNamespace(channels=channels))
+        channels[7] = 2000
+        observer.record_rc(SimpleNamespace(channels=channels))
+        observer.control_received(SimpleNamespace(armed=True, control_mode=mission.ControlCommand.BODY_RATES))
+        observer.record_rc(SimpleNamespace(channels=channels))  # Held high must not recapture.
+        observer.record_trigger(SimpleNamespace(frame_id="MISSION"))
+        self.assertEqual(observer.control_sequence, 1)
+        self.assertEqual(observer.mission_event, (100, 0))
+        observer.record_mission_state(SimpleNamespace(data=True))
+        observer.record_mission_state(SimpleNamespace(data=False))
+        self.assertEqual(observer.mission_active_since, 100)
+
+    def test_both_arm_paths_use_the_same_verification(self):
+        test = self.make_mission()
+        test.rc = Mock()
+        test.ros_iface = Mock()
+        test.wait = Mock(return_value={"modes": [0]})
+        test.origin = (0, 0, 0)
+        test.verify_arm_edge = Mock()
+        test.arm_fc()
+        test.verify_arm_edge.assert_called_once_with({"modes": [0]}, ANY)
+        test.verify_arm_edge.reset_mock()
+        state = {"pos": (0, 0, 0), "modes": [0]}
+        test.interactive_armed(state, since=123)
+        test.verify_arm_edge.assert_called_once_with(state, 123)
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", return_value=101)
+    def test_same_mission_trace_has_identical_results_for_both_rc_sources(self, _clock, _sleep):
+        for outcome in ("hit", "lost", "dismissed", "user_rth"):
+            results = []
+            for scripted in (True, False):
+                with self.subTest(outcome=outcome, scripted=scripted):
+                    test = self.prepare_intercept(
+                        [{"vel": (3, 4, -2), "distance": .75 if outcome == "hit" else 10}],
+                        mission_active=outcome == "hit")
+                    test.ros_iface.mission_event = (100, 0)
+                    test.ros_iface.mission_active_since = 100
+                    test.ros_iface.trigger_seen.side_effect = lambda frame, since: (
+                        outcome == "dismissed" and frame == "DISMISS")
+                    test.pulse_rc_trigger = Mock()
+                    test.rth_dial_active.return_value = outcome == "user_rth"
+                    if not scripted:
+                        test.rc = None
+                    results.append(test.run_intercept(trigger_mission=scripted))
+                    self.assertEqual(results[-1]["outcome"], outcome)
+                    self.assertEqual(test.pulse_rc_trigger.call_count, int(scripted))
+            self.assertEqual(results[0], results[1])
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", return_value=100)
+    def test_same_rescue_trace_has_identical_checks_for_both_rc_sources(self, _clock, _sleep):
+        results = []
+        for scripted in (True, False):
+            test = self.prepare_return(
+                {"pos": (100.1, -30.1, -3), "vel": (0, 0, 0), "modes": []}, 200)
+            if not scripted:
+                test.rc = None
+            test.return_home(dial_engaged=not scripted)
+            results.append(test.report["phases"]["rth"])
+            test.ros_iface.publish_trigger.assert_not_called()
+            test.ros_iface.publish_offboard.assert_not_called()
+        self.assertEqual(results[0], results[1])
+
+    @patch.object(mission.time, "sleep")
+    def test_native_mission_does_not_wait_for_relock_before_releasing_launcher(self, _sleep):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": .75}])
+        test.rc = None
+        test.ros_iface.tracker_state = 1
+        test.ros_iface.control_sequence = 1  # First command arrived before supervision.
+        test.launcher = SimpleNamespace(released=False, stowed=True, release=Mock())
+        test.launcher.release.side_effect = lambda: setattr(test.launcher, "released", True)
+        result = test.run_intercept(trigger_mission=False)
+        self.assertEqual(result["outcome"], "hit")
+        test.launcher.release.assert_called_once()
+
+    @patch.object(mission.time, "sleep")
+    def test_false_before_true_mission_state_is_not_a_premature_end(self, _sleep):
+        test = self.prepare_intercept([
+            {"vel": (0, 0, 0), "distance": 10},
+            {"vel": (0, 0, 0), "distance": .75}], mission_active=False)
+        test.ros_iface.mission_active_since = 0
+        self.assertEqual(test.run_intercept(trigger_mission=False)["outcome"], "hit")
+
+    @patch.object(mission.time, "sleep")
+    @patch.object(mission.time, "monotonic", return_value=106)
+    def test_missing_interceptor_mission_ack_fails_instead_of_flying_blind(self, _clock, _sleep):
+        test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": 10}])
+        test.ros_iface.mission_event = (100, 0)
+        test.ros_iface.mission_active_since = 0
+        with self.assertRaisesRegex(RuntimeError, "did not acknowledge"):
+            test.run_intercept(trigger_mission=False)
+
+    @patch.object(mission.time, "sleep")
+    def test_disarm_during_mission_is_rejected_with_either_rc_source(self, _sleep):
+        for scripted in (True, False):
+            test = self.prepare_intercept([
+                {"vel": (0, 0, 0), "distance": 10, "modes": []}])
+            if not scripted:
+                test.rc = None
+            with self.subTest(scripted=scripted), \
+                    self.assertRaisesRegex(RuntimeError, "disarmed during MISSION"):
+                test.run_intercept(trigger_mission=scripted)
 
     # ------------------------------------------------------------ interactive
 
@@ -547,7 +767,7 @@ class InterceptMissionTest(unittest.TestCase):
             test.interactive_mission()  # must not raise
 
     @patch.object(mission.time, "sleep")
-    def test_interactive_stop_pulse_restarts_the_tracker_once(self, _sleep):
+    def test_interactive_unexpected_off_does_not_inject_host_or_rc_commands(self, _sleep):
         off_time = time.monotonic()
         test = self.make_interactive(
             samples=[{"pos": (0, 0, -5), "rpy": (0, 0, 0), "modes": []},
@@ -559,7 +779,8 @@ class InterceptMissionTest(unittest.TestCase):
         test.interactive_armed = Mock()
         with patch.object(mission.time, "monotonic", side_effect=itertools.count(1)):
             test.interactive_mission()
-        test.ros_iface.publish_trigger.assert_called_once_with("ON")
+        self.assertIsNone(test.rc)
+        test.ros_iface.publish_trigger.assert_not_called()
 
     def test_interactive_armed_requires_bridge_auto_on(self):
         test = self.make_mission()
@@ -568,10 +789,10 @@ class InterceptMissionTest(unittest.TestCase):
         test.wait_for_trigger = Mock(return_value=False)
         with patch.object(mission.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "auto-publish /fpv/tracker_trigger ON"):
-                test.interactive_armed({"pos": (0, 0, 0)})
+                test.interactive_armed({"pos": (0, 0, 0), "modes": [0]})
         test.wait_for_trigger = Mock(return_value=True)
         with patch.object(mission.time, "sleep"):
-            test.interactive_armed({"pos": (0, 0, 0)})
+            test.interactive_armed({"pos": (0, 0, 0), "modes": [0]})
         self.assertTrue(test.armed_once)
 
     def test_interactive_armed_anchors_wait_before_the_detection_sample(self):
@@ -583,8 +804,8 @@ class InterceptMissionTest(unittest.TestCase):
         test.launcher = None
         test.wait_for_trigger = Mock(return_value=True)
         with patch.object(mission.time, "sleep"):
-            test.interactive_armed({"pos": (0, 0, 0)}, since=123.0)
-        test.wait_for_trigger.assert_called_once_with("ON", 123.0, 10.0)
+            test.interactive_armed({"pos": (0, 0, 0), "modes": [0]}, since=123.0)
+        test.wait_for_trigger.assert_called_once_with("ON", 123.0, 60.0)
         self.assertTrue(test.armed_once)
 
     @patch.object(mission.time, "sleep")
@@ -594,9 +815,9 @@ class InterceptMissionTest(unittest.TestCase):
         test.run_intercept = Mock(return_value={"outcome": "hit", "closest_distance_m": .9})
         test.supervise_interactive_mission()
         test.run_intercept.assert_called_once_with(
-            publish_mission=False, abort=test.rth_dial_active)
+            trigger_mission=False, abort=test.rth_dial_active)
         test.ros_iface.publish_trigger.assert_not_called()
-        test.ros_iface.publish_offboard.assert_called_once_with(False)
+        test.ros_iface.publish_offboard.assert_not_called()
         self.assertEqual(test.report["phases"]["interactive_missions"],
                          [{"outcome": "hit", "closest_distance_m": .9}])
 
@@ -620,8 +841,9 @@ class InterceptMissionTest(unittest.TestCase):
     @patch.object(mission.time, "sleep")
     def test_run_intercept_suppresses_mission_publish_for_native_trigger(self, _sleep):
         test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": .75}])
-        result = test.run_intercept(publish_mission=False)
+        result = test.run_intercept(trigger_mission=False)
         self.assertEqual(result["outcome"], "hit")
+        test.pulse_rc_trigger.assert_not_called()
         test.ros_iface.publish_trigger.assert_not_called()
 
     def test_run_intercept_dismiss_pulse_is_not_scored_as_a_miss(self):
@@ -640,8 +862,8 @@ class InterceptMissionTest(unittest.TestCase):
         test.rc.set.assert_not_called()
         test.rc.set_mode.assert_not_called()
         self.assertEqual(test.report["phases"]["rth"]["outcome"], "returned")
-        test.ros_iface.publish_trigger.assert_called_once_with("OFF")
-        test.ros_iface.publish_offboard.assert_called_once_with(False)
+        test.ros_iface.publish_trigger.assert_not_called()
+        test.ros_iface.publish_offboard.assert_not_called()
 
     def test_non_target_collision_emergency_works_without_script_rc(self):
         test = self.prepare_intercept([{"vel": (0, 0, 0), "distance": 10}])
@@ -649,8 +871,8 @@ class InterceptMissionTest(unittest.TestCase):
         test.client.simGetCollisionInfo.return_value = SimpleNamespace(
             has_collided=True, time_stamp=2, object_name="Landscape_1")
         with self.assertRaisesRegex(RuntimeError, "non-target collision"):
-            test.run_intercept()
-        test.ros_iface.publish_offboard.assert_called_once_with(False)
+            test.run_intercept(trigger_mission=False)
+        test.ros_iface.publish_offboard.assert_not_called()
 
     def test_interactive_return_home_skips_unreleased_launcher(self):
         test = self.make_mission()
@@ -684,16 +906,26 @@ class InterceptMissionTest(unittest.TestCase):
     def prepare_intercept(self, samples, mission_active=True):
         test = self.make_mission()
         test.origin = (0, 0, 0)
-        test.ros_iface = Mock(tracker_state=2, mission_state=mission_active, control_sequence=0)
+        event_time = time.monotonic()
+        test.ros_iface = Mock(tracker_state=2, mission_state=mission_active, control_sequence=0,
+                              mission_event=(event_time, 0), mission_active_since=event_time)
         test.ros_iface.trigger_seen.return_value = False
         test.rc = Mock()
+        def pulse(expected, on_poll):
+            now = time.monotonic()
+            test.ros_iface.mission_event = (now, 0)
+            test.ros_iface.mission_active_since = now
+            on_poll()
+
+        test.pulse_rc_trigger = Mock(side_effect=pulse)
+        test.rth_dial_active = Mock(return_value=False)
         test.client = Mock()
         test.client.getMultirotorState.return_value = SimpleNamespace(timestamp=1)
         test.client.simGetCollisionInfo.return_value = SimpleNamespace(has_collided=False)
         samples = iter(samples)
 
         def sample():
-            state = {"pos": (0, 0, -3), "rpy": (0, 0, 0), **next(samples)}
+            state = {"pos": (0, 0, -3), "rpy": (0, 0, 0), "modes": [0], **next(samples)}
             test.last_sample = state
             test.min_distance = min(test.min_distance or math.inf, state["distance"])
             return state
@@ -753,7 +985,7 @@ class InterceptMissionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-target collision"):
             test.run_intercept()
         self.assertTrue(test.hard_collision)
-        test.ros_iface.publish_offboard.assert_called_once_with(False)
+        test.ros_iface.publish_offboard.assert_not_called()
 
     def test_target_contact_alone_does_not_override_distance_threshold(self):
         test = self.prepare_intercept(
@@ -810,7 +1042,12 @@ class InterceptMissionTest(unittest.TestCase):
         self.assertEqual(test.report["phases"]["rth"]["outcome"], "returned")
         self.assertTrue(test.report["phases"]["rth"]["ground_contact"])
         self.assertTrue(test.report["phases"]["rth"]["disarm_trigger_off"])
-        test.ros_iface.publish_offboard.assert_called_once_with(False)
+        test.ros_iface.publish_offboard.assert_not_called()
+        test.rc.set.assert_called_once_with(
+            roll=1500, pitch=1500, yaw=1500, trigger=1000, mode6=2000)
+        rescue_ready = test.wait.call_args.args[1]
+        self.assertTrue(rescue_ready({"modes": [0, 3, 11, 56]}))
+        self.assertFalse(rescue_ready({"modes": [0, 3, 11, 56, 58]}))
 
     @patch.object(mission.time, "sleep")
     def test_return_fails_without_disarm_edge_off_trigger(self, _sleep):
@@ -1094,15 +1331,17 @@ class InterceptMissionTest(unittest.TestCase):
 
     @patch.object(mission.time, "sleep")
     @patch.object(mission.time, "monotonic", side_effect=itertools.count(1, .25))
-    def test_aim_only_tracking_still_publishes_manual_on(self, _clock, _sleep):
+    def test_aim_only_tracking_uses_disarmed_rc_preview(self, _clock, _sleep):
         test = self.make_mission()
         test.args = SimpleNamespace(balloon_motion="hover")
         test.ros_iface = Mock(tracker_state=2)
         test.capture_png = Mock()
+        test.pulse_rc_trigger = Mock()
         test.sample = Mock(return_value={
             "target_pos": (70, 0, -45), "target_vel": (0, 0, 0), "camera_error_deg": None})
-        test.start_tracking(manual_trigger=True)
-        test.ros_iface.publish_trigger.assert_called_once_with("ON")
+        test.start_tracking(preview=True)
+        test.pulse_rc_trigger.assert_called_once_with("ON")
+        test.ros_iface.publish_trigger.assert_not_called()
         self.assertIn("prelaunch_tracking", test.report["phases"])
 
     @patch.object(mission.time, "sleep")

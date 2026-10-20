@@ -23,7 +23,7 @@ and links MISSION entry/exit to OFFBOARD on the FC), and turning the ch5/AUX1
 firmware strips host authority the instant that switch is active).  The
 script still provisions everything, launches the joystick bridge (unless one
 is already streaming on UDP 9004), verifies the arm-edge tracker ON trigger,
-restarts the tracker after a stop pulse and supervises every engaged mission
+and supervises every engaged mission
 with the same safety watchdogs as the automated run.
 
 Run under the ROS 2 environment (see airsim_control_test.py for the SITL
@@ -88,6 +88,7 @@ TRACK_LOCK_WAIT = 45.0
 MISSION_WAIT = 100.0
 RTH_WAIT = 240.0
 HIT_DISTANCE = 1.0  # m, common-world ground-truth intercept threshold
+ARM_TRIGGER_WAIT = 60.0
 
 # RC switch thresholds on the bridge-mirrored channels (us): above the lower
 # bound of every aux band used here; the dial's GPS-Rescue detent is 2000.
@@ -235,10 +236,6 @@ def connect_airsim(host, port, timeout):
 class RosInterface(Node):
     def __init__(self):
         super().__init__("intercept_mission")
-        self.trigger_pub = self.create_publisher(Header, "/fpv/tracker_trigger", 10)
-        self.arm_pub = self.create_publisher(Bool, "/fpv/arm", 10)
-        self.offboard_pub = self.create_publisher(Bool, "/fpv/offboard", 10)
-        self.control_pub = self.create_publisher(ControlCommand, "/fpv/control_command", 10)
         self.tracker_state = -1
         self.mission_state = None
         self.imu_count = 0
@@ -249,6 +246,10 @@ class RosInterface(Node):
         self.target_los = None
         self.target_bbox = None
         self.control_sequence = 0
+        self.trigger_control_sequence = 0
+        self.trigger_started_at = None
+        self.mission_event = None
+        self.mission_active_since = 0.0
         self.create_subscription(ControlCommand, "/fpv/control_command", self.control_received, 10)
         self.create_subscription(TwistStamped, "/fpv/target_los",
                                  lambda m: setattr(self, "target_los", m), 10)
@@ -257,7 +258,7 @@ class RosInterface(Node):
         self.create_subscription(Int8, "/fpv/tracker_state",
                                  lambda m: setattr(self, "tracker_state", m.data), 10)
         self.create_subscription(Bool, "/fpv/mission_state",
-                                 lambda m: setattr(self, "mission_state", m.data), 10)
+                                 self.record_mission_state, 10)
         self.triggers = []
         self.create_subscription(Header, "/fpv/tracker_trigger", self.record_trigger, 10)
         self.create_subscription(Imu, "/mavros/imu/data",
@@ -278,8 +279,7 @@ class RosInterface(Node):
         self.rc_in = None
         self.rc_in_stamp = 0.0
         self.create_subscription(RCIn, "/mavros/rc/in",
-                                 lambda m: (setattr(self, "rc_in", list(m.channels)),
-                                            setattr(self, "rc_in_stamp", time.monotonic())),
+                                 self.record_rc,
                                  qos_profile_sensor_data)
 
     def control_received(self, message):
@@ -287,26 +287,32 @@ class RosInterface(Node):
             self.control_sequence += 1
 
     def record_trigger(self, message):
-        self.triggers.append((time.monotonic(), message.frame_id))
+        received = time.monotonic()
+        if message.frame_id == "MISSION":
+            start = received if self.trigger_started_at is None else self.trigger_started_at
+            self.mission_event = (start, self.trigger_control_sequence)
+        self.triggers.append((received, message.frame_id))
+
+    def record_mission_state(self, message):
+        self.mission_state = message.data
+        if message.data:
+            self.mission_active_since = time.monotonic()
+
+    def record_rc(self, message):
+        received = time.monotonic()
+        index = joystick.RC_CHANNEL_INDICES["trigger"]
+        channels = list(message.channels)
+        # Capture before the >0.5 s RC latch, not after MISSION is observed:
+        # a control frame may already have arrived when supervision starts.
+        was_high = self.rc_in is not None and len(self.rc_in) > index and self.rc_in[index] > 1900
+        if len(channels) > index and channels[index] > 1900 and not was_high:
+            self.trigger_control_sequence = self.control_sequence
+            self.trigger_started_at = received
+        self.rc_in, self.rc_in_stamp = channels, received
 
     def trigger_seen(self, frame_id, since=None):
         return any(f == frame_id and (since is None or t >= since)
                    for t, f in self.triggers)
-
-    def publish_trigger(self, frame_id):
-        msg = Header()
-        msg.frame_id = frame_id
-        msg.stamp = self.get_clock().now().to_msg()
-        self.trigger_pub.publish(msg)
-        log(f"published /fpv/tracker_trigger frame_id={frame_id}")
-
-    def publish_arm(self, armed):
-        self.arm_pub.publish(Bool(data=armed))
-        log(f"published /fpv/arm={armed}")
-
-    def publish_offboard(self, enabled):
-        self.offboard_pub.publish(Bool(data=enabled))
-        log(f"published /fpv/offboard={enabled}")
 
 
 class ManagedProcess:
@@ -408,6 +414,7 @@ class InterceptMission:
         self.hard_collision = False
         self.world_ready = False
         self.external_rc = False  # interactive: a user bridge already streams UDP 9004
+        self.hover_pwm = None
 
     # ---------------------------------------------------------------- helpers
 
@@ -501,7 +508,7 @@ class InterceptMission:
                              f"dist={last['distance'] if last else None:.1f}" if last else description)
 
     def wait_for_trigger(self, frame_id, since, timeout):
-        """Wait for a /fpv/tracker_trigger frame (bridge arm-edge or mission-published)."""
+        """Observe a /fpv/tracker_trigger acknowledgement from the bridge."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.ros_iface.trigger_seen(frame_id, since):
@@ -675,6 +682,7 @@ class InterceptMission:
         if self.args.eeprom:
             shutil.copy2(self.args.eeprom.resolve(), self.workdir / "eeprom.bin")
         control.provision(self.args.binary, self.workdir, config, log_name="provision")
+        self.hover_pwm = control.read_hover_pwm(self.args.binary, self.workdir)
         log_file = open(self.workdir / "sitl.log", "w")
         self.sitl = subprocess.Popen([str(self.args.binary)], cwd=self.workdir,
                                      stdout=log_file, stderr=subprocess.STDOUT)
@@ -1064,7 +1072,7 @@ class InterceptMission:
         semantics), which engages OFFBOARD authority immediately — the FC then
         ignores RC sticks and the ground yaw alignment cannot rotate the
         airframe. Pilot-switch arming keeps stick authority until the
-        interceptor's first ControlCommand arrives and OFFBOARD takes over.
+        bridge accepts the AUX4 MISSION pulse and requests OFFBOARD.
 
         Arming (props spinning) must make the bridge auto-publish
         /fpv/tracker_trigger ON on the arm edge; verified here so a bridge
@@ -1073,7 +1081,7 @@ class InterceptMission:
         self.stage = "arm"
         self.rc.set(roll=1500, pitch=1500, yaw=1500, throttle=1000,
                     mode6=joystick.MODE6_VALUES_US[0 if self.launcher is not None else 1],
-                    switch3=joystick.RC_MAX_US,
+                    switch3=joystick.RC_MIN_US,
                     arm=joystick.RC_MIN_US, trigger=joystick.RC_MIN_US)
         self.wait("FC arming checks clear with ARM low",
                   lambda s: s["flags"] == 0, timeout=60, dwell=.5)
@@ -1085,25 +1093,53 @@ class InterceptMission:
         except AssertionError:
             _, flags = self.modes()
             raise RuntimeError(f"arming failed; arming-disable flags=0x{flags:08x}")
-        self.armed_once = True
         log(f"armed, modes={state['modes']} (props up)")
-        if not self.wait_for_trigger("ON", arm_since, 10.0):
+        self.verify_arm_edge(state, arm_since)
+
+    def verify_arm_edge(self, state, since):
+        """Apply the same arm/vision acknowledgement to either RC source."""
+        self.armed_once = True
+        if 0 not in state["modes"]:
+            raise RuntimeError("FC did not confirm RC arming")
+        if not self.wait_for_trigger("ON", since, ARM_TRIGGER_WAIT):
             raise RuntimeError("bridge did not auto-publish /fpv/tracker_trigger ON "
                                "on the arm edge (props spinning)")
         log("arm edge auto-published /fpv/tracker_trigger ON (bridge)")
 
-    def start_tracking(self, manual_trigger=False):
+    def pulse_rc_trigger(self, expected, on_poll=None):
+        """Hold AUX4 long enough for the bridge latch and require its response."""
+        if self.rc is None:
+            raise RuntimeError(f"{expected} requires a simulated RC stream")
+        self.rc.set(trigger=joystick.RC_MIN_US)
+        time.sleep(.15)  # The bridge must see the release that resets its latch.
+        since = time.monotonic()
+        self.rc.set(trigger=joystick.RC_MAX_US)
+        try:
+            while time.monotonic() - since < 5.0:
+                if self.rc.error is not None:
+                    raise RuntimeError(f"RC stream failed: {self.rc.error}")
+                if on_poll is not None:
+                    on_poll()
+                if self.ros_iface.trigger_seen(expected, since):
+                    log(f"bridge emitted {expected} after simulated AUX4 pulse")
+                    return
+                time.sleep(.02)
+            raise RuntimeError(f"bridge did not emit {expected} after simulated AUX4 pulse")
+        finally:
+            self.rc.set(trigger=joystick.RC_MIN_US)
+
+    def start_tracking(self, preview=False):
         """Wait for the vision tracker to lock onto the balloon.
 
         The armed path relies on the bridge's arm-edge auto ON trigger (verified
-        in arm_fc); manual_trigger covers aim-only runs that never arm.
+        in arm_fc); preview uses the bridge's disarmed AirSim AUX4 path.
         """
         self.stage = "track"
         self.capture_png("0", "ground_camera.png")
         if self.launcher is not None and getattr(self.args, "launcher_overview", False):
             self.capture_png("LauncherOverview", "launcher_overview.png")
-        if manual_trigger:
-            self.ros_iface.publish_trigger("ON")
+        if preview:
+            self.pulse_rc_trigger("ON")
         first = self.sample()
         yaw_start = self.launcher.yaw if self.launcher else None
         pitch_start = self.launcher.pitch if self.launcher else None
@@ -1172,81 +1208,52 @@ class InterceptMission:
             raise RuntimeError(f"near obstacle in launcher sight cone: {clearance:.1f} m")
         log(f"launcher three-ray collision corridor clear for {clearance:.1f} m")
 
-    def publish_hover_command(self, thrust):
-        msg = ControlCommand()
-        msg.header.stamp = self.ros_iface.get_clock().now().to_msg()
-        msg.control_mode = ControlCommand.BODY_RATES
-        msg.armed = True
-        msg.bodyrates.x = 0.0
-        msg.bodyrates.y = 0.0
-        msg.bodyrates.z = 0.0
-        msg.collective_thrust = thrust
-        self.ros_iface.control_pub.publish(msg)
-
-    def hold_launch_hover(self, state):
-        height = self.origin[2] - state["pos"][2]
-        thrust = max(4.0, min(14.0, 9.81 + 1.5 * (4.0 - height) + 2.5 * state["vel"][2]))
-        self.publish_hover_command(thrust)
-
     def hover_handover(self):
-        """Lift the armed drone to a low hover over the same OFFBOARD 0x20
-        stream the interceptor will use, then hand over at MISSION.
-
-        Launching the interceptor's guidance from the ground trips its gyro
-        collision detector within the first tenths of a second: the initial
-        yaw-rate commands jerk the airframe against ground friction (observed
-        |gyro-cmd| = 4.4 rad/s -> false COMPLETED, run 2026-10-13). A short
-        rate-zero, thrust-managed climb to ~4 m gives the guidance a clean
-        airborne start; the bridge's command cache makes the interceptor's
-        first frame take over seamlessly.
-        """
+        """Take off on pilot RC, then let the FC hold position and altitude."""
+        if self.rc is None or self.hover_pwm is None:
+            raise RuntimeError("RC takeoff requires a stream and configured hover throttle")
         self.stage = "takeoff"
-        log("hover takeover: climbing to 4 m via OFFBOARD bodyrate/thrust")
-        start = time.monotonic()
-        deadline = start + 25
-        since = None
-        while time.monotonic() < deadline:
-            state = self.sample()
-            height = self.origin[2] - state["pos"][2]
-            self.hold_launch_hover(state)
-            if abs(height - 4.0) < 0.4 and abs(state["vel"][2]) < 0.3:
-                since = since or time.monotonic()
-                if time.monotonic() - since >= 1.0:
-                    break
-            else:
-                since = None
-            if max(abs(state["rpy"][0]), abs(state["rpy"][1])) > 45:
-                raise RuntimeError(f"takeover attitude upset: {state['rpy'][:2]}")
-            time.sleep(0.05)
-        else:
-            raise RuntimeError("hover takeover did not settle at 4 m")
+        log("taking off via RC throttle, then POSHOLD+ALTHOLD")
+        self.rc.set_mode("ANGLE")
+        self.rc.set(throttle=min(1900, self.hover_pwm + (10 if self.hover_pwm < 1200 else 40)))
+        self.wait("RC takeoff above 3 m",
+                  lambda s: self.origin[2] - s["pos"][2] > 3.0, timeout=25)
+        self.rc.set(throttle=control.alt_hold_neutral_pwm(self.hover_pwm))
+        self.rc.set_mode("POSHOLD+ALTHOLD")
+        self.wait("FC hover ready for RC mission trigger",
+                  lambda s: {0, 3, 11} <= set(s["modes"]) and 58 not in s["modes"]
+                  and 2.0 < self.origin[2] - s["pos"][2] < 10.0
+                  and abs(s["vel"][2]) < .3 and math.hypot(*s["vel"][:2]) < .5,
+                  timeout=40, dwell=1.0)
         log(f"hover at {self.origin[2] - self.gt()['pos'][2]:.1f} m; "
             f"tracker={self.ros_iface.tracker_state}")
         self.airborne_timestamp = self.client.getMultirotorState(vehicle_name=VEHICLE).timestamp
 
-    def run_intercept(self, abort=None, publish_mission=True):
+    def release_launcher_on_command(self, control_before_launch, start, result):
+        if self.launcher is not None and not self.launcher.released \
+                and self.ros_iface.control_sequence > control_before_launch:
+            self.launcher.release()
+            result["launcher_release_s"] = time.monotonic() - start
+            log("launcher released on first interceptor body-rate command")
+
+    def run_intercept(self, abort=None, trigger_mission=True):
         """Fly one engagement; `abort` (interactive RTH dial) ends it early.
-        publish_mission=False supervises a MISSION another party already
-        published (interactive: the bridge's RC trigger pulse)."""
+        trigger_mission=False supervises the pilot's existing RC MISSION."""
         self.stage = "mission"
         self.min_distance = None
-        # Hold the hover while the vision lock re-establishes (spin-up shake
-        # can drop it for a moment); the mission starts from a solid track.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and self.ros_iface.tracker_state != 2:
-            if self.launcher is None:
-                self.hold_launch_hover(self.sample())
-            time.sleep(0.05)
-        if self.ros_iface.tracker_state != 2:
-            raise RuntimeError(f"vision lock did not recover at handover "
-                               f"(tracker_state={self.ros_iface.tracker_state})")
+        if trigger_mission:
+            # The scripted pilot may wait before pressing AUX4. Once the bridge
+            # emits MISSION, both sources must supervise immediately.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and self.ros_iface.tracker_state != 2:
+                self.sample()
+                time.sleep(0.05)
+            if self.ros_iface.tracker_state != 2:
+                raise RuntimeError(f"vision lock did not recover at handover "
+                                   f"(tracker_state={self.ros_iface.tracker_state})")
         control_before_launch = self.ros_iface.control_sequence
-        if publish_mission:
-            self.ros_iface.publish_trigger("MISSION")
         start = time.monotonic()
-        airborne_deadline = start + 20
         result = {"took_off": False, "terminated_by_node": False}
-        progress_mark = (start, self.min_distance)
         lost_since = None
         bad_view_since = None
         next_log = 0.0
@@ -1255,15 +1262,31 @@ class InterceptMission:
         target_start, target_previous = None, None
         target_path = 0.0
         launch_timestamp = self.client.getMultirotorState(vehicle_name=VEHICLE).timestamp
+        if trigger_mission:
+            self.pulse_rc_trigger(
+                "MISSION", on_poll=lambda: self.release_launcher_on_command(
+                    control_before_launch, start, result))
+        event = self.ros_iface.mission_event
+        if event is None:
+            raise RuntimeError("MISSION supervision requires a bridge RC trigger acknowledgement")
+        event_time, control_before_launch = event
+        if "launcher_release_s" in result:
+            result["launcher_release_s"] -= event_time - start
+        start = event_time
+        airborne_deadline = start + 20
+        progress_mark = (start, self.min_distance)
+        abort = self.rth_dial_active if abort is None else abort
         while time.monotonic() - start < MISSION_WAIT:
             state = self.sample()
-            if abort is not None and abort():
+            if abort():
                 result["outcome"] = "user_rth"
                 result["closest_distance_m"] = self.min_distance
                 result["duration_s"] = time.monotonic() - start
                 log(f"pilot RTH requested mid-mission at min distance "
                     f"{self.min_distance:.2f} m; handing over to GPS Rescue")
                 return result
+            if 0 not in state["modes"]:
+                raise RuntimeError("FC disarmed during MISSION")
             if "target_vel" in state:
                 result["target_peak_speed_m_s"] = max(
                     result.get("target_peak_speed_m_s", 0), math.hypot(*state["target_vel"]))
@@ -1280,10 +1303,7 @@ class InterceptMission:
             result["peak_horizontal_speed_m_s"] = peak_horizontal_speed
             result["peak_climb_speed_m_s"] = peak_climb_speed
             if self.launcher is not None:
-                if not self.launcher.released and self.ros_iface.control_sequence > control_before_launch:
-                    self.launcher.release()
-                    result["launcher_release_s"] = time.monotonic() - start
-                    log("launcher released on first interceptor body-rate command")
+                self.release_launcher_on_command(control_before_launch, start, result)
                 if self.launcher.released and not self.launcher.stowed and \
                         math.dist(state["pos"], self.origin) > 5.0:
                     self.launcher.stow()
@@ -1300,12 +1320,11 @@ class InterceptMission:
                 self.hard_collision = True
                 self.report["phases"]["collision"] = {
                     "object": collision.object_name, "time_s": elapsed, "position": state["pos"]}
-                self.ros_iface.publish_trigger("OFF")
                 if self.rc is not None:
-                    self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, switch3=joystick.RC_MIN_US)
+                    self.rc.set(trigger=joystick.RC_MIN_US,
+                                arm=joystick.RC_MIN_US, throttle=1000, switch3=joystick.RC_MIN_US)
                 else:
-                    log("PILOT: host control cut - disarm now (AUX3 low)")
-                self.ros_iface.publish_offboard(False)
+                    log("PILOT: collision detected - disarm now (AUX3 low)")
                 raise RuntimeError(f"non-target collision with {collision.object_name}; emergency stop")
             if getattr(self.args, "launcher", False) and self.ros_iface.gimbal_quat is not None:
                 error_deg = camera_target_error_degrees(
@@ -1361,7 +1380,7 @@ class InterceptMission:
                 result["closest_distance_m"] = self.min_distance
                 result["duration_s"] = elapsed
                 return result
-            if self.ros_iface.mission_state is False:
+            if self.ros_iface.mission_state is False and self.ros_iface.mission_active_since >= start:
                 result["terminated_by_node"] = True
                 outcome = ("hit" if self.min_distance <= HIT_DISTANCE
                            else "lost")
@@ -1375,6 +1394,8 @@ class InterceptMission:
                 result["closest_distance_m"] = self.min_distance
                 result["duration_s"] = elapsed
                 return result
+            if self.ros_iface.mission_active_since < start and elapsed >= 5:
+                raise RuntimeError("interceptor did not acknowledge the bridge MISSION")
             if not result["took_off"]:
                 if height > 2.0:
                     result["took_off"] = True
@@ -1405,17 +1426,19 @@ class InterceptMission:
                 log("launcher never released; disarm via the AUX3 switch when done")
             self.report["phases"]["rth"] = {"outcome": "not-launched-home"}
             return
-        self.ros_iface.publish_trigger("OFF")
-        if not dial_engaged and self.rc is not None:
-            self.rc.set(roll=1500, pitch=1500, yaw=1500, switch3=joystick.RC_MIN_US)
-            self.rc.set_mode("GPSRESCUE")
+        if not dial_engaged:
+            if self.rc is None:
+                raise RuntimeError("automated RTH requires an RC stream")
+            self.rc.set(roll=1500, pitch=1500, yaw=1500, trigger=joystick.RC_MIN_US,
+                        mode6=joystick.MODE6_VALUES_US[5])
+            log("one-key RTH requested through simulated AUX1 sixth detent")
+        else:
+            log("one-key RTH engaged (pilot AUX1 sixth detent)")
         time.sleep(0.2)
-        self.ros_iface.publish_offboard(False)
-        log("one-key RTH engaged ({}OFFBOARD released)".format(
-            "pilot dial sixth detent, " if dial_engaged else "mode dial sixth detent, "))
         try:
             state = self.wait("GPS Rescue controller engaged",
-                              lambda s: rescue_controller(s["modes"]) is not None, timeout=20)
+                              lambda s: rescue_controller(s["modes"]) is not None
+                              and 58 not in s["modes"], timeout=20)
         except AssertionError:
             state = self.sample()
             if 0 not in state["modes"]:
@@ -1502,15 +1525,11 @@ class InterceptMission:
         physical arm edge, which can precede this loop's (much slower)
         detection of the armed mode — anchoring at detection time would miss
         an already-delivered ON frame."""
-        self.armed_once = True
         arm_since = time.monotonic() if since is None else since
         height = self.origin[2] - state["pos"][2]
         log(f"pilot armed {'at {:.1f} m altitude'.format(height) if height > 2 else 'on the ground'} "
             "(props spinning)")
-        if not self.wait_for_trigger("ON", arm_since, 60.0):
-            raise RuntimeError("bridge did not auto-publish /fpv/tracker_trigger ON "
-                               "on the arm edge (props spinning)")
-        log("arm edge auto-published /fpv/tracker_trigger ON (bridge)")
+        self.verify_arm_edge(state, arm_since)
         if self.launcher is None and height <= 2:
             log("take off and hover above 2 m on sticks (ANGLE recommended), "
                 "then hold AUX4 >=0.5 s to launch MISSION")
@@ -1528,19 +1547,13 @@ class InterceptMission:
                 "can trip the interceptor's collision detector; hover above 2 m "
                 "before triggering")
         log("supervising MISSION (pilot AUX4 pulse; bridge engaged OFFBOARD)")
-        result = self.run_intercept(publish_mission=False, abort=self.rth_dial_active)
+        result = self.run_intercept(trigger_mission=False, abort=self.rth_dial_active)
         self.report["phases"].setdefault("interactive_missions", []).append(result)
         log(f"MISSION finished: outcome={result['outcome']} "
             f"closest={result.get('closest_distance_m')}")
-        if result["outcome"] != "user_rth":
-            # OFFBOARD already dropped at the mission_state falling edge and on
-            # any OFF pulse (bridge); re-assert for robustness. The tracker
-            # stays ON so a later pulse can re-trigger once locked again.
-            self.ros_iface.publish_offboard(False)
 
     def interactive_return_home(self):
-        """Dial detent 6: the FC already switched to GPS Rescue (host authority
-        stripped firmware-side); release OFFBOARD and monitor it home."""
+        """Dial detent 6 strips host authority in the FC; observe the return."""
         if self.launcher is not None and not self.launcher.released and self.launcher.pivot is not None:
             log("RTH skipped: launcher never released (nothing airborne)")
             self.report["phases"]["rth"] = {"outcome": "not-launched-home"}
@@ -1565,7 +1578,7 @@ class InterceptMission:
         warned_no_rc = False
         warned_dial_blocks_arming = False
         mission_mark = time.monotonic()   # MISSION frames older than this: seen
-        restart_mark = 0.0                # last tracker-restart OFF already handled
+        restart_mark = 0.0                # last unexpected OFF already reported
         try:
             while time.monotonic() < deadline:
                 state = self.sample()
@@ -1617,13 +1630,9 @@ class InterceptMission:
                 if (armed and triggers and triggers[-1][1] == "OFF"
                         and triggers[-1][0] > restart_mark
                         and self.ros_iface.mission_state is not True):
-                    # A stop pulse now sends DISMISS and leaves the tracker
-                    # running; an OFF while armed is unexpected - bring the
-                    # vision pipeline back so the pilot can still re-trigger.
                     restart_mark = triggers[-1][0]
-                    log("tracker stopped while armed (unexpected OFF); restarting "
-                        "vision pipeline (ON)")
-                    self.ros_iface.publish_trigger("ON")
+                    log("tracker stopped unexpectedly; land and re-arm to restart "
+                        "vision through the bridge (no host trigger override)")
                 if not armed:
                     unarmed_since = sampled_at
                 armed_prev = armed
@@ -1643,14 +1652,20 @@ class InterceptMission:
     def teardown(self, error=None):
         stage_reached = self.stage
         self.stage = "cleanup"
-        with contextlib.suppress(Exception):
-            if self.rc is not None:
-                self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, yaw=1500)
+        if self.rc is not None:
+            try:
+                self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, yaw=1500,
+                            trigger=joystick.RC_MIN_US, switch3=joystick.RC_MIN_US)
                 self.rc.set_mode("ACRO")
-        with contextlib.suppress(Exception):
-            self.ros_iface.publish_arm(False)
-        with contextlib.suppress(Exception):
-            self.ros_iface.publish_offboard(False)
+                if self.sitl is not None and self.sitl.poll() is None:
+                    deadline = time.monotonic() + 5.0
+                    while 0 in self.modes()[0]:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("FC did not confirm cleanup RC disarm")
+                        time.sleep(.05)
+            except Exception as exc:
+                log(f"RC cleanup failed: {exc}")
+                error = error or exc
         if self.launcher is not None and not self.launcher.released and self.launcher.pivot is not None:
             try:
                 self.launcher.release()
@@ -1719,7 +1734,7 @@ class InterceptMission:
             if self.launcher is not None:
                 self.check_launcher_clearance()
             if self.args.aim_only:
-                self.start_tracking(manual_trigger=True)
+                self.start_tracking(preview=True)
                 self.report["phases"]["aim_check"] = {"passed": True}
             elif self.args.interactive:
                 self.interactive_mission()

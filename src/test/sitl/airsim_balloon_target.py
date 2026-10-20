@@ -22,6 +22,8 @@ import cosysairsim as airsim
 
 INTERCEPTOR_NAME = "Copter"
 TARGET_NAME = "TargetDrone"
+# Inverse horizontal acceleration gain of the default SimpleFlight velocity P loop.
+ORBIT_VELOCITY_LEAD_S = .9
 
 
 def validate_motion(motion, radius, speed):
@@ -42,6 +44,28 @@ def orbit_reference(center, radius, speed, elapsed):
                 center[1] + radius * math.sin(angle), center[2])
     velocity = (-speed * math.sin(angle), speed * math.cos(angle), 0.0)
     return position, velocity
+
+
+def orbit_start_reference(center, radius, speed, elapsed):
+    """Ramp tangential speed from rest and integrate it into the orbit phase."""
+    validate_motion("orbit", radius, speed)
+    if not math.isfinite(elapsed) or elapsed < 0:
+        raise ValueError("orbit elapsed time must be finite and nonnegative")
+    ramp_time = max(2.0, speed)  # At most 1 m/s^2 tangential acceleration.
+    ramp_elapsed = min(elapsed, ramp_time)
+    distance = speed * (elapsed - ramp_elapsed + .5 * ramp_elapsed ** 2 / ramp_time)
+    position, tangent = orbit_reference(center, radius, speed, distance / speed)
+    return position, tuple(v * ramp_elapsed / ramp_time for v in tangent)
+
+
+def orbit_start_acceleration(radius, speed, elapsed):
+    """Tangential startup and centripetal acceleration of the same reference."""
+    offset, velocity = orbit_start_reference((0.0, 0.0, 0.0), radius, speed, elapsed)
+    ramp_time = max(2.0, speed)
+    tangential = speed / ramp_time if elapsed < ramp_time else 0.0
+    omega_squared = sum(v * v for v in velocity) / (radius * radius)
+    return (-omega_squared * offset[0] - tangential * offset[1] / radius,
+            -omega_squared * offset[1] + tangential * offset[0] / radius, 0.0)
 
 
 def world_to_geopoint(position, origin):
@@ -254,9 +278,10 @@ class BalloonTarget:
             v = state.kinematics_estimated.linear_velocity
             speed = math.hypot(v.x_val, v.y_val, v.z_val)
             if self.args.motion == "orbit":
-                goal, feedforward = orbit_reference(
+                goal, feedforward = orbit_start_reference(
                     self.standoff, self.args.orbit_radius, self.args.orbit_speed, elapsed)
-                stable = (math.dist(pos, goal) < 1
+                stable = (elapsed >= max(2.0, self.args.orbit_speed)
+                          and math.dist(pos, goal) < 1
                           and abs(speed - self.args.orbit_speed) < max(.3, .3 * self.args.orbit_speed)
                           and math.dist(pos, first_position) > .25)
             else:
@@ -276,7 +301,13 @@ class BalloonTarget:
                     ready = True
                 elif time.monotonic() - wall_start > 20:
                     raise RuntimeError(f"balloon {self.args.motion} motion did not become ready")
-            command = tuple(ff + .8 * (g-p) for g, p, ff in zip(goal, pos, feedforward))
+            acceleration = (orbit_start_acceleration(
+                self.args.orbit_radius, self.args.orbit_speed, elapsed)
+                if self.args.motion == "orbit" else (0.0, 0.0, 0.0))
+            # SimpleFlight's horizontal velocity P loop needs an acceleration lead
+            # to generate the centripetal lean before radial tracking error grows.
+            command = tuple(ff + ORBIT_VELOCITY_LEAD_S * a + .8 * (g-p)
+                            for g, p, ff, a in zip(goal, pos, feedforward, acceleration))
             limit = max(self.args.cruise, self.args.orbit_speed * 1.5)
             magnitude = math.hypot(*command)
             if magnitude > limit:

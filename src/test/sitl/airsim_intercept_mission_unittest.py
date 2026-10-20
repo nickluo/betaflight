@@ -798,6 +798,48 @@ class InterceptMissionTest(unittest.TestCase):
                     self.assertAlmostEqual(math.hypot(*vel), speed)
                     self.assertAlmostEqual(sum(p*v for p, v in zip(offset, vel)), 0)
 
+    def test_orbit_start_ramps_speed_and_integrates_phase(self):
+        center = (10, 20, -45)
+        for radius, speed in ((5, 1.5), (10, 5)):
+            with self.subTest(radius=radius, speed=speed):
+                ramp_time = max(2.0, speed)
+                position, velocity = balloon.orbit_start_reference(center, radius, speed, 0)
+                self.assertEqual(position, (center[0] + radius, center[1], center[2]))
+                self.assertEqual(velocity, (0, 0, 0))
+                for t in (ramp_time / 2, ramp_time, ramp_time + 1, 100):
+                    position, velocity = balloon.orbit_start_reference(center, radius, speed, t)
+                    self.assertAlmostEqual(math.dist(position, center), radius)
+                    self.assertAlmostEqual(math.hypot(*velocity), speed * min(t / ramp_time, 1))
+                    phase_time = t * t / (2 * ramp_time) if t < ramp_time else t - ramp_time / 2
+                    expected, _ = balloon.orbit_reference(center, radius, speed, phase_time)
+                    self.assertLess(math.dist(position, expected), 1e-9)
+                before = balloon.orbit_start_reference(center, radius, speed, ramp_time - 1e-6)
+                after = balloon.orbit_start_reference(center, radius, speed, ramp_time + 1e-6)
+                self.assertLess(math.dist(before[0], after[0]), 2.1e-6 * speed)
+                self.assertLess(math.dist(before[1], after[1]), 1e-5)
+
+    def test_orbit_velocity_and_acceleration_match_position_derivatives(self):
+        for radius, speed in ((5, 1.5), (10, 5)):
+            for t in (.1, 1, 1.9, 6, 12):
+                with self.subTest(radius=radius, speed=speed, t=t):
+                    dt = 1e-4
+                    before = balloon.orbit_start_reference((0, 0, 0), radius, speed, t - dt)
+                    after = balloon.orbit_start_reference((0, 0, 0), radius, speed, t + dt)
+                    _, velocity = balloon.orbit_start_reference((0, 0, 0), radius, speed, t)
+                    acceleration = balloon.orbit_start_acceleration(radius, speed, t)
+                    for i in range(3):
+                        self.assertAlmostEqual((after[0][i] - before[0][i]) / (2 * dt),
+                                               velocity[i], places=6)
+                        self.assertAlmostEqual((after[1][i] - before[1][i]) / (2 * dt),
+                                               acceleration[i], places=6)
+
+    def test_fast_orbit_acceleration_includes_centripetal_demand(self):
+        position, velocity = balloon.orbit_start_reference((0, 0, 0), 10, 5, 8)
+        acceleration = balloon.orbit_start_acceleration(10, 5, 8)
+        self.assertAlmostEqual(math.hypot(*acceleration), 2.5)
+        self.assertAlmostEqual(sum(a * v for a, v in zip(acceleration, velocity)), 0)
+        self.assertLess(sum(a * p for a, p in zip(acceleration, position)), 0)
+
     def test_motion_parameters_reject_invalid_values_before_starting(self):
         for radius, speed in ((0, 1), (-1, 1), (5, 0), (math.nan, 1), (5, math.inf),
                               (11, 1), (5, 6)):
@@ -805,6 +847,11 @@ class InterceptMissionTest(unittest.TestCase):
                 balloon.validate_motion("orbit", radius, speed)
         with self.assertRaises(ValueError):
             balloon.orbit_reference((0, 0, 0), 5, 1, -1)
+        for elapsed in (-1, math.nan, math.inf):
+            with self.subTest(elapsed=elapsed), self.assertRaises(ValueError):
+                balloon.orbit_start_reference((0, 0, 0), 10, 5, elapsed)
+            with self.subTest(elapsed=elapsed), self.assertRaises(ValueError):
+                balloon.orbit_start_acceleration(10, 5, elapsed)
         with self.assertRaises(ValueError):
             balloon.validate_motion("invalid", 5, 1)
 
@@ -831,8 +878,8 @@ class InterceptMissionTest(unittest.TestCase):
         target.args.motion = "orbit"
         target.fly_leg = Mock()
         target.command_velocity = Mock()
-        times = [0, .5, 1, 1.5, 2]
-        samples = [balloon.orbit_reference(target.standoff, 5, 1.5, t) for t in times]
+        times = [0, .5, 1, 1.5, 2, 2.5, 3]
+        samples = [balloon.orbit_start_reference(target.standoff, 5, 1.5, t) for t in times]
         states = [SimpleNamespace(
             timestamp=int((100+t) * 1e9),
             kinematics_estimated=SimpleNamespace(linear_velocity=airsim.Vector3r(*vel)))
@@ -844,9 +891,12 @@ class InterceptMissionTest(unittest.TestCase):
         with patch("builtins.print") as output:
             target.hold_orbit()
         target.fly_leg.assert_called_once_with(samples[0][0])
-        for call, (_, vel) in zip(target.command_velocity.call_args_list, samples):
-            for actual, expected in zip(call.args[0], vel):
-                self.assertAlmostEqual(actual, expected)
+        for t, call, (_, vel) in zip(times, target.command_velocity.call_args_list, samples):
+            acceleration = balloon.orbit_start_acceleration(5, 1.5, t)
+            expected = tuple(v + balloon.ORBIT_VELOCITY_LEAD_S * a
+                             for v, a in zip(vel, acceleration))
+            for actual, value in zip(call.args[0], expected):
+                self.assertAlmostEqual(actual, value)
             self.assertEqual(call.kwargs["duration"], .1)
         self.assertTrue(any("target ready: motion=orbit" in c.args[0] for c in output.call_args_list))
         sleep.assert_not_called()

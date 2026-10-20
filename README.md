@@ -331,7 +331,14 @@ the runner accepts positive radii up to 10 m and speeds up to 5 m/s. These
 bounds keep the small-area test and its geometry scan finite; they do not
 certify interception at every accepted setting.
 The target first settles at the standoff, moves to a checked circle entry point,
-then follows a simulation-time circular position/velocity reference. Position
+then ramps tangential speed over `max(2, orbit_speed)` simulation seconds (at most
+1 m/s²) before cruising. Orbit phase integrates that ramp, so the position reference
+does not run ahead at full speed while the target is still accelerating. Tangential
+and centripetal acceleration feedforward provide a 0.9 s velocity-command lead for
+the default SimpleFlight horizontal P controller. This is target-only simulator
+control; it is never fed to the interceptor. Readiness still requires full-speed
+tracking for 1 s after the ramp, and the 1 m readiness / 2 m abort thresholds,
+collision checks and task-error handling remain unchanged. Position
 feedback corrects drift; logging never pauses control. The entire sampled
 circle and its entry connector are checked for geometry clearance before arming
 the target. Collision, excessive tracking error or a failed native flight task

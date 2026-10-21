@@ -34,6 +34,7 @@
 
 #include "drivers/motor.h"
 #include "drivers/serial.h"
+#include "drivers/system.h"
 #include "drivers/time.h"
 
 #include "scheduler/scheduler.h"
@@ -52,9 +53,12 @@
 #include "io/gps.h"
 #include "io/serial.h"
 
+#include "config/config.h"
+
 #include "pg/custom_link.h"
 
 #include "rx/rx.h"
+#include "rx/rx_bind.h"
 
 #include "sensors/acceleration.h"
 #include "sensors/barometer.h"
@@ -359,6 +363,50 @@ static void customLinkProcessCliRequest(const clFrame_t *frame)
             customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, notFound, sizeof(notFound) - 1);
         } else {
             customLinkCliStartInfo(req.reqId, req.args);
+        }
+        break;
+    }
+
+    case CL_CLI_CMD_BIND_RX: {
+        // Same engine as the serial CLI "bind_rx": put the receiver (CRSF/
+        // SRXL2/SPI) into pairing mode. Bounded, no settings-engine work.
+        // Builds without any bind-capable RX provider (e.g. SITL) answer
+        // NOT SUPPORTED rather than pulling in dead code.
+#if defined(USE_RX_BIND)
+        if (startRxBind()) {
+            static const char binding[] = "binding...";
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_OK, binding, sizeof(binding) - 1);
+        } else {
+            static const char notSupported[] = "NOT SUPPORTED";
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, notSupported, sizeof(notSupported) - 1);
+        }
+#else
+        static const char notSupported[] = "NOT SUPPORTED";
+        customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, notSupported, sizeof(notSupported) - 1);
+#endif
+        break;
+    }
+
+    case CL_CLI_CMD_SAVE: {
+        // CLI "save": persist the RAM config (writeEEPROM, exactly what
+        // MSP_EEPROM_WRITE does) and, unless args = "noreboot", reboot like
+        // the serial CLI. Refused while armed - a reboot mid-flight is
+        // catastrophic and a flash write can stall the control loop.
+        if (ARMING_FLAG(ARMED)) {
+            static const char armedErr[] = "ARMED";
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, armedErr, sizeof(armedErr) - 1);
+            break;
+        }
+        static const char saving[] = "saving...";
+        customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_OK, saving, sizeof(saving) - 1);
+        // put the single-chunk reply on the wire NOW: the EEPROM write and
+        // especially the reboot must not race the response
+        customLinkCliPump();
+        writeEEPROM();
+        if (strcasecmp(req.args, "noreboot") != 0) {
+            waitForSerialPortToFinishTransmitting(customLinkPort);
+            motorShutdown();
+            systemReset();
         }
         break;
     }

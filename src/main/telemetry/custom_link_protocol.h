@@ -176,6 +176,8 @@ typedef struct __attribute__((packed)) {
 #define CL_CLI_CMD_GET              0   // args = setting name -> "name = value"
 #define CL_CLI_CMD_SET              1   // args = "name = value" -> readback on success
 #define CL_CLI_CMD_INFO             2   // args = setting name -> metadata (type/min/max/values/default)
+#define CL_CLI_CMD_BIND_RX          3   // no args -> "binding..." (same engine as CLI bind_rx)
+#define CL_CLI_CMD_SAVE             4   // no args (or "noreboot") -> "saving...": persist, then reboot
 
 #define CL_CLI_STATUS_OK            0   // data[] carries response bytes (see flags)
 #define CL_CLI_STATUS_ERR           1   // data[] carries a short error text

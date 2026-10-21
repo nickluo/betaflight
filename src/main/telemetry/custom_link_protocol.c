@@ -171,7 +171,7 @@ bool clCliParseRequest(const clFrame_t *frame, clCliRequest_t *out)
     if (memchr(req.args, '\0', argsLen) == NULL) {
         return false;
     }
-    if (req.cmd > CL_CLI_CMD_INFO || req.reserved != 0) {
+    if (req.cmd > CL_CLI_CMD_SAVE || req.reserved != 0) {
         return false;
     }
 

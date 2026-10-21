@@ -21,11 +21,14 @@ table through the same engine the serial CLI and MSP2_CLI_SETTING use:
                             contiguous offsets, total_len matches, flags
                             MORE set on intermediate chunks
 11. string setting        : MODE_STRING round trip (craft_name)
-12. stream interruption   : a GET superseding a multi-chunk INFO stream kills
+12. bind_rx command       : SITL has no bind-capable RX -> NOT SUPPORTED
+13. stream interruption   : a GET superseding a multi-chunk INFO stream kills
                             the old stream (no further chunks, MORE never
                             clears) while answering normally - last-wins
-13. telemetry alive       : 0x10 keeps flowing after all CLI traffic (the
+14. telemetry alive       : 0x10 keeps flowing after all CLI traffic (the
                             streamer never wedges the 200 Hz task)
+15. save                  : SET + save -> "saving...", SITL exits (reboot),
+                            relaunch -> GET returns the persisted value
 
 Usage:
   python3 src/test/sitl/sitl_custom_link_cli_test.py \
@@ -70,6 +73,8 @@ MSG_HOST_CLI = 0x24
 CL_CLI_CMD_GET = 0
 CL_CLI_CMD_SET = 1
 CL_CLI_CMD_INFO = 2
+CL_CLI_CMD_BIND_RX = 3
+CL_CLI_CMD_SAVE = 4
 
 CL_CLI_STATUS_OK = 0
 CL_CLI_STATUS_ERR = 1
@@ -351,7 +356,16 @@ def main():
         results["string_roundtrip"] = (err is None and status == CL_CLI_STATUS_OK and
                                        parse_value(text or b"")[1] == "clilink_test")
 
-        # ---- 12. interrupting an in-flight stream: last request wins ----
+        # ---- 12. bind_rx command (no settings engine, direct action) ----
+        # SITL compiles no bind-capable RX provider -> NOT SUPPORTED; the
+        # real machine (CRSF/ELRS) answers "binding..."
+        print("== 12. bind_rx command ==")
+        status, text, _, err = request(CL_CLI_CMD_BIND_RX, "")
+        print(f"  status={status} text={text!r}")
+        results["bind_rx"] = (err is None and status == CL_CLI_STATUS_ERR and
+                              text == b"NOT SUPPORTED")
+
+        # ---- 13. interrupting an in-flight stream: last request wins ----
         # Start a long multi-chunk INFO stream (debug_mode has a ~40-entry
         # lookup table -> hundreds of bytes -> many chunks), wait for its
         # first chunk, then supersede it with a GET. The GET must complete
@@ -392,11 +406,63 @@ def main():
                                       len(a_frames_after) == len(a_frames))  # and stayed dead
 
         # ---- 13. telemetry still alive ----
-        print("== 13. telemetry alive after CLI traffic ==")
+        print("== 14. telemetry alive after CLI traffic ==")
         time.sleep(1.0)
         c1 = reader.telemetry_count
         print(f"  telemetry frames: {c0} -> {c1}")
         results["telemetry_alive"] = c1 - c0 > 150
+
+        # ---- 15. save: persist + reboot, then verify across the reboot ----
+        print("== 15. save (persist + reboot + reload) ==")
+        status, text, _, err = request(CL_CLI_CMD_SET, "failsafe_delay = 21")
+        assert err is None and status == CL_CLI_STATUS_OK, (err, text)
+        next_req_id[0] += 1
+        status, text, _, err = do_cli(sock, send_lock, reader, next_req_id[0],
+                                      CL_CLI_CMD_SAVE, "", 5.0)
+        results["save_ack"] = (err is None and status == CL_CLI_STATUS_OK and
+                               text == b"saving...")
+        # SITL's systemReset() exits the process
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and sitl.poll() is None:
+            time.sleep(0.2)
+        results["save_reboot"] = sitl.poll() is not None
+        print(f"  ack={results['save_ack']} process exited={results['save_reboot']}")
+        if results["save_reboot"]:
+            reader.stop()
+            sock.close()
+            sitl_log.close()
+            sitl_log = open(os.path.join(args.workdir, "sitl2.log"), "w")
+            sitl = subprocess.Popen(["stdbuf", "-oL", "-eL", binary], cwd=args.workdir,
+                                    stdout=sitl_log, stderr=sitl_log,
+                                    preexec_fn=os.setsid)
+            time.sleep(1.0)
+            sock = None
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                try:
+                    s = socket.create_connection(("127.0.0.1", LINK_TCP_PORT), timeout=0.5)
+                    s.settimeout(2.0)
+                    try:
+                        data = s.recv(64)
+                    except socket.timeout:
+                        data = b""
+                    if SYNC in data:
+                        sock = s
+                        break
+                    s.close()
+                except OSError:
+                    pass
+                time.sleep(0.3)
+            if sock is not None:
+                sock.settimeout(None)
+                reader = CliReader(sock)
+                time.sleep(0.5)
+                status, text, _, err = request(CL_CLI_CMD_GET, "failsafe_delay")
+                print(f"  after reboot: {text!r}")
+                results["save_persisted"] = (err is None and
+                                             text == b"failsafe_delay = 21")
+            else:
+                results["save_persisted"] = False
 
     finally:
         if reader is not None:

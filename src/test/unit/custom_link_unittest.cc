@@ -486,7 +486,24 @@ TEST(CustomLinkCliTest, TestCliRequestValidation)
 
     // unknown cmd
     frame.len = 4 + 4;
-    memcpy(frame.payload, "\x11\x22\x03\x00" "foo\x00", 8);
+    memcpy(frame.payload, "\x11\x22\x05\x00" "foo\x00", 8);
+    EXPECT_FALSE(clCliParseRequest(&frame, &req));
+
+    // bind_rx: empty args (bare NUL) accepted
+    frame.len = 4 + 1;
+    memcpy(frame.payload, "\x11\x22\x03\x00" "\x00", 5);
+    EXPECT_TRUE(clCliParseRequest(&frame, &req));
+    EXPECT_EQ(req.cmd, CL_CLI_CMD_BIND_RX);
+    EXPECT_STREQ(req.args, "");
+
+    // save (highest valid cmd) with "noreboot"
+    frame.len = 4 + 9;
+    memcpy(frame.payload, "\x11\x22\x04\x00" "noreboot\x00", 13);
+    EXPECT_TRUE(clCliParseRequest(&frame, &req));
+    EXPECT_EQ(req.cmd, CL_CLI_CMD_SAVE);
+    EXPECT_STREQ(req.args, "noreboot");
+    frame.len = 4 + 8;                       // same bytes, terminator outside
+    memcpy(frame.payload, "\x11\x22\x04\x00" "noreboot", 12);
     EXPECT_FALSE(clCliParseRequest(&frame, &req));
 
     // nonzero reserved

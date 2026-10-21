@@ -621,6 +621,8 @@ static void crsfFrameFlightMode(sbuf_t *dst)
         flightMode = "!FS!";
     } else if (FLIGHT_MODE(GPS_RESCUE_MODE) || IS_RC_MODE_ACTIVE(BOXGPSRESCUE) || flightPlanNavIsRescuePlanActive()) {
         flightMode = "RTH";
+    } else if (FLIGHT_MODE(OFFBOARD_MODE)) {
+        flightMode = "OFFB";
     } else if (FLIGHT_MODE(PASSTHRU_MODE)) {
         flightMode = "PASS";
     } else if (FLIGHT_MODE(ANGLE_MODE)) {

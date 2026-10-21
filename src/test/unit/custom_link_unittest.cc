@@ -457,6 +457,142 @@ TEST(CustomLinkParserTest, TestUnknownMessageIdStillDelivered)
     EXPECT_EQ(testRx.lastFrame.len, 4u);
 }
 
+TEST(CustomLinkCliTest, TestCliRequestValidation)
+{
+    clFrame_t frame = {};
+    clCliRequest_t req;
+
+    // well-formed GET: req_id little-endian, cmd 0, reserved 0, NUL-terminated name
+    frame.msgId = CUSTOM_LINK_MSG_HOST_CLI;
+    frame.len = 8;
+    memcpy(frame.payload, "\x11\x22\x00\x00" "foo\x00", 8);
+    EXPECT_TRUE(clCliParseRequest(&frame, &req));
+    EXPECT_EQ(req.reqId, 0x2211);
+    EXPECT_EQ(req.cmd, CL_CLI_CMD_GET);
+    EXPECT_STREQ(req.args, "foo");
+
+    // SET with "= value" and trailing padding after the terminator is fine
+    frame.len = 4 + 9;
+    memcpy(frame.payload, "\x00\x01\x01\x00" "a = 5\x00\x00\x00", 13);
+    EXPECT_TRUE(clCliParseRequest(&frame, &req));
+    EXPECT_EQ(req.reqId, 0x0100);
+    EXPECT_EQ(req.cmd, CL_CLI_CMD_SET);
+    EXPECT_STREQ(req.args, "a = 5");
+
+    // missing NUL terminator inside the received bytes
+    frame.len = 8;
+    memcpy(frame.payload, "\x11\x22\x00\x00" "fails", 8);
+    EXPECT_FALSE(clCliParseRequest(&frame, &req));
+
+    // unknown cmd
+    frame.len = 4 + 4;
+    memcpy(frame.payload, "\x11\x22\x03\x00" "foo\x00", 8);
+    EXPECT_FALSE(clCliParseRequest(&frame, &req));
+
+    // nonzero reserved
+    frame.len = 4 + 4;
+    memcpy(frame.payload, "\x11\x22\x00\x01" "foo\x00", 8);
+    EXPECT_FALSE(clCliParseRequest(&frame, &req));
+
+    // too short: rejected, but req_id is still salvaged for the NAK
+    frame.len = 3;
+    memcpy(frame.payload, "\x11\x22\x00", 3);
+    EXPECT_FALSE(clCliParseRequest(&frame, &req));
+    EXPECT_EQ(req.reqId, 0x2211);
+
+    // wrong message id
+    frame.msgId = CUSTOM_LINK_MSG_HOST_CONTROL;
+    frame.len = 8;
+    memcpy(frame.payload, "\x11\x22\x00\x00" "foo\x00", 8);
+    EXPECT_FALSE(clCliParseRequest(&frame, &req));
+}
+
+TEST(CustomLinkCliTest, TestCliResponseHeaderChunking)
+{
+    clPayloadCliResp_t resp;
+
+    // full chunk out of a longer response: MORE set, payload maxed
+    uint8_t n = clCliResponseHeader(&resp, 0xBEEF, 130, 0, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 64u);
+    EXPECT_EQ(resp.req_id, 0xBEEFu);
+    EXPECT_EQ(resp.total_len, 130u);
+    EXPECT_EQ(resp.offset, 0u);
+    EXPECT_EQ(resp.status, CL_CLI_STATUS_OK);
+    EXPECT_EQ(resp.flags, CL_CLI_FLAG_MORE);
+
+    // middle chunk
+    n = clCliResponseHeader(&resp, 0xBEEF, 130, 56, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 64u);
+    EXPECT_EQ(resp.offset, 56u);
+    EXPECT_EQ(resp.flags, CL_CLI_FLAG_MORE);
+
+    // final partial chunk: clamped to the remaining bytes, MORE clear
+    n = clCliResponseHeader(&resp, 0xBEEF, 130, 112, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 8u + 18u);
+    EXPECT_EQ(resp.offset, 112u);
+    EXPECT_EQ(resp.flags, 0u);
+
+    // short single-chunk response
+    n = clCliResponseHeader(&resp, 7, 10, 0, CL_CLI_STATUS_ERR, 56);
+    EXPECT_EQ(n, 8u + 10u);
+    EXPECT_EQ(resp.status, CL_CLI_STATUS_ERR);
+    EXPECT_EQ(resp.flags, 0u);
+
+    // offset at/past the end: zero-length chunk, MORE clear (stream done)
+    n = clCliResponseHeader(&resp, 7, 10, 10, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 8u);
+    EXPECT_EQ(resp.flags, 0u);
+    n = clCliResponseHeader(&resp, 7, 10, 12, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 8u);
+    EXPECT_EQ(resp.flags, 0u);
+}
+
+TEST(CustomLinkCliTest, TestCliRequestRoundtrip)
+{
+    resetParser(10000);
+
+    clPayloadCliReq_t req = {};
+    req.req_id = 0x1234;
+    req.cmd = CL_CLI_CMD_INFO;
+    strcpy(req.args, "some_setting");
+
+    uint8_t buf[CUSTOM_LINK_FRAME_MAX];
+    const uint8_t len = clEncodeFrame(CUSTOM_LINK_MSG_HOST_CLI, 3, &req,
+        4 + strlen(req.args) + 1, buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 1000, 10);
+    ASSERT_EQ(testRx.frameCount, 1u);
+    EXPECT_EQ(testRx.lastFrame.msgId, CUSTOM_LINK_MSG_HOST_CLI);
+    EXPECT_EQ(testRx.lastFrame.seq, 3u);
+
+    clCliRequest_t parsed;
+    EXPECT_TRUE(clCliParseRequest(&testRx.lastFrame, &parsed));
+    EXPECT_EQ(parsed.reqId, 0x1234);
+    EXPECT_EQ(parsed.cmd, CL_CLI_CMD_INFO);
+    EXPECT_STREQ(parsed.args, "some_setting");
+
+    // response frames are never valid requests
+    clPayloadCliResp_t resp = {};
+    resp.req_id = 0x1234;
+    resp.total_len = 100;
+    resp.offset = 0;
+    resp.status = CL_CLI_STATUS_OK;
+    resp.flags = CL_CLI_FLAG_MORE;
+    memset(resp.data, 'x', CL_CLI_MAX_DATA);
+    const uint8_t rlen = clEncodeFrame(CUSTOM_LINK_MSG_FC_CLI, 4, &resp, sizeof(resp), buf, sizeof(buf));
+    ASSERT_EQ(rlen, CUSTOM_LINK_FRAME_MAX);
+    feedBytes(buf, rlen, 5000, 10);
+    ASSERT_EQ(testRx.frameCount, 2u);
+    EXPECT_FALSE(clCliParseRequest(&testRx.lastFrame, &parsed));
+
+    clPayloadCliResp_t respOut;
+    memcpy(&respOut, testRx.lastFrame.payload, sizeof(respOut));
+    EXPECT_EQ(respOut.req_id, 0x1234u);
+    EXPECT_EQ(respOut.total_len, 100u);
+    EXPECT_EQ(respOut.flags, CL_CLI_FLAG_MORE);
+    EXPECT_EQ(respOut.data[0], 'x');
+}
+
 TEST(CustomLinkControlTest, TestArmEdgeDetection)
 {
     clControlState_t state;
@@ -727,7 +863,7 @@ TEST_F(CustomLinkAuthorityTest, WatchdogStillDropsHostAuthorityWithoutPilotTakeo
 TEST(CustomLinkStructTest, TestPackedLayout)
 {
     EXPECT_EQ(sizeof(clPayloadFast_t), 22u);
-    EXPECT_EQ(sizeof(clPayloadMedium_t), 46u);
+    EXPECT_EQ(sizeof(clPayloadMedium_t), 47u);
     EXPECT_EQ(sizeof(clPayloadSlow_t), 36u);
     EXPECT_EQ(sizeof(clPayloadMotors_t), 17u);
     EXPECT_EQ(sizeof(clPayloadControl_t), 20u);
@@ -736,6 +872,8 @@ TEST(CustomLinkStructTest, TestPackedLayout)
     EXPECT_EQ(sizeof(clPayloadHostRc_t), 36u);
     EXPECT_EQ(sizeof(clPayloadTimesyncReq_t), 8u);
     EXPECT_EQ(sizeof(clPayloadTimesyncResp_t), 16u);
+    EXPECT_EQ(sizeof(clPayloadCliReq_t), 64u);
+    EXPECT_EQ(sizeof(clPayloadCliResp_t), 64u);
 
     EXPECT_EQ(offsetof(clPayloadControl_t, host_ts_us), 0u);
     EXPECT_EQ(offsetof(clPayloadControl_t, cmd_seq), 8u);
@@ -764,4 +902,15 @@ TEST(CustomLinkStructTest, TestPackedLayout)
 
     EXPECT_EQ(offsetof(clPayloadTimesyncResp_t, t2_isr_us), 8u);
     EXPECT_EQ(offsetof(clPayloadTimesyncResp_t, t3_tx_us), 12u);
+
+    EXPECT_EQ(offsetof(clPayloadCliReq_t, req_id), 0u);
+    EXPECT_EQ(offsetof(clPayloadCliReq_t, cmd), 2u);
+    EXPECT_EQ(offsetof(clPayloadCliReq_t, args), 4u);
+
+    EXPECT_EQ(offsetof(clPayloadCliResp_t, req_id), 0u);
+    EXPECT_EQ(offsetof(clPayloadCliResp_t, total_len), 2u);
+    EXPECT_EQ(offsetof(clPayloadCliResp_t, offset), 4u);
+    EXPECT_EQ(offsetof(clPayloadCliResp_t, status), 6u);
+    EXPECT_EQ(offsetof(clPayloadCliResp_t, flags), 7u);
+    EXPECT_EQ(offsetof(clPayloadCliResp_t, data), 8u);
 }

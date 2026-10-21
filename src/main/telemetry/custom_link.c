@@ -38,6 +38,8 @@
 
 #include "scheduler/scheduler.h"
 
+#include "cli/cli.h"
+
 #include "fc/core.h"
 #include "fc/rc_modes.h"
 #include "fc/runtime_config.h"
@@ -112,6 +114,32 @@ static bool syncPending;
 static uint64_t syncT1;
 static uint32_t syncT2Us;
 
+// CLI read/write channel (0x24 up / 0x15 down). One in-flight response at a
+// time; a new request replaces it (last request wins). GET/SET responses are
+// snapshotted into buf once and streamed out; INFO regenerates each window
+// through the offset-aware helper because its text (lookup value lists) can
+// exceed any reasonable static buffer.
+#define CL_CLI_GET_BUF_LEN      288     // worst-case "name = value" + NUL
+
+typedef struct {
+    bool active;
+    bool fromBuffer;                          // buf snapshot vs INFO regeneration
+    uint8_t status;
+    uint16_t reqId;
+    uint16_t offset;
+    uint16_t totalLen;
+    char name[CL_CLI_MAX_ARGS + 1];           // cached INFO setting name
+    char buf[CL_CLI_GET_BUF_LEN];
+} clCliStream_t;
+
+static clCliStream_t cliStream;
+
+// True when the settings engine (table scan, PG copy, sprintf) ran during the
+// current taskFast period. That work is bounded, tens-of-microsecond bursts -
+// unlike serial-write stalls - so its cost is let into the scheduler's
+// execution-time estimate; only the stall jitter keeps the ignore below.
+static bool cliEngineWorked;
+
 static void customLinkFrameHandler(const clFrame_t *frame, timeUs_t frameCompleteUs, void *ctx)
 {
     UNUSED(ctx);
@@ -144,21 +172,205 @@ static void customLinkDrainBufferedRx(void)
     }
 }
 
-static void customLinkSendFrame(uint8_t msgId, const void *payload, uint8_t payloadLen)
+// Send that only consumes a sequence number once the frame is actually on the
+// wire, so a deferred retry never reads as a lost telemetry frame. Used by the
+// CLI response streamer, which re-attempts the same chunk next task period.
+static bool customLinkTrySendFrame(uint8_t msgId, const void *payload, uint8_t payloadLen)
 {
     uint8_t buf[CUSTOM_LINK_FRAME_MAX];
-    const uint8_t len = clEncodeFrame(msgId, downlinkSeq++, payload, payloadLen, buf, sizeof(buf));
+    const uint8_t len = clEncodeFrame(msgId, downlinkSeq, payload, payloadLen, buf, sizeof(buf));
     if (len == 0) {
-        return;
+        return false;
     }
     // serialWriteBuf busy-waits for buffer space on a stalled transport
     // (no TCP client, slow host); a wedged task would freeze the whole
     // cooperative scheduler. Degrade to dropping the frame instead.
     if (serialTxBytesFree(customLinkPort) < (uint32_t)len) {
+        return false;
+    }
+    serialWriteBuf(customLinkPort, buf, len);
+    downlinkSeq++;
+    return true;
+}
+
+static void customLinkSendFrame(uint8_t msgId, const void *payload, uint8_t payloadLen)
+{
+    // telemetry frames consume a sequence number even when dropped: the host
+    // loss detector must see the gap (this preserves the original semantics)
+    uint8_t buf[CUSTOM_LINK_FRAME_MAX];
+    const uint8_t len = clEncodeFrame(msgId, downlinkSeq++, payload, payloadLen, buf, sizeof(buf));
+    if (len == 0) {
+        return;
+    }
+    if (serialTxBytesFree(customLinkPort) < (uint32_t)len) {
         return;
     }
     serialWriteBuf(customLinkPort, buf, len);
 }
+
+static void customLinkCliStartBuffered(uint16_t reqId, uint8_t status, const char *text, uint16_t len)
+{
+    cliStream.active = true;
+    cliStream.fromBuffer = true;
+    cliStream.status = status;
+    cliStream.reqId = reqId;
+    cliStream.offset = 0;
+    cliStream.totalLen = len;
+    memcpy(cliStream.buf, text, len);
+}
+
+// Variant for responses composed directly into cliStream.buf (the GET/SET
+// readback path): keeps the 200 Hz task clear of a second sizeable stack
+// buffer on top of the CLI engine's own parsing buffers.
+static void customLinkCliStartSnapshot(uint16_t reqId, uint8_t status, uint16_t len)
+{
+    cliStream.active = true;
+    cliStream.fromBuffer = true;
+    cliStream.status = status;
+    cliStream.reqId = reqId;
+    cliStream.offset = 0;
+    cliStream.totalLen = len;
+}
+
+#ifdef USE_CLI
+static void customLinkCliStartInfo(uint16_t reqId, const char *name)
+{
+    cliStream.active = true;
+    cliStream.fromBuffer = false;
+    cliStream.status = CL_CLI_STATUS_OK;
+    cliStream.reqId = reqId;
+    cliStream.offset = 0;
+    cliStream.totalLen = 0;                   // latched from the first window
+    strncpy(cliStream.name, name, sizeof(cliStream.name) - 1);
+    cliStream.name[sizeof(cliStream.name) - 1] = '\0';
+}
+#endif // USE_CLI
+
+// Streams at most one response chunk per task period (5 ms) so CLI traffic
+// never displaces telemetry frames; a full TX buffer defers the chunk to the
+// next period without consuming a sequence number. Both chunk sources share
+// the same header/send/advance epilogue - only the way resp.data is filled
+// differs (snapshot memcpy vs offset-windowed regeneration).
+static void customLinkCliPump(void)
+{
+    if (!cliStream.active) {
+        return;
+    }
+
+    clPayloadCliResp_t resp;
+    uint8_t payloadLen;
+    if (!cliStream.fromBuffer) {
+#if defined(USE_CLI)
+        int totalLen = 0;
+        const int written = cliGetSettingInfoByName(cliStream.name, cliStream.offset,
+            resp.data, CL_CLI_MAX_DATA, &totalLen);
+        if (written < 0 || totalLen <= 0 ||
+            (written == 0 && cliStream.offset != 0)) {
+            // the setting vanished mid-stream (cannot happen with a static
+            // settings table, but never wedge the streamer on it)
+            static const char infoFailed[] = "INFO FAILED";
+            customLinkCliStartBuffered(cliStream.reqId, CL_CLI_STATUS_ERR, infoFailed, sizeof(infoFailed) - 1);
+            return;
+        }
+        if (cliStream.totalLen == 0) {
+            cliStream.totalLen = (uint16_t)totalLen;
+        }
+        cliEngineWorked = true;
+        payloadLen = clCliResponseHeader(&resp, cliStream.reqId, cliStream.totalLen,
+            cliStream.offset, CL_CLI_STATUS_OK, (uint8_t)written);
+#else
+        return;
+#endif
+    } else {
+        // header sizing clamps n to the remaining bytes of the snapshot
+        payloadLen = clCliResponseHeader(&resp, cliStream.reqId, cliStream.totalLen,
+            cliStream.offset, cliStream.status, CL_CLI_MAX_DATA);
+        memcpy(resp.data, cliStream.buf + cliStream.offset, payloadLen - 8);
+    }
+
+    if (customLinkTrySendFrame(CUSTOM_LINK_MSG_FC_CLI, &resp, payloadLen)) {
+        cliStream.offset += payloadLen - 8;
+        cliStream.active = cliStream.offset < cliStream.totalLen;
+    }
+}
+
+// Executes a validated 0x24 request against the settings table. Runs in task
+// context exactly like the MSP handler for MSP2_CLI_SETTING; writes are
+// RAM-only and range-checked by the shared CLI engine.
+static void customLinkProcessCliRequest(const clFrame_t *frame)
+{
+    clCliRequest_t req;
+    if (!clCliParseRequest(frame, &req)) {
+        static const char badRequest[] = "BAD REQUEST";
+        customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, badRequest, sizeof(badRequest) - 1);
+        return;
+    }
+
+#if defined(USE_CLI)
+    cliEngineWorked = true;
+    switch (req.cmd) {
+    case CL_CLI_CMD_GET: {
+        const int written = cliGetSettingByName(req.args, cliStream.buf, sizeof(cliStream.buf));
+        if (written < 0) {
+            static const char notFound[] = "NOT FOUND";
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, notFound, sizeof(notFound) - 1);
+        } else {
+            customLinkCliStartSnapshot(req.reqId, CL_CLI_STATUS_OK, (uint16_t)written);
+        }
+        break;
+    }
+
+    case CL_CLI_CMD_SET: {
+        if (cliSetSettingByName(req.args)) {
+            // read back the new value for a request/response contract like
+            // MSP2_CLI_SETTING: strip "= value", trim, query by bare name
+            char nameOnly[CUSTOM_LINK_MAX_PAYLOAD];
+            strncpy(nameOnly, req.args, sizeof(nameOnly) - 1);
+            nameOnly[sizeof(nameOnly) - 1] = '\0';
+            char *eq = strchr(nameOnly, '=');
+            if (eq != NULL) {
+                while (eq > nameOnly && *(eq - 1) == ' ') {
+                    eq--;
+                }
+                *eq = '\0';
+                const int written = cliGetSettingByName(nameOnly, cliStream.buf, sizeof(cliStream.buf));
+                if (written >= 0) {
+                    customLinkCliStartSnapshot(req.reqId, CL_CLI_STATUS_OK, (uint16_t)written);
+                    break;
+                }
+            }
+            // set succeeded but the readback failed: acknowledge with the request
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_OK, req.args, (uint16_t)strlen(req.args));
+        } else {
+            static const char setFailed[] = "SET FAILED";
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, setFailed, sizeof(setFailed) - 1);
+        }
+        break;
+    }
+
+    case CL_CLI_CMD_INFO: {
+        // minimal probe window: unknown names return -1 before stream state
+        // is touched; the probe also reports the full response length
+        char probe[1];
+        int totalLen = 0;
+        if (req.args[0] == '\0' ||
+            cliGetSettingInfoByName(req.args, 0, probe, sizeof(probe), &totalLen) < 0) {
+            static const char notFound[] = "NOT FOUND";
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, notFound, sizeof(notFound) - 1);
+        } else {
+            customLinkCliStartInfo(req.reqId, req.args);
+        }
+        break;
+    }
+    }
+#else
+    // no settings table on this build: fail loudly so a host never mistakes
+    // silence for success
+    static const char noCli[] = "NO CLI";
+    customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, noCli, sizeof(noCli) - 1);
+#endif
+}
+
 
 static int16_t clScaleFloat(float v, float scale)
 {
@@ -322,6 +534,10 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
         }
         break;
     }
+
+    case CUSTOM_LINK_MSG_HOST_CLI:
+        customLinkProcessCliRequest(frame);
+        break;
 
 #ifdef SIMULATOR
     case CUSTOM_LINK_MSG_HOST_IMU: {
@@ -531,9 +747,17 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
     }
 #endif
 
+    // CLI read/write response chunks (0x15), paced one per task period
+    customLinkCliPump();
+
     // 串口写路径的耗时抖动不应抬调度器对本任务的时间预算需求
-    //（8 kHz gyro 节奏下凑不出大预算窗口，会饥饿降频）。
-    schedulerIgnoreTaskExecTime();
+    //（8 kHz gyro 节奏下凑不出大预算窗口，会饥饿降频）。例外：CLI 设置
+    // 引擎的耗时（查表扫描/PG 拷贝，几十 µs 量级突发）必须如实计入预算，
+    // 否则调度器以为本任务近乎零耗时、贴着 gyro 死线排入，而统计看不见。
+    if (!cliEngineWorked) {
+        schedulerIgnoreTaskExecTime();
+    }
+    cliEngineWorked = false;
 }
 
 // 温度来源优先级：气压计内部温度（DPS310 等用于补偿的实测值）> IMU 温度 >

@@ -152,6 +152,57 @@ void clParserProcessByte(clParser_t *parser, uint8_t c, timeUs_t nowUs, clFrameH
     }
 }
 
+bool clCliParseRequest(const clFrame_t *frame, clCliRequest_t *out)
+{
+    if (frame->len >= 2) {
+        out->reqId = (uint16_t)frame->payload[0] | ((uint16_t)frame->payload[1] << 8);
+    } else {
+        out->reqId = 0;
+    }
+    if (frame->msgId != CUSTOM_LINK_MSG_HOST_CLI || frame->len < 4) {
+        return false;
+    }
+    clPayloadCliReq_t req;
+    memcpy(&req, frame->payload, sizeof(req));
+
+    // the terminator must sit inside the received bytes; trailing garbage
+    // past it is ignored, not rejected (forward-compatible payloads)
+    const uint8_t argsLen = frame->len - 4;
+    if (memchr(req.args, '\0', argsLen) == NULL) {
+        return false;
+    }
+    if (req.cmd > CL_CLI_CMD_INFO || req.reserved != 0) {
+        return false;
+    }
+
+    out->cmd = req.cmd;
+    memcpy(out->args, req.args, argsLen);
+    out->args[argsLen] = '\0';
+    return true;
+}
+
+uint8_t clCliResponseHeader(clPayloadCliResp_t *resp, uint16_t reqId,
+    uint16_t totalLen, uint16_t offset, uint8_t status, uint8_t n)
+{
+    uint32_t remaining = (uint32_t)totalLen - (uint32_t)offset;
+    if (totalLen < offset) {
+        remaining = 0;
+    }
+    if (n > CL_CLI_MAX_DATA) {
+        n = CL_CLI_MAX_DATA;
+    }
+    if ((uint32_t)n > remaining) {
+        n = (uint8_t)remaining;
+    }
+
+    resp->req_id = reqId;
+    resp->total_len = totalLen;
+    resp->offset = offset;
+    resp->status = status;
+    resp->flags = ((uint32_t)offset + n < (uint32_t)totalLen) ? CL_CLI_FLAG_MORE : 0;
+    return sizeof(clPayloadCliResp_t) - CL_CLI_MAX_DATA + n;
+}
+
 void clControlReset(clControlState_t *state)
 {
     memset(state, 0, sizeof(*state));

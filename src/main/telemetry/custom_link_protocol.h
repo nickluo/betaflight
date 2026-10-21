@@ -58,10 +58,12 @@ typedef enum {
     CUSTOM_LINK_MSG_FC_SLOW        = 0x12,   // 10 Hz battery/gps/flight mode
     CUSTOM_LINK_MSG_FC_MOTORS      = 0x13,   // 200 Hz mixer motor outputs (SITL)
     CUSTOM_LINK_MSG_FC_ODOMETRY    = 0x14,   // 100 Hz ARM-relative ENU odometry
+    CUSTOM_LINK_MSG_FC_CLI         = 0x15,   // CLI setting read/write response (chunked)
     CUSTOM_LINK_MSG_HOST_CONTROL   = 0x20,   // 100-200 Hz control setpoints
     CUSTOM_LINK_MSG_HOST_IMU       = 0x21,   // >=200 Hz simulator IMU injection (SITL)
     CUSTOM_LINK_MSG_HOST_ENV       = 0x22,   // 10-50 Hz simulator baro/GPS injection (SITL)
     CUSTOM_LINK_MSG_HOST_RC        = 0x23,   // 50 Hz simulator RC channel injection (SITL)
+    CUSTOM_LINK_MSG_HOST_CLI       = 0x24,   // CLI setting read/write request
     CUSTOM_LINK_MSG_HOST_TIMESYNC  = 0x30,   // time sync request (u64 T1)
     CUSTOM_LINK_MSG_FC_TIMESYNC    = 0x31,   // time sync response (T1, T2, T3)
 } customLinkMsgId_e;
@@ -160,6 +162,55 @@ typedef struct __attribute__((packed)) {
 } clPayloadTimesyncResp_t;
 
 //
+// CLI setting read/write channel (0x24 up / 0x15 down). The host issues get/
+// set/info commands against the Betaflight settings table - the same engine
+// the serial CLI and MSP2_CLI_SETTING use - without opening a CLI session on
+// the port. Writes are RAM-only (CLI "set" without "save") and range-checked
+// exactly like the CLI; there is deliberately no armed guard, matching MSP.
+//
+// Responses longer than one frame are streamed as consecutive 0x15 chunks
+// carrying offset/total_len so the host can reassemble and detect gaps; a
+// new request replaces any response still in flight (last request wins).
+//
+
+#define CL_CLI_CMD_GET              0   // args = setting name -> "name = value"
+#define CL_CLI_CMD_SET              1   // args = "name = value" -> readback on success
+#define CL_CLI_CMD_INFO             2   // args = setting name -> metadata (type/min/max/values/default)
+
+#define CL_CLI_STATUS_OK            0   // data[] carries response bytes (see flags)
+#define CL_CLI_STATUS_ERR           1   // data[] carries a short error text
+
+#define CL_CLI_FLAG_MORE            0x01    // more chunks follow for this req_id
+
+#define CL_CLI_MAX_ARGS             (CUSTOM_LINK_MAX_PAYLOAD - 4)
+#define CL_CLI_MAX_DATA             (CUSTOM_LINK_MAX_PAYLOAD - 8)
+
+// 0x24 - host -> FC CLI request (4..64 bytes). args must be NUL-terminated
+// within the frame payload; bytes after the terminator are ignored.
+typedef struct __attribute__((packed)) {
+    uint16_t req_id;            // echoed in every 0x15 response frame
+    uint8_t cmd;                // CL_CLI_CMD_*
+    uint8_t reserved;           // must be 0 (forward compatibility)
+    char args[CUSTOM_LINK_MAX_PAYLOAD - 4];
+} clPayloadCliReq_t;
+
+// 0x15 - FC -> host CLI response (8..64 bytes)
+typedef struct __attribute__((packed)) {
+    uint16_t req_id;            // from the request
+    uint16_t total_len;         // length of the complete response text
+    uint16_t offset;            // offset of data[0] within the complete text
+    uint8_t status;             // CL_CLI_STATUS_*
+    uint8_t flags;              // CL_CLI_FLAG_* (MORE clear on the final chunk)
+    char data[CUSTOM_LINK_MAX_PAYLOAD - 8];
+} clPayloadCliResp_t;
+
+typedef struct {
+    uint16_t reqId;
+    uint8_t cmd;
+    char args[CUSTOM_LINK_MAX_PAYLOAD - 4 + 1];  // NUL-terminated copy
+} clCliRequest_t;
+
+//
 // Simulation frames (SITL). A simulator acting as the host replaces the real
 // sensors: 0x21/0x22/0x23 feed the virtual sensor drivers (the same path the
 // UDP FDM bridge uses on SITL targets) and 0x13 returns the mixer motor
@@ -233,6 +284,22 @@ uint16_t clCrc(const clFrame_t *frame);
 // Serializes one frame into out; returns the total frame size or 0 on error
 // (payload too large or output buffer too small).
 uint8_t clEncodeFrame(uint8_t msgId, uint8_t seq, const void *payload, uint8_t payloadLen, uint8_t *out, uint8_t outSize);
+
+//
+// CLI request/response helpers (pure logic, time-independent)
+//
+
+// Validates a HOST_CLI frame into a request. Fills out->reqId whenever the
+// payload is at least two bytes (so a caller can still NAK a malformed
+// request); returns false on bad length, missing terminator, unknown cmd or
+// nonzero reserved.
+bool clCliParseRequest(const clFrame_t *frame, clCliRequest_t *out);
+
+// Sizes and fills a response chunk header covering args[offset, offset+n) of
+// a total_len-byte response; returns the 0x15 payload length (8 + n). n is
+// clamped to CL_CLI_MAX_DATA and to the remaining bytes.
+uint8_t clCliResponseHeader(clPayloadCliResp_t *resp, uint16_t reqId,
+    uint16_t totalLen, uint16_t offset, uint8_t status, uint8_t n);
 
 //
 // Parser state machine

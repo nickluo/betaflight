@@ -87,6 +87,29 @@ the pose into a fixed frame with X along the initial ARM heading, Y left and
 Z up. Internal flight-navigation/estimator coordinates stay ENU. GPS recovery
 keeps both the original position and heading; re-arming captures new ones.
 
+## Custom-link CLI read/write channel
+
+Custom firmware builds with `USE_CUSTOM_LINK` add a request/response channel
+for the Betaflight settings table over the companion link, without opening a
+serial CLI session: `0x24 HOST_CLI` carries one command (`get`, `set` or
+`info`, plus a host-chosen `req_id`), `0x15 FC_CLI` streams the reply back in
+up-to-56-byte chunks annotated with `offset`/`total_len`/`more` so the host
+reassembles losslessly and detects gaps. `get`/`set` map onto the exact
+engine the serial CLI and `MSP2_CLI_SETTING` use - same name matching, same
+range validation, same `"name = value"` response text - while `info` returns
+the metadata block (`pgn`, `type`, min/max or lookup `values`, `default`)
+windowed by offset, so long lookup tables page through any transport.
+
+Writes are RAM-only (the CLI `set` without `save`) and there is no armed
+guard, matching MSP: a host can retune in flight, and values revert on
+reboot unless persisted through another channel. Responses are paced at one
+chunk per 200 Hz task period and never displace telemetry frames; a new
+request replaces any response still in flight (last request wins), and a
+malformed frame is NAKed with `BAD REQUEST` echoing whatever `req_id` could
+be salvaged. `SET FAILED` / `NOT FOUND` keep failures explicit. See
+[the protocol definition](src/main/telemetry/custom_link_protocol.h) and
+`src/test/sitl/sitl_custom_link_cli_test.py` for the end-to-end contract.
+
 ### AirSim POS HOLD odometry regression
 
 The `0x10` and `0x14` attitude/ARM yaw both use **CCW-positive mathematical

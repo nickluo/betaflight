@@ -1,0 +1,75 @@
+# Custom-link HARDWARE bring-up, not a flight-ready tune.
+# For this fork with USE_CUSTOM_LINK and USE_GPS_RESCUE.
+# Remove props. Disconnect companion mission/control processes before applying.
+# First back up: version, status, dump all, diff all.
+# Read README.md beside this file before enabling any optional section.
+# No defaults, PID/filter changes, automatic binding, calibration or save.
+
+# Portable baseline. 100 Hz companion commands must arrive within 50 ms.
+set custom_link_watchdog_ms = 50
+set custom_link_motors_stream = OFF
+set gps_rescue_allow_arming_without_fix = OFF
+
+# Preserve board-specific receiver, motor resources and existing failsafe policy.
+# Optional examples below are COMMENTS, not an automatically applied profile.
+
+# LINK UART EXAMPLE ONLY: use only if UART3 is wired to the companion.
+# This REPLACES the UART function mask; never share with RX, GPS or MSP.
+# Baud fields are MSP, GPS, TELEMETRY (used by custom link), BLACKBOX.
+# serial UART3 2097152 115200 57600 921600 115200
+
+# GPS EXAMPLE ONLY: use only for a real UBLOX receiver on a confirmed free UART.
+# Replace UART4 with the actual GPS UART and use that receiver's baud/provider.
+# feature GPS
+# serial UART4 2 115200 57600 0 115200
+# set gps_provider = UBLOX
+
+# RADIO EXAMPLE ONLY: verify received channel order and ALL existing AUX rules.
+# These slots overwrite rules 0..6. Do not remove PREARM or other safety rules.
+# CH1..4=AETR, CH5=AUX1 modes, CH7=AUX3 ARM, CH8=AUX4 bridge trigger.
+# CH8 trigger needs bridge channel_trigger=7 (ZERO-BASED); it is not an FC mode.
+# map AETR1234
+# aux 0 0 2 1700 2100 0 0
+# aux 1 1 0 1100 1300 0 0
+# aux 2 2 0 1300 1500 0 0
+# aux 3 3 0 1500 1900 0 0
+# aux 4 11 0 1700 1900 0 0
+# Slot 5 OFFBOARD example is deliberately NOT supplied: bridge owns mode requests.
+# aux 6 46 0 1900 2100 0 0
+# Keep AUX2 LOW and audit any existing permanent mode ID 58 (held OFFBOARD).
+# Do not add the SITL AUX6/AUTOPILOT test waypoint rule (permanent mode ID 56).
+
+# HARDWARE-DEPENDENT: inspect/tune on the real craft, not from simulation.
+# custom_link_rate_limit_dps / custom_link_angle_limit_deg:
+#   0 disables each clamp. Existing values are preserved, not certified.
+# ap_hover_throttle / ap_throttle_min / ap_throttle_max:
+#   measure the real propulsion system; the SITL 1275 value is NOT portable.
+# ap_position_* / ap_altitude_* / ap_max_angle / ap_nav_*:
+#   preserve the real craft tune, then validate manually before autonomous use.
+# gps_rescue_*:
+#   set return altitude, clearance and speeds for the real site/craft.
+#   The branch's 8 m default return altitude is NOT a safe universal value.
+# failsafe_procedure:
+#   preserve the existing policy until real RX/link-loss tests are complete.
+
+# Readbacks: inspect the output and stop on ANY ###ERROR / unknown setting.
+version
+status
+feature
+serial
+map
+aux
+get custom_link_
+get gps_
+get ap_
+get failsafe_
+get poshold_position_source
+get trust_mag
+get mag_declination
+get imu_dcm_
+get small_angle
+get pwr_on_arm_grace
+
+# Deliberately no automatic persistence/reboot.
+# Only after readback, channel checks and hardware review, enter manually:
+# save

@@ -89,6 +89,11 @@ keeps both the original position and heading; re-arming captures new ones.
 
 ## Custom-link CLI read/write channel
 
+For hardware bring-up, see the [hardware checklist](src/test/hardware/README.md)
+and [conservative CLI baseline](src/test/hardware/custom_link_hardware.cli).
+They deliberately exclude simulation PID/GPS/arming overrides and leave UART,
+receiver mapping and flight tuning subject to actual hardware verification.
+
 Custom firmware builds with `USE_CUSTOM_LINK` add a request/response channel
 for the Betaflight settings table over the companion link, without opening a
 serial CLI session: `0x24 HOST_CLI` carries one command (`get`, `set` or

@@ -262,7 +262,12 @@ void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
         && state->pilotModes != pilotModes;
     const bool pilotDisarm = pilotModesValid && state->havePilotModes
         && state->pilotArm && !pilotArm;
-    const bool apiTakeover = (state->authority == CL_AUTHORITY_API || newApiRequest) && modeChanged;
+    // API 权限锁存（apiBlocked）仅在主机**正在控制**（authority==API）时
+    // 飞手改变飞行模式才触发：那是一次真实的接管干预。请求挂起期间
+    //（尚未取得权限）飞手扫拨盘路过 ANGLE 等档位不应锁死主机——主机
+    // 只发一次请求即应可在条件满足时接管；真正的飞手夺权信号是
+    // OFFBOARD 开关关闭（rcTakeover）与飞手上锁（pilotDisarm）。
+    const bool apiTakeover = state->authority == CL_AUTHORITY_API && modeChanged;
     const bool rcTakeover = state->authority == CL_AUTHORITY_RC && !offboardSwitch;
     if (apiTakeover || rcTakeover || rescueSwitch) {
         state->apiBlocked = true;

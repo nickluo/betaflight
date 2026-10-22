@@ -616,7 +616,8 @@ static void crsfFrameFlightMode(sbuf_t *dst)
     // Acro is the default mode
     const char *flightMode = "ACRO";
 
-    // Flight modes in decreasing order of importance
+    // Flight modes in decreasing order of importance. Hold modes also enable
+    // ANGLE_MODE for self-levelling, so report them ahead of ANGLE_MODE.
     if (FLIGHT_MODE(FAILSAFE_MODE) || IS_RC_MODE_ACTIVE(BOXFAILSAFE)) {
         flightMode = "!FS!";
     } else if (FLIGHT_MODE(GPS_RESCUE_MODE) || IS_RC_MODE_ACTIVE(BOXGPSRESCUE) || flightPlanNavIsRescuePlanActive()) {
@@ -625,12 +626,12 @@ static void crsfFrameFlightMode(sbuf_t *dst)
         flightMode = "OFFB";
     } else if (FLIGHT_MODE(PASSTHRU_MODE)) {
         flightMode = "PASS";
-    } else if (FLIGHT_MODE(ANGLE_MODE)) {
-        flightMode = "ANGL";
     } else if (FLIGHT_MODE(POS_HOLD_MODE)) {
         flightMode = "POSH";
     } else if (FLIGHT_MODE(ALT_HOLD_MODE)) {
         flightMode = "ALTH";
+    } else if (FLIGHT_MODE(ANGLE_MODE)) {
+        flightMode = "ANGL";
     } else if (FLIGHT_MODE(HORIZON_MODE)) {
         flightMode = "HOR";
     } else if (FLIGHT_MODE(CHIRP_MODE)) {

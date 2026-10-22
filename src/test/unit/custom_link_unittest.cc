@@ -789,8 +789,10 @@ TEST_F(CustomLinkAuthorityTest, ExplicitRcSwitchKeepsPriorityOverOrdinaryDialCha
     EXPECT_TRUE(clControlModeRequested(&state));
 }
 
-TEST_F(CustomLinkAuthorityTest, PilotModeChangeWinsEvenWhenNewApiRequestArrivesInSameCycle)
+TEST_F(CustomLinkAuthorityTest, PendingRequestSurvivesConcurrentPilotModeChange)
 {
+    // 方案 B：请求挂起/主机未控制时，飞手改变飞行模式不再锁死主机——
+    // 同周期的请求与拨盘变化，请求方胜（旧语义是飞手胜并锁存）。
     command();
     update(0);
     update(1);
@@ -798,9 +800,39 @@ TEST_F(CustomLinkAuthorityTest, PilotModeChangeWinsEvenWhenNewApiRequestArrivesI
     update(1);
     command();
     update(2);
-    EXPECT_FALSE(clControlModeRequested(&state));
+    EXPECT_TRUE(clControlModeRequested(&state));
+    EXPECT_FALSE(state.apiBlocked);
+    EXPECT_EQ(state.authority, CL_AUTHORITY_API);
+}
+
+TEST_F(CustomLinkAuthorityTest, DialSweepWhileRequestPendingDoesNotLatch)
+{
+    // 用户报障场景：首次请求挂起、主机尚未控制（流未新鲜），飞手扫拨盘
+    // 路过 ANGLE 档。不得锁存；链路就绪后一次请求即完成接管。
+    command();
+    update(1, false, false, false, true, false);  // 请求与扫档同周期，fresh=false
+    EXPECT_FALSE(state.apiBlocked);
+    update(1);                                    // 链路就绪
+    EXPECT_EQ(state.authority, CL_AUTHORITY_API);
+    EXPECT_TRUE(clControlModeRequested(&state));
+}
+
+TEST_F(CustomLinkAuthorityTest, ActiveApiControlStillLatchesOnPilotModeChange)
+{
+    // 保留的防护：主机**正在控制**时飞手改模式 = 干预，锁存直至主机
+    // 重新请求（mode_req 新边沿）。
+    command();
+    update(0);
+    EXPECT_EQ(state.authority, CL_AUTHORITY_API);
+    update(1);                                    // 控制中飞手改模式
     EXPECT_TRUE(state.apiBlocked);
-    EXPECT_TRUE(clControlHostArmActive(&state, true, false));
+    EXPECT_FALSE(clControlModeRequested(&state));
+    command(0);
+    update(1);
+    command();                                    // 重新请求
+    update(1);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    EXPECT_FALSE(state.apiBlocked);
 }
 
 TEST_F(CustomLinkAuthorityTest, NewApiSessionDoesNotRetainPilotArmContinuity)

@@ -306,6 +306,70 @@ TEST(TelemetryCrsfTest, TestFlightMode)
     EXPECT_EQ(crfsCrc(frame, frameLen), frame[7]);
 }
 
+class TelemetryCrsfFlightModeTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        savedFlightModeFlags = flightModeFlags;
+        savedArmingFlags = armingFlags;
+        savedAirMode = airMode;
+        flightModeFlags = 0;
+        armingFlags = ARMED;
+        airMode = false;
+    }
+
+    void TearDown() override
+    {
+        flightModeFlags = savedFlightModeFlags;
+        armingFlags = savedArmingFlags;
+        airMode = savedAirMode;
+    }
+
+    uint16_t savedFlightModeFlags;
+    uint8_t savedArmingFlags;
+    bool savedAirMode;
+};
+
+TEST_F(TelemetryCrsfFlightModeTest, HoldModesTakePriorityOverSelfLeveling)
+{
+    const struct {
+        uint16_t modes;
+        const char *name;
+    } cases[] = {
+        {ANGLE_MODE, "ANGL"},
+        {ALT_HOLD_MODE, "ALTH"},
+        {ANGLE_MODE | ALT_HOLD_MODE, "ALTH"},
+        {ANGLE_MODE | POS_HOLD_MODE, "POSH"},
+        {ANGLE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE, "POSH"},
+        {ANGLE_MODE | ALT_HOLD_MODE | OFFBOARD_MODE, "OFFB"},
+        {ANGLE_MODE | ALT_HOLD_MODE | PASSTHRU_MODE, "PASS"},
+        {ANGLE_MODE | ALT_HOLD_MODE | GPS_RESCUE_MODE, "RTH"},
+        {ANGLE_MODE | ALT_HOLD_MODE | FAILSAFE_MODE, "!FS!"},
+    };
+
+    for (const auto &testCase : cases) {
+        SCOPED_TRACE(testCase.modes);
+        flightModeFlags = testCase.modes;
+        uint8_t frame[CRSF_FRAME_SIZE_MAX];
+        const int frameLen = getCrsfFrame(frame, CRSF_FRAMETYPE_FLIGHT_MODE);
+        EXPECT_EQ(strlen(testCase.name) + 1 + FRAME_HEADER_FOOTER_LEN, frameLen);
+        EXPECT_EQ(CRSF_FRAMETYPE_FLIGHT_MODE, frame[2]);
+        EXPECT_STREQ(testCase.name, reinterpret_cast<const char *>(&frame[3]));
+        EXPECT_EQ(crfsCrc(frame, frameLen), frame[frameLen - 1]);
+    }
+}
+
+TEST_F(TelemetryCrsfFlightModeTest, DisarmedHoldModeRetainsArmingIndicator)
+{
+    flightModeFlags = ANGLE_MODE | ALT_HOLD_MODE;
+    armingFlags = 0;
+    uint8_t frame[CRSF_FRAME_SIZE_MAX];
+    const int frameLen = getCrsfFrame(frame, CRSF_FRAMETYPE_FLIGHT_MODE);
+    EXPECT_EQ(6 + FRAME_HEADER_FOOTER_LEN, frameLen);
+    EXPECT_STREQ("ALTH*", reinterpret_cast<const char *>(&frame[3]));
+    EXPECT_EQ(crfsCrc(frame, frameLen), frame[frameLen - 1]);
+}
+
 // STUBS
 
 extern "C" {

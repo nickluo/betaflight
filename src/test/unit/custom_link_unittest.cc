@@ -486,7 +486,7 @@ TEST(CustomLinkCliTest, TestCliRequestValidation)
 
     // unknown cmd
     frame.len = 4 + 4;
-    memcpy(frame.payload, "\x11\x22\x05\x00" "foo\x00", 8);
+    memcpy(frame.payload, "\x11\x22\x06\x00" "foo\x00", 8);
     EXPECT_FALSE(clCliParseRequest(&frame, &req));
 
     // bind_rx: empty args (bare NUL) accepted
@@ -502,6 +502,11 @@ TEST(CustomLinkCliTest, TestCliRequestValidation)
     EXPECT_TRUE(clCliParseRequest(&frame, &req));
     EXPECT_EQ(req.cmd, CL_CLI_CMD_SAVE);
     EXPECT_STREQ(req.args, "noreboot");
+    frame.len = 6;
+    memcpy(frame.payload, "\x11\x22\x05\x00" "0\x00", 6);
+    EXPECT_TRUE(clCliParseRequest(&frame, &req));
+    EXPECT_EQ(req.cmd, CL_CLI_CMD_APPLY_PID);
+    EXPECT_STREQ(req.args, "0");
     frame.len = 4 + 8;                       // same bytes, terminator outside
     memcpy(frame.payload, "\x11\x22\x04\x00" "noreboot", 12);
     EXPECT_FALSE(clCliParseRequest(&frame, &req));
@@ -522,6 +527,22 @@ TEST(CustomLinkCliTest, TestCliRequestValidation)
     frame.len = 8;
     memcpy(frame.payload, "\x11\x22\x00\x00" "foo\x00", 8);
     EXPECT_FALSE(clCliParseRequest(&frame, &req));
+}
+
+TEST(CustomLinkCliTest, PidApplyRequiresIdleAuthorizedOutputWhileArmed)
+{
+    float command[3] = {0, 0, 0};
+    float measured[3] = {0, 0, 0};
+    EXPECT_TRUE(clPidApplyIsSafe(false, false, false, 1.0f, command, measured));
+    EXPECT_TRUE(clPidApplyIsSafe(true, true, true, 0.0f, command, measured));
+    EXPECT_FALSE(clPidApplyIsSafe(true, false, true, 0.0f, command, measured));
+    EXPECT_FALSE(clPidApplyIsSafe(true, true, false, 0.0f, command, measured));
+    EXPECT_FALSE(clPidApplyIsSafe(true, true, true, 0.01f, command, measured));
+    command[0] = 1.0f;
+    EXPECT_FALSE(clPidApplyIsSafe(true, true, true, 0.0f, command, measured));
+    command[0] = 0;
+    measured[2] = 6;
+    EXPECT_FALSE(clPidApplyIsSafe(true, true, true, 0.0f, command, measured));
 }
 
 TEST(CustomLinkCliTest, TestCliResponseHeaderChunking)

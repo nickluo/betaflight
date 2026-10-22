@@ -178,6 +178,7 @@ typedef struct __attribute__((packed)) {
 #define CL_CLI_CMD_INFO             2   // args = setting name -> metadata (type/min/max/values/default)
 #define CL_CLI_CMD_BIND_RX          3   // no args -> "binding..." (same engine as CLI bind_rx)
 #define CL_CLI_CMD_SAVE             4   // no args (or "noreboot") -> "saving...": persist, then reboot
+#define CL_CLI_CMD_APPLY_PID        5   // "check" -> profile; "<index>" -> apply RAM PID at zero output
 
 #define CL_CLI_STATUS_OK            0   // data[] carries response bytes (see flags)
 #define CL_CLI_STATUS_ERR           1   // data[] carries a short error text
@@ -296,6 +297,8 @@ uint8_t clEncodeFrame(uint8_t msgId, uint8_t seq, const void *payload, uint8_t p
 // request); returns false on bad length, missing terminator, unknown cmd or
 // nonzero reserved.
 bool clCliParseRequest(const clFrame_t *frame, clCliRequest_t *out);
+bool clPidApplyIsSafe(bool armed, bool offboard, bool fresh, float throttle,
+    const volatile float commandedRates[3], const float measuredRates[3]);
 
 // Sizes and fills a response chunk header covering args[offset, offset+n) of
 // a total_len-byte response; returns the 0x15 payload length (8 + n). n is

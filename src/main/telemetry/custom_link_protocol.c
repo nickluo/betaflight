@@ -20,6 +20,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 #include <string.h>
 
 #include "platform.h"
@@ -152,6 +153,23 @@ void clParserProcessByte(clParser_t *parser, uint8_t c, timeUs_t nowUs, clFrameH
     }
 }
 
+bool clPidApplyIsSafe(bool armed, bool offboard, bool fresh, float throttle,
+    const volatile float commandedRates[3], const float measuredRates[3])
+{
+    if (!armed) {
+        return true;
+    }
+    if (!offboard || !fresh || throttle != 0.0f) {
+        return false;
+    }
+    for (unsigned axis = 0; axis < 3; axis++) {
+        if (!(fabsf(commandedRates[axis]) < 0.01f && fabsf(measuredRates[axis]) < 5.0f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool clCliParseRequest(const clFrame_t *frame, clCliRequest_t *out)
 {
     if (frame->len >= 2) {
@@ -171,7 +189,7 @@ bool clCliParseRequest(const clFrame_t *frame, clCliRequest_t *out)
     if (memchr(req.args, '\0', argsLen) == NULL) {
         return false;
     }
-    if (req.cmd > CL_CLI_CMD_SAVE || req.reserved != 0) {
+    if (req.cmd > CL_CLI_CMD_APPLY_PID || req.reserved != 0) {
         return false;
     }
 

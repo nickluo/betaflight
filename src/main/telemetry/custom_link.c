@@ -48,6 +48,8 @@
 #include "flight/failsafe.h"
 #include "flight/imu.h"
 #include "flight/mixer.h"
+#include "flight/pid.h"
+#include "flight/pid_init.h"
 #include "flight/position_estimator.h"
 
 #include "io/gps.h"
@@ -395,6 +397,28 @@ static void customLinkProcessCliRequest(const clFrame_t *frame)
         if (ARMING_FLAG(ARMED)) {
             static const char armedErr[] = "ARMED";
             customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, armedErr, sizeof(armedErr) - 1);
+            break;
+        }
+        case CL_CLI_CMD_APPLY_PID: {
+            const uint8_t profile = getCurrentPidProfileIndex();
+            if (strcmp(req.args, "check") != 0) {
+                if (strlen(req.args) != 1 || req.args[0] != '0' + profile) {
+                    static const char wrongProfile[] = "PID PROFILE MISMATCH";
+                    customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, wrongProfile, sizeof(wrongProfile) - 1);
+                    break;
+                }
+                if (!clPidApplyIsSafe(ARMING_FLAG(ARMED), FLIGHT_MODE(OFFBOARD_MODE),
+                    customLinkIsControlFresh(), cachedThrottle, cachedRate, gyro.gyroADCf)) {
+                    static const char busy[] = "PID APPLY REQUIRES ZERO OUTPUT";
+                    customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_ERR, busy, sizeof(busy) - 1);
+                    break;
+                }
+                pidInitConfig(currentPidProfile);
+                pidResetIterm();
+            }
+            char response[] = "PID PROFILE 0";
+            response[sizeof(response) - 2] = '0' + profile;
+            customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_OK, response, sizeof(response) - 1);
             break;
         }
         static const char saving[] = "saving...";

@@ -115,6 +115,16 @@ be salvaged. `SET FAILED` / `NOT FOUND` keep failures explicit. See
 [the protocol definition](src/main/telemetry/custom_link_protocol.h) and
 `src/test/sitl/sitl_custom_link_cli_test.py` for the end-to-end contract.
 
+CLI command `5` (`APPLY_PID`) explicitly refreshes the current profile's runtime
+PID coefficients and resets I-term without writing flash. `args="check"` reports
+`PID PROFILE <index>` without applying; `args="<index>"` must match the active
+profile. While armed, application requires fresh OFFBOARD authority, zero throttle,
+near-zero commanded rates and measured rates below 5 deg/s. Other states are rejected.
+GET/SET semantics and existing command numbers are unchanged. See
+[the disarmed protocol regression](src/test/sitl/sitl_custom_link_pid_test.py).
+For rate PID gains, ordinary SET updates the profile storage only; a successful
+readback must not be mistaken for a refresh of the active runtime coefficients.
+
 ### AirSim POS HOLD odometry regression
 
 The `0x10` and `0x14` attitude/ARM yaw both use **CCW-positive mathematical

@@ -142,7 +142,7 @@ typedef struct __attribute__((packed)) {
     uint64_t host_ts_us;        // host monotonic timestamp at send time
     uint16_t cmd_seq;           // command sequence number
     uint8_t arm;                // 0 = request disarm, 1 = request arm
-    uint8_t mode_req;           // 0 = manual/rate, 1 = angle, 2 = offboard override
+    uint8_t mode_req;           // 0 manual, 1 reserved, 2 offboard rates, 3 offboard ANGLE (roll/pitch deg, yaw deg/s)
     uint16_t throttle;          // throttle, us-style 1000-2000 (clamped)
     int16_t rate_x10[3];        // roll/pitch/yaw rate targets, 0.1 deg/s,
                                 // in the same frame as the 0x10 gyro: roll

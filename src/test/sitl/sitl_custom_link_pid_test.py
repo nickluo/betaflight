@@ -43,6 +43,7 @@ def main():
                     return text.decode()
 
                 assert request(5, "check") == "PID PROFILE 0"
+                assert request(5, "angle") == "ANGLE OFFBOARD 1"
                 original = request(0, "p_roll")
                 gain = int(original.split(" = ")[1])
                 assert request(1, f"p_roll = {gain + 1}") == f"p_roll = {gain + 1}"

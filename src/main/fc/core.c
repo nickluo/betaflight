@@ -1068,7 +1068,11 @@ void processRxModes(timeUs_t currentTimeUs)
 #else
     const bool offboardHasPriority = false;
 #endif
-    if (!offboardHasPriority
+    bool hostAngleMode = false;
+#ifdef USE_CUSTOM_LINK
+    hostAngleMode = offboardHasPriority && customLinkAngleRequested();
+#endif
+    if ((hostAngleMode || (!offboardHasPriority
         && (IS_RC_MODE_ACTIVE(BOXANGLE)
         || failsafeIsActive()
 #ifdef USE_ALTITUDE_HOLD
@@ -1077,7 +1081,7 @@ void processRxModes(timeUs_t currentTimeUs)
 #ifdef USE_POSITION_HOLD
         || FLIGHT_MODE(POS_HOLD_MODE)
 #endif
-        ) && (sensors(SENSOR_ACC))) {
+        ))) && sensors(SENSOR_ACC)) {
         // bumpless transfer to Level mode
         canUseHorizonMode = false;
 

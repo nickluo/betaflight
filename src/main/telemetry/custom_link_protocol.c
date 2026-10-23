@@ -243,7 +243,7 @@ clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, u
     }
 
     state->arm = cmd.arm ? 1 : 0;
-    if (cmd.mode_req == 2 && state->modeReq != 2) {
+    if ((cmd.mode_req == 2 || cmd.mode_req == 3) && cmd.mode_req != state->modeReq) {
         state->apiRequestPending = true;
     }
     state->modeReq = cmd.mode_req;
@@ -307,7 +307,7 @@ void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
     }
     if (fresh && !rescueSwitch && !state->pilotDisarmed && offboardSwitch) {
         state->authority = CL_AUTHORITY_RC;
-    } else if (fresh && !rescueSwitch && !state->apiBlocked && state->modeReq == 2) {
+    } else if (fresh && !rescueSwitch && !state->apiBlocked && (state->modeReq == 2 || state->modeReq == 3)) {
         state->authority = CL_AUTHORITY_API;
         state->handoverArm = false;
     } else {
@@ -318,7 +318,7 @@ void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
 bool clControlModeRequested(const clControlState_t *state)
 {
     return state->authority == CL_AUTHORITY_RC
-        || (state->authority == CL_AUTHORITY_API && state->modeReq == 2 && !state->apiBlocked);
+        || (state->authority == CL_AUTHORITY_API && (state->modeReq == 2 || state->modeReq == 3) && !state->apiBlocked);
 }
 
 bool clControlHostArmActive(const clControlState_t *state, bool armed, bool fresh)

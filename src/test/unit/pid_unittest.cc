@@ -24,6 +24,9 @@
 #include "gtest/gtest.h"
 #include "build/debug.h"
 
+bool simulatedCustomControl = false;
+bool simulatedCustomAngle = false;
+float simulatedAngleTarget[3] = { 0, 0, 0 };
 bool simulatedThrottleRaised = true;
 float simulatedSetpointRate[3] = { 0,0,0 };
 float simulatedPrevSetpointRate[3] = { 0,0,0 };
@@ -121,6 +124,10 @@ extern "C" {
         return maxRate;
     }
     void initRcProcessing(void) { }
+    bool customLinkHasControl(void) { return simulatedCustomControl; }
+    bool customLinkAngleRequested(void) { return simulatedCustomAngle; }
+    float customLinkGetRateSetpoint(int axis) { return simulatedSetpointRate[axis]; }
+    float customLinkGetAngleSetpoint(int axis) { return simulatedAngleTarget[axis]; }
 }
 
 pidProfile_t *pidProfile;
@@ -187,6 +194,7 @@ timeUs_t currentTestTime(void)
 
 void resetTest(void)
 {
+    simulatedCustomControl = simulatedCustomAngle = false;
     loopIter = 0;
     pidRuntime.tpaFactor = 1.0f;
     simulatedMotorMixRange = 0.0f;
@@ -449,6 +457,28 @@ TEST(pidControllerTest, testPidLevel)
     EXPECT_FLOAT_EQ(-231.55479, calculatedAngleSetpoint);
 }
 
+
+TEST(pidControllerTest, NativeAngleOffboardUsesDegreesRatherThanRcRateScaling)
+{
+    resetTest();
+    enableFlightMode(ANGLE_MODE);
+    simulatedCustomControl = simulatedCustomAngle = true;
+    simulatedAngleTarget[FD_ROLL] = 2.0f;
+    simulatedAngleTarget[FD_PITCH] = -2.0f;
+    rollAndPitchTrims_t trim = {{0, 0}};
+    for (int i = 0; i < 1000; i++) {
+        pidLevel(FD_ROLL, pidProfile, &trim, 0.0f, 0.0f);
+        pidLevel(FD_PITCH, pidProfile, &trim, 0.0f, 0.0f);
+    }
+    const float roll = pidLevel(FD_ROLL, pidProfile, &trim, 0.0f, 0.0f);
+    const float pitch = pidLevel(FD_PITCH, pidProfile, &trim, 0.0f, 0.0f);
+    EXPECT_GT(roll, 0.0f);
+    EXPECT_LT(pitch, 0.0f);
+    // Pilot rate scaling must not change a host target expressed in degrees.
+    EXPECT_NEAR(roll, pidLevel(FD_ROLL, pidProfile, &trim, 400.0f, 0.0f), 0.001f);
+    EXPECT_NEAR(pitch, pidLevel(FD_PITCH, pidProfile, &trim, -400.0f, 0.0f), 0.001f);
+    simulatedCustomControl = simulatedCustomAngle = false;
+}
 
 TEST(pidControllerTest, testPidHorizon)
 {

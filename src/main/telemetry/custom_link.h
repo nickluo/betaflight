@@ -60,6 +60,10 @@ bool customLinkHostArmActive(void);
 // Host rate setpoint for an axis in deg/s (0.1 deg/s protocol units scaled).
 float customLinkGetRateSetpoint(int axis);
 
+// Explicit native ANGLE variant (mode_req=3), retaining normal authority/watchdog gates.
+bool customLinkAngleRequested(void);
+float customLinkGetAngleSetpoint(int axis);
+
 // Host throttle in mixer units, 0.0 .. 1.0.
 float customLinkGetThrottle(void);
 

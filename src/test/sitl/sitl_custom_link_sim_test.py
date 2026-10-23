@@ -182,7 +182,7 @@ class Feed:
                 rx, ry, rz = (int(round(v * 10)) for v in c["rates"])
                 self._send(MSG_HOST_CONTROL, struct.pack(
                     "<QHBBH3h", int(time.monotonic() * 1e6) & 0xFFFFFFFFFFFFFFFF,
-                    0, c["arm"], 2, int(c["throttle"]), rx, ry, rz))
+                    0, c["arm"], c.get("mode", 2), int(c["throttle"]), rx, ry, rz))
 
             time.sleep(0.001)
 

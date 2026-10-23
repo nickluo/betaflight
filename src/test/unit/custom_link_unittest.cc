@@ -752,6 +752,30 @@ protected:
     }
 };
 
+TEST_F(CustomLinkAuthorityTest, AngleVariantUsesSameAuthorityTakeoverAndWatchdogGates)
+{
+    command(3);
+    update(1);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    EXPECT_EQ(state.authority, CL_AUTHORITY_API);
+    update(1, false, false, false, true, false);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    update(1);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    update(0);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    command(3);
+    update(0);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    command(0);
+    update(0);
+    command(3);
+    update(0);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    update(0, false, true);
+    EXPECT_FALSE(clControlModeRequested(&state));
+}
+
 TEST_F(CustomLinkAuthorityTest, ApiEntryDoesNotRequireOffboardSwitch)
 {
     command();

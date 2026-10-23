@@ -559,6 +559,7 @@ pid_unittest_SRC :=  \
 		$(USER_DIR)/pg/pg.c
 
 pid_unittest_DEFINES := \
+		USE_CUSTOM_LINK= \
 		USE_ITERM_RELAX= \
 		USE_RC_SMOOTHING_FILTER= \
 		USE_LAUNCH_CONTROL= \

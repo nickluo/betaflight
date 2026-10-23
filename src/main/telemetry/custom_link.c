@@ -401,6 +401,15 @@ static void customLinkProcessCliRequest(const clFrame_t *frame)
         }
         case CL_CLI_CMD_APPLY_PID: {
             const uint8_t profile = getCurrentPidProfileIndex();
+            if (strcmp(req.args, "angle") == 0) {
+#ifdef USE_ACC
+                static const char capability[] = "ANGLE OFFBOARD 1";
+#else
+                static const char capability[] = "ANGLE NOT SUPPORTED";
+#endif
+                customLinkCliStartBuffered(req.reqId, CL_CLI_STATUS_OK, capability, sizeof(capability) - 1);
+                break;
+            }
             if (strcmp(req.args, "check") != 0) {
                 if (strlen(req.args) != 1 || req.args[0] != '0' + profile) {
                     static const char wrongProfile[] = "PID PROFILE MISMATCH";
@@ -740,6 +749,16 @@ float customLinkGetRateSetpoint(int axis)
     }
 
     return rate;
+}
+
+bool customLinkAngleRequested(void)
+{
+    return controlState.modeReq == 3 && customLinkIsControlFresh() && customLinkIsModeRequested();
+}
+
+float customLinkGetAngleSetpoint(int axis)
+{
+    return constrainf(cachedRate[axis], -10.0f, 10.0f);
 }
 
 float customLinkGetThrottle(void)

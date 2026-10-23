@@ -604,6 +604,12 @@ STATIC_UNIT_TESTED FAST_CODE_NOINLINE float pidLevel(int axis, const pidProfile_
     }
 #endif
 
+#ifdef USE_CUSTOM_LINK
+    if (customLinkHasControl() && customLinkAngleRequested()) {
+        angleTarget = customLinkGetAngleSetpoint(axis);
+        angleFeedforward = 0.0f;
+    }
+#endif
     angleTarget = constrainf(angleTarget, -angleLimit, angleLimit);
 
     const float currentAngle = (attitude.raw[axis] - angleTrim->raw[axis]) / 10.0f; // stepped at 500hz with some 4ms flat spots
@@ -1075,7 +1081,11 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
                 ;
     levelMode_e levelMode;
     if (FLIGHT_MODE(ANGLE_MODE | HORIZON_MODE | GPS_RESCUE_MODE)) {
-        if (pidRuntime.levelRaceMode && !isExternalAngleModeRequest) {
+        if (pidRuntime.levelRaceMode && !isExternalAngleModeRequest
+#ifdef USE_CUSTOM_LINK
+            && !customLinkAngleRequested()
+#endif
+        ) {
             levelMode = LEVEL_MODE_R;
         } else {
             levelMode = LEVEL_MODE_RP;

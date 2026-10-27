@@ -61,6 +61,7 @@ MSG_FC_FAST = 0x10
 MSG_FC_MEDIUM = 0x11
 MSG_FC_SLOW = 0x12
 MSG_FC_MOTORS = 0x13
+MSG_FC_ESC_TELEMETRY = 0x16
 MSG_HOST_CONTROL = 0x20
 MSG_HOST_IMU = 0x21
 MSG_HOST_ENV = 0x22
@@ -68,7 +69,7 @@ MSG_HOST_RC = 0x23
 
 MSG_NAMES = {
     MSG_FC_FAST: "0x10", MSG_FC_MEDIUM: "0x11", MSG_FC_SLOW: "0x12",
-    MSG_FC_MOTORS: "0x13",
+    MSG_FC_MOTORS: "0x13", MSG_FC_ESC_TELEMETRY: "0x16",
 }
 
 
@@ -247,6 +248,10 @@ class Telemetry:
                 motors = struct.unpack("<8H", p[1:17])[:count]
                 self.motor_values = motors
                 self.motor_stamp = time.time()
+            elif msg_id == MSG_FC_ESC_TELEMETRY:
+                ts, count, valid = struct.unpack("<IBB", p[:6])
+                rpm = struct.unpack("<8H", p[6:22])[:count]
+                self.last["esc_telemetry"] = (count, valid, rpm)
         except struct.error:
             pass
 
@@ -384,9 +389,16 @@ def main():
         def hz(mid):
             return (tel.rx_counts.get(mid, 0) - c0.get(mid, 0)) / 3.0
         f10, f11, f12, f13 = hz(MSG_FC_FAST), hz(MSG_FC_MEDIUM), hz(MSG_FC_SLOW), hz(MSG_FC_MOTORS)
-        print(f"  0x10 {f10:.1f} Hz, 0x11 {f11:.1f} Hz, 0x12 {f12:.1f} Hz, 0x13 {f13:.1f} Hz")
+        f16 = hz(MSG_FC_ESC_TELEMETRY)
+        print(f"  0x10 {f10:.1f} Hz, 0x11 {f11:.1f} Hz, 0x12 {f12:.1f} Hz, 0x13 {f13:.1f} Hz, 0x16 {f16:.1f} Hz")
         results["rates"] = 160 <= f10 <= 240 and 80 <= f11 <= 120 and 8 <= f12 <= 12
         results["motors_stream_rate"] = 160 <= f13 <= 240
+        # 0x16 ESC telemetry frames at the medium rate; SITL has no real ESCs,
+        # so the shape check only pins cadence + count + empty valid mask.
+        results["esc_telemetry_rate"] = 80 <= f16 <= 120
+        esc = tel.last.get("esc_telemetry")
+        results["esc_telemetry_shape"] = bool(
+            esc and esc[0] == 4 and esc[1] == 0 and all(r == 0 for r in esc[2]))
 
         # ---- 3. IMU injection: level acc echo ----
         print("== 3. IMU injection (level) ==")

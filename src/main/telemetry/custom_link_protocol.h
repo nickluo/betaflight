@@ -59,6 +59,7 @@ typedef enum {
     CUSTOM_LINK_MSG_FC_MOTORS      = 0x13,   // 200 Hz mixer motor outputs (SITL)
     CUSTOM_LINK_MSG_FC_ODOMETRY    = 0x14,   // 100 Hz ARM-relative ENU odometry
     CUSTOM_LINK_MSG_FC_CLI         = 0x15,   // CLI setting read/write response (chunked)
+    CUSTOM_LINK_MSG_FC_ESC_TELEMETRY = 0x16, // 100 Hz bidir-DShot ESC eRPM per motor
     CUSTOM_LINK_MSG_HOST_CONTROL   = 0x20,   // 100-200 Hz control setpoints
     CUSTOM_LINK_MSG_HOST_IMU       = 0x21,   // >=200 Hz simulator IMU injection (SITL)
     CUSTOM_LINK_MSG_HOST_ENV       = 0x22,   // 10-50 Hz simulator baro/GPS injection (SITL)
@@ -212,6 +213,22 @@ typedef struct {
     uint8_t cmd;
     char args[CUSTOM_LINK_MAX_PAYLOAD - 4 + 1];  // NUL-terminated copy
 } clCliRequest_t;
+
+// 0x16 - bidirectional DShot ESC telemetry, mechanical RPM per motor (22 bytes).
+// Streamed at the medium task rate while the motor driver is enabled; with
+// bidirectional DShot off (e.g. dshot_bidir = OFF), or before the first valid
+// eRPM frame of a motor, that motor's valid bit is clear and rpm[] reads 0.
+// The FC converts eRPM to mechanical rpm itself via the motor_poles setting
+// (rpm = eRPM / (motor_poles / 2), the same conversion erpmToRpm() applies),
+// so hosts never need the pole count.
+typedef struct __attribute__((packed)) {
+    uint32_t ts_us;             // FC micros() timestamp
+    uint8_t count;              // number of reported motors
+    uint8_t valid;              // bitmask: bit i = live RPM for motor i
+    uint16_t rpm[8];            // mechanical RPM per motor, rounded
+} clPayloadEscTelemetry_t;
+
+_Static_assert(sizeof(clPayloadEscTelemetry_t) == 22, "esc telemetry payload size");
 
 //
 // Simulation frames (SITL). A simulator acting as the host replaces the real

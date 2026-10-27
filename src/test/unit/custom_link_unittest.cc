@@ -440,6 +440,32 @@ TEST(CustomLinkRoundtripTest, TestSimulationFrames)
     EXPECT_EQ(rcOut.rc[15], 1500u);
 }
 
+TEST(CustomLinkRoundtripTest, EscTelemetryPayloadRoundtrip)
+{
+    resetParser(10000);
+    clPayloadEscTelemetry_t esc = {};
+    esc.ts_us = 424242;
+    esc.count = 4;
+    esc.valid = 0x0f;
+    esc.rpm[0] = 30000;
+    esc.rpm[3] = 1;
+    esc.rpm[7] = 0xFFFF;                                      // full u16 rpm domain survives verbatim
+    uint8_t buf[CUSTOM_LINK_FRAME_MAX];
+    const uint8_t len = clEncodeFrame(CUSTOM_LINK_MSG_FC_ESC_TELEMETRY, 21, &esc, sizeof(esc), buf, sizeof(buf));
+    ASSERT_GT(len, 0);
+    feedBytes(buf, len, 1000, 10);
+    EXPECT_EQ(testRx.frameCount, 1u);
+    EXPECT_EQ(testRx.lastFrame.msgId, CUSTOM_LINK_MSG_FC_ESC_TELEMETRY);
+    clPayloadEscTelemetry_t escOut;
+    memcpy(&escOut, testRx.lastFrame.payload, sizeof(escOut));
+    EXPECT_EQ(escOut.ts_us, esc.ts_us);
+    EXPECT_EQ(escOut.count, 4u);
+    EXPECT_EQ(escOut.valid, 0x0f);
+    EXPECT_EQ(escOut.rpm[0], 30000u);
+    EXPECT_EQ(escOut.rpm[3], 1u);
+    EXPECT_EQ(escOut.rpm[7], 0xFFFFu);
+}
+
 TEST(CustomLinkParserTest, TestUnknownMessageIdStillDelivered)
 {
     // Compatibility property: the codec has no knowledge of specific message
@@ -968,6 +994,7 @@ TEST(CustomLinkStructTest, TestPackedLayout)
     EXPECT_EQ(sizeof(clPayloadTimesyncResp_t), 16u);
     EXPECT_EQ(sizeof(clPayloadCliReq_t), 64u);
     EXPECT_EQ(sizeof(clPayloadCliResp_t), 64u);
+    EXPECT_EQ(sizeof(clPayloadEscTelemetry_t), 22u);
 
     EXPECT_EQ(offsetof(clPayloadControl_t, host_ts_us), 0u);
     EXPECT_EQ(offsetof(clPayloadControl_t, cmd_seq), 8u);
@@ -978,6 +1005,11 @@ TEST(CustomLinkStructTest, TestPackedLayout)
 
     EXPECT_EQ(offsetof(clPayloadMotors_t, count), 0u);
     EXPECT_EQ(offsetof(clPayloadMotors_t, motor), 1u);      // packed: no padding after count
+
+    EXPECT_EQ(offsetof(clPayloadEscTelemetry_t, ts_us), 0u);
+    EXPECT_EQ(offsetof(clPayloadEscTelemetry_t, count), 4u);
+    EXPECT_EQ(offsetof(clPayloadEscTelemetry_t, valid), 5u);
+    EXPECT_EQ(offsetof(clPayloadEscTelemetry_t, rpm), 6u);  // packed: no padding after count/valid
 
     EXPECT_EQ(offsetof(clPayloadHostImu_t, ts_us), 0u);
     EXPECT_EQ(offsetof(clPayloadHostImu_t, gyro), 4u);

@@ -32,6 +32,7 @@
 #include "common/time.h"
 #include "common/utils.h"
 
+#include "drivers/dshot.h"
 #include "drivers/motor.h"
 #include "drivers/serial.h"
 #include "drivers/system.h"
@@ -887,9 +888,36 @@ void customLinkTaskMed(timeUs_t currentTimeUs)
     // 注入帧同样算活跃链路。真机走 rx 的 RSSI 源（getRssiPercent 0..100）。
     med.rssi_pct = (rxUdpBridgeRcFresh() || millis() - lastHostRcMs < 100) ? 100 : 0;
 #else
-    med.rssi_pct = getRssiPercent();
+    med.rssi_pct = rxGetLinkQualityPercent() & 0xFF;
 #endif
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_MEDIUM, &med, sizeof(med));
+
+#ifdef USE_MOTOR
+    // ESC motor RPM telemetry (0x16). Bidirectional DShot (Bluejay-class ESCs)
+    // reports eRPM per motor; the FC converts it to mechanical rpm via the
+    // motor_poles setting so hosts never need the pole count. With telemetry
+    // off the valid mask stays zero and the frame still flows so hosts see a
+    // stable cadence.
+    if (motorIsEnabled()) {
+        clPayloadEscTelemetry_t esc;
+        memset(&esc, 0, sizeof(esc));
+        esc.ts_us = (uint32_t)currentTimeUs;
+        esc.count = getMotorCount();
+        if (esc.count > ARRAYLEN(esc.rpm)) {
+            esc.count = ARRAYLEN(esc.rpm);
+        }
+        for (uint8_t i = 0; i < esc.count; i++) {
+#if defined(USE_DSHOT_TELEMETRY)
+            if (isDshotMotorTelemetryActive(i)) {
+                esc.valid |= 1 << i;
+                const uint32_t rpm = (uint32_t)lrintf(erpmToRpm(getDshotErpm(i)));
+                esc.rpm[i] = rpm > UINT16_MAX ? UINT16_MAX : (uint16_t)rpm;
+            }
+#endif
+        }
+        customLinkSendFrame(CUSTOM_LINK_MSG_FC_ESC_TELEMETRY, &esc, sizeof(esc));
+    }
+#endif
 
 #ifdef USE_GPS
     positionEstimate3d_t estimate;

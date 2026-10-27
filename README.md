@@ -115,7 +115,23 @@ be salvaged. `SET FAILED` / `NOT FOUND` keep failures explicit. See
 [the protocol definition](src/main/telemetry/custom_link_protocol.h) and
 `src/test/sitl/sitl_custom_link_cli_test.py` for the end-to-end contract.
 
-CLI command `5` (`APPLY_PID`) explicitly refreshes the current profile's runtime
+## Custom-link ESC motor RPM telemetry
+
+Custom firmware builds with `USE_CUSTOM_LINK` and `USE_MOTOR` stream a 100 Hz
+`0x16` ESC telemetry downlink (22-byte payload) alongside `0x11`: per-motor
+**mechanical RPM** from bidirectional DShot (Bluejay-class ESCs, `dshot_bidir
+= ON`), already converted on the FC via the `motor_poles` setting, plus a
+per-motor valid bitmask. With bidirectional DShot off, or before a motor's
+first valid eRPM frame, that motor's valid bit is clear and its rpm reads 0;
+the frame itself keeps flowing so hosts see a stable cadence. Old hosts ignore
+the new ID. A companion bridge can publish it as ROS 2
+`std_msgs/msg/Float32MultiArray` on `/fpv/motor_rpm` (NaN for invalid motors),
+and `apm_bridge/test/hw_custom_link_rpm_test.py` uses it for props-off bench
+verification of the whole OFFBOARD control chain (command sign -> motor speed
+differential). See
+[the protocol definition](src/main/telemetry/custom_link_protocol.h).
+
+
 PID coefficients and resets I-term without writing flash. `args="check"` reports
 `PID PROFILE <index>` without applying; `args="<index>"` must match the active
 profile. While armed, application requires fresh OFFBOARD authority, zero throttle,

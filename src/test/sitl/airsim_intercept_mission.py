@@ -413,6 +413,10 @@ class InterceptMission:
         self.origin = None
         self.geo_origin = None
         self.min_distance = None
+        if self.min_visual_distance is not None:
+            self.min_visual_distance = None
+        self.min_visual_distance = None
+        self.visual_target_pos = None
         self.trajectory = None
         self.trajectory_file = None
         self.workdir = None
@@ -456,6 +460,56 @@ class InterceptMission:
                 "vel": (v.x_val, v.y_val, v.z_val),
                 "rpy": (roll, pitch, yaw)}
 
+    def calibrate_visual_target(self, duration=2.0):
+        """Measure the VISUAL balloon position (what the camera/tracker actually aims at) vs the
+        pawn GT origin, over the locked-static prelaunch window: the tracker's camera-frame LOS
+        (/fpv/target_los) rotated to world by the current /fpv/gimbal pose, scaled by the GT range.
+        A pawn whose visual mesh is offset from its origin (e.g. the balloon mesh hanging off the
+        root) otherwise biases the GT hit metric by the same offset on every run regardless of
+        guidance tuning. Averages samples; a mesh aligned with the origin calibrates to ~0."""
+        samples = []
+        deadline = time.monotonic() + duration
+        seen = None
+        while time.monotonic() < deadline:
+            state = self.sample()
+            los = self.ros_iface.target_los if self.ros_iface else None
+            camera = getattr(self.ros_iface, "gimbal_quat", None)
+            if los is None or camera is None or self.ros_iface.tracker_state != 2:
+                time.sleep(0.02)
+                continue
+            stamp = los.header.stamp.sec + los.header.stamp.nanosec * 1e-9
+            key = (stamp, round(los.twist.linear.y, 6), round(los.twist.linear.z, 6))
+            if key == seen:
+                time.sleep(0.02)
+                continue
+            seen = key
+            az_cam, el_cam = los.twist.linear.y, los.twist.linear.z
+            ray_flu = (math.cos(el_cam) * math.cos(az_cam),
+                       math.cos(el_cam) * math.sin(az_cam),
+                       -math.sin(el_cam))
+            ray_enu = rotate(airsim.Quaternionr(*camera), ray_flu)
+            ray_ned = (ray_enu[1], ray_enu[0], -ray_enu[2])
+            rel_ned = tuple(t - o for t, o in zip(state["target_pos"], state["pos"]))
+            rng = math.hypot(*rel_ned)
+            if rng < 1e-3:
+                continue
+            visual_pos = tuple(o + rng * r for o, r in zip(state["pos"], ray_ned))
+            samples.append(visual_pos)
+            time.sleep(0.02)
+        if len(samples) < 10:
+            log(f"visual target calibration skipped ({len(samples)} samples)")
+            return
+        n = len(samples)
+        self.visual_target_pos = tuple(sum(c[i] for c in samples) / n for i in range(3))
+        state = self.sample()
+        offset = tuple(v - g for v, g in zip(self.visual_target_pos, state["target_pos"]))
+        off = math.hypot(*offset)
+        log(f"visual target calibrated: offset {off:.2f} m from pawn origin "
+            f"(dx={offset[0]:+.2f} dy={offset[1]:+.2f} dz={offset[2]:+.2f}, {n} samples)")
+        self.report["phases"]["visual_target_calibration"] = {
+            "offset_m": off, "offset_ned_m": offset,
+            "visual_pos_ned_m": self.visual_target_pos, "samples": n}
+
     def sample(self):
         if self.balloon is not None:
             self.balloon.check_running()
@@ -468,6 +522,11 @@ class InterceptMission:
         distance = math.dist(state["pos"], target["pos"])
         if self.stage == "mission" and (self.min_distance is None or distance < self.min_distance):
             self.min_distance = distance
+        vpos = getattr(self, "visual_target_pos", None)
+        if self.stage == "mission" and vpos is not None:
+            vdist = math.dist(state["pos"], vpos)
+            if self.min_visual_distance is None or vdist < self.min_visual_distance:
+                self.min_visual_distance = vdist
         modes, flags = self.modes()
         los = self.ros_iface.target_los if self.ros_iface else None
         bbox = self.ros_iface.target_bbox if self.ros_iface else None
@@ -1187,6 +1246,8 @@ class InterceptMission:
                 if time.monotonic() - since >= (3.0 if dynamic else 1.0) and (
                         not dynamic or evidence["target_displacement_m"] > .5):
                     self.report["phases"]["prelaunch_tracking"] = evidence
+                    if not dynamic:
+                        self.calibrate_visual_target()
                     log(f"tracker locked with {'moving' if dynamic else 'static'} target; "
                         f"platform tracking={evidence}")
                     return
@@ -1389,7 +1450,9 @@ class InterceptMission:
                         (self.min_distance is not None and mark_dist is not None
                          and mark_dist - self.min_distance >= 1.0):
                     progress_mark = (time.monotonic(), self.min_distance)
-            if self.min_distance is not None and self.min_distance <= HIT_DISTANCE:
+            hit_distance = (self.min_visual_distance if self.min_visual_distance is not None
+                            else self.min_distance)
+            if hit_distance is not None and hit_distance <= HIT_DISTANCE:
                 log(f"INTERCEPT: closest approach {self.min_distance:.2f} m "
                     f"(t+{elapsed:.1f}s, height {height:.1f} m)")
                 result["outcome"] = "hit"
@@ -1398,7 +1461,7 @@ class InterceptMission:
                 return result
             if self.ros_iface.mission_state is False and self.ros_iface.mission_active_since >= start:
                 result["terminated_by_node"] = True
-                outcome = ("hit" if self.min_distance <= HIT_DISTANCE
+                outcome = ("hit" if hit_distance <= HIT_DISTANCE
                            else "lost")
                 # A pilot DISMISS pulse cancelled the interception - deliberate
                 # end, not a capability miss (same standing as user_rth).

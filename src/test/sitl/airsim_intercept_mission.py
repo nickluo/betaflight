@@ -875,7 +875,10 @@ class InterceptMission:
             "orbit_radius_m": self.args.balloon_orbit_radius,
             "orbit_speed_m_s": self.args.balloon_orbit_speed,
             "ready_speed_m_s": math.hypot(*target["vel"])}
-        if not 60 <= horizontal <= 80 or altitude <= 40:
+        # Altitude floor (target above the launch origin) keeps the default climb engagement sane;
+        # --balloon-min-alt 0 explicitly opts out for the missile-mode DIVE geometry (ground-level
+        # target, ballistic launch, terminal dive through the >90 deg pitch regime).
+        if not 60 <= horizontal <= 80 or altitude <= self.args.balloon_min_alt:
             raise RuntimeError("balloon standoff geometry out of bounds")
 
     def fc_yaw(self):
@@ -1855,6 +1858,8 @@ def parse_arguments(argv=None):
                         help="dynamic target circle radius about balloon-x/y/z (m)")
     parser.add_argument("--balloon-orbit-speed", type=float, default=1.5,
                         help="dynamic target tangential speed (m/s)")
+    parser.add_argument("--balloon-min-alt", type=float, default=40.0,
+                        help="minimum target altitude above the launch origin (m); 0 allows a\nground-level target for the missile-mode dive geometry (--max-tilt 95).")
     parser.add_argument("--launch-x", type=float, default=0.0,
                         help="ground launch X in Copter-local NED (m)")
     parser.add_argument("--launch-y", type=float, default=0.0,

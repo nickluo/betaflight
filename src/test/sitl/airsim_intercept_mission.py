@@ -128,6 +128,12 @@ def apply_interceptor_profile(params, args):
     # (0.25 s of vertical/axial timing error at 12 m/s is 3 m; at 6 m/s it is 1.5 m).
     if args.terminal_floor is not None:
         params["controller"]["terminal_speed_floor"] = args.terminal_floor
+    # Monocular width prior: the yaml default is a generic guess; the AirSim balloon's effective
+    # width (from close-range bbox * GT distance / focal) is ~1.2 m. An inaccurate prior biases
+    # r_est ~proportionally (no radar in these runs) and with it every range-keyed gate and the
+    # vertical arrival decomposition.
+    if args.target_width is not None:
+        params["estimation"]["w_guess"] = args.target_width
     return params
 
 
@@ -1965,6 +1971,8 @@ def parse_arguments(argv=None):
                         help="override physics.max_tilt_deg/_terminal (deg). 95 = missile-mode dive envelope of the quaternion attitude layer; default keeps the yaml flight profile.")
     parser.add_argument("--terminal-floor", type=float, default=None,
                         help="override controller.terminal_speed_floor (m/s). Lower = slower\nkinetic pass with a proportionally tighter timing window; default keeps the yaml.")
+    parser.add_argument("--target-width", type=float, default=None,
+                        help="override estimation.w_guess (m) with the target's effective\nvisual width; calibrate from close-range bbox*GT_range/focal. Default keeps the yaml.")
     parser.add_argument("--rate-control-attenuation", action=argparse.BooleanOptionalAction,
                         default=False, help="body-rate attenuation (off for Betaflight SITL)")
     parser.add_argument("--pitch-aim", type=float, default=None,

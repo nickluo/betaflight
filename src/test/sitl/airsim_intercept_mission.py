@@ -117,6 +117,12 @@ def apply_interceptor_profile(params, args):
     params["control"]["rate_control_attenuation"] = args.rate_control_attenuation
     params["physics"]["v_climb"] = args.climb_speed
     params["physics"]["v_descent"] = args.climb_speed
+    # Missile-mode dive envelope: raise the thrust tilt cap past the flight 65/68 deg profile
+    # (the quaternion attitude layer is valid through +-90 deg; 95 lets the thrust axis pass
+    # horizontal). None keeps the yaml flight profile.
+    if args.max_tilt is not None:
+        params["physics"]["max_tilt_deg"] = args.max_tilt
+        params["physics"]["max_tilt_terminal_deg"] = args.max_tilt
     return params
 
 
@@ -1880,6 +1886,8 @@ def parse_arguments(argv=None):
                         help="climb/descent speed limit (m/s)")
     parser.add_argument("--turn-cap-factor", type=float, default=.8,
                         help="turn-radius speed governor, [0.3,1.0]; lower brakes earlier")
+    parser.add_argument("--max-tilt", type=float, default=None,
+                        help="override physics.max_tilt_deg/_terminal (deg). 95 = missile-mode dive envelope of the quaternion attitude layer; default keeps the yaml flight profile.")
     parser.add_argument("--rate-control-attenuation", action=argparse.BooleanOptionalAction,
                         default=False, help="body-rate attenuation (off for Betaflight SITL)")
     parser.add_argument("--pitch-aim", type=float, default=None,

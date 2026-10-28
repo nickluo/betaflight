@@ -413,8 +413,6 @@ class InterceptMission:
         self.origin = None
         self.geo_origin = None
         self.min_distance = None
-        if self.min_visual_distance is not None:
-            self.min_visual_distance = None
         self.min_visual_distance = None
         self.visual_target_pos = None
         self.trajectory = None
@@ -1318,6 +1316,7 @@ class InterceptMission:
         trigger_mission=False supervises the pilot's existing RC MISSION."""
         self.stage = "mission"
         self.min_distance = None
+        self.min_visual_distance = None
         if trigger_mission:
             # The scripted pilot may wait before pressing AUX4. Once the bridge
             # emits MISSION, both sources must supervise immediately.

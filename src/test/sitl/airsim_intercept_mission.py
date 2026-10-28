@@ -123,6 +123,11 @@ def apply_interceptor_profile(params, args):
     if args.max_tilt is not None:
         params["physics"]["max_tilt_deg"] = args.max_tilt
         params["physics"]["max_tilt_terminal_deg"] = args.max_tilt
+    # Terminal closure floor: the kinetic-intercept pass-through speed. Lower it for
+    # close-precision work against a slow/static target — the miss distance scales with it
+    # (0.25 s of vertical/axial timing error at 12 m/s is 3 m; at 6 m/s it is 1.5 m).
+    if args.terminal_floor is not None:
+        params["controller"]["terminal_speed_floor"] = args.terminal_floor
     return params
 
 
@@ -1896,6 +1901,8 @@ def parse_arguments(argv=None):
                         help="turn-radius speed governor, [0.3,1.0]; lower brakes earlier")
     parser.add_argument("--max-tilt", type=float, default=None,
                         help="override physics.max_tilt_deg/_terminal (deg). 95 = missile-mode dive envelope of the quaternion attitude layer; default keeps the yaml flight profile.")
+    parser.add_argument("--terminal-floor", type=float, default=None,
+                        help="override controller.terminal_speed_floor (m/s). Lower = slower\nkinetic pass with a proportionally tighter timing window; default keeps the yaml.")
     parser.add_argument("--rate-control-attenuation", action=argparse.BooleanOptionalAction,
                         default=False, help="body-rate attenuation (off for Betaflight SITL)")
     parser.add_argument("--pitch-aim", type=float, default=None,

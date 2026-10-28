@@ -1436,11 +1436,24 @@ class InterceptMission:
             else:
                 lost_since = None
             if result["took_off"] and distance > self.min_distance + 8.0:
-                log(f"missed pass: range reopened to {distance:.1f} m "
-                    f"from {self.min_distance:.2f} m; ending engagement")
-                result["outcome"] = "opening_range"
+                # A kinetic pass ALWAYS reopens the range right after the closest approach
+                # (~12 m/s through-pass); judge the hit from the closest approach itself, not
+                # from the reopen event ordering.
+                hit_distance = (self.min_visual_distance if self.min_visual_distance is not None
+                                else self.min_distance)
                 result["closest_distance_m"] = self.min_distance
+                result["closest_visual_distance_m"] = self.min_visual_distance
                 result["duration_s"] = elapsed
+                if hit_distance is not None and hit_distance <= HIT_DISTANCE:
+                    log(f"INTERCEPT: closest approach {self.min_distance:.2f} m "
+                        f"(visual {self.min_visual_distance:.2f} m, t+{elapsed:.1f}s)")
+                    result["outcome"] = "hit"
+                    return result
+                log(f"missed pass: range reopened to {distance:.1f} m "
+                    f"from {self.min_distance:.2f} m (visual "
+                    f"{self.min_visual_distance if self.min_visual_distance is not None else float('nan'):.2f} m); "
+                    f"ending engagement")
+                result["outcome"] = "opening_range"
                 return result
             # Stagnation watchdog: no closing progress for 20 s while tracking is
             # up means the guidance is circling/blind — end it and go home.
@@ -1459,9 +1472,11 @@ class InterceptMission:
                             else self.min_distance)
             if hit_distance is not None and hit_distance <= HIT_DISTANCE:
                 log(f"INTERCEPT: closest approach {self.min_distance:.2f} m "
-                    f"(t+{elapsed:.1f}s, height {height:.1f} m)")
+                    f"(visual {self.min_visual_distance:.2f} m, t+{elapsed:.1f}s, "
+                    f"height {height:.1f} m)")
                 result["outcome"] = "hit"
                 result["closest_distance_m"] = self.min_distance
+                result["closest_visual_distance_m"] = self.min_visual_distance
                 result["duration_s"] = elapsed
                 return result
             if self.ros_iface.mission_state is False and self.ros_iface.mission_active_since >= start:

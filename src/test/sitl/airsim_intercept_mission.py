@@ -875,10 +875,13 @@ class InterceptMission:
             "orbit_radius_m": self.args.balloon_orbit_radius,
             "orbit_speed_m_s": self.args.balloon_orbit_speed,
             "ready_speed_m_s": math.hypot(*target["vel"])}
-        # Altitude floor (target above the launch origin) keeps the default climb engagement sane;
-        # --balloon-min-alt 0 explicitly opts out for the missile-mode DIVE geometry (ground-level
-        # target, ballistic launch, terminal dive through the >90 deg pitch regime).
-        if not 60 <= horizontal <= 80 or altitude <= self.args.balloon_min_alt:
+        # Two valid standoff geometries: the standard climb engagement (60-80 m horizontal,
+        # above the altitude floor; --balloon-min-alt 0 opts out for the missile-mode DIVE
+        # geometry with a ground-level target), or the NEAR-OVERHEAD geometry (<= 30 m
+        # horizontal, >= 40 m up) for launch sites ringed by trees — the near-vertical sightline
+        # clears any tree line and the mission yaws/aims the same way for any bearing.
+        overhead = horizontal <= 30.0 and altitude >= 40.0
+        if not ((60 <= horizontal <= 80 and altitude > self.args.balloon_min_alt) or overhead):
             raise RuntimeError("balloon standoff geometry out of bounds")
 
     def fc_yaw(self):

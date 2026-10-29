@@ -25,6 +25,8 @@
 
 #include "platform.h"
 
+#include "build/debug.h"
+
 #if defined(USE_CUSTOM_LINK)
 
 #include "common/axis.h"
@@ -116,6 +118,22 @@ static clRxRingEntry_t rxRing[CL_RX_RING_LEN];
 static volatile uint8_t rxRingHead;
 static volatile uint8_t rxRingTail;
 
+// Uplink observability (MSP_DEBUG, DEBUG_CUSTOM_LINK): a feeder-side stall
+// shows env stopping while imu keeps counting; an FC-side loss shows frames
+// or bytes flattening while the host insists it is streaming. Counters are
+// u16-truncated on export - liveness is the signal, not the absolute value.
+// Byte parsing runs from the serial RX callback (IRQ context on hardware
+// UARTs) or from the 200 Hz task's buffered drain (SITL TCP ports) depending
+// on the port driver, and the export below races both, so every access is
+// atomic; relaxed ordering suffices because these are statistics only.
+#define CL_STAT_INC(stat) __atomic_fetch_add(&(stat), 1, __ATOMIC_RELAXED)
+static uint32_t clStatFrames;      // parser-completed uplink frames, all types
+static uint32_t clStatEnv;         // 0x22 HOST_ENV frames processed
+static uint32_t clStatImu;         // 0x21 HOST_IMU frames processed
+static uint32_t clStatRc;          // 0x23 HOST_RC frames processed
+static uint32_t clStatRingDrops;   // uplink frames dropped on a full rxRing
+static uint32_t clStatBytes;       // bytes pulled from the serial port
+
 // pending time sync response, task context only
 static bool syncPending;
 static uint64_t syncT1;
@@ -151,9 +169,12 @@ static void customLinkFrameHandler(const clFrame_t *frame, timeUs_t frameComplet
 {
     UNUSED(ctx);
 
+    CL_STAT_INC(clStatFrames);
+
     const uint8_t next = (rxRingHead + 1) % CL_RX_RING_LEN;
     if (next == rxRingTail) {
-        return;                        // ring full: drop the frame
+        CL_STAT_INC(clStatRingDrops);  // ring full: drop the frame
+        return;
     }
     rxRing[rxRingHead].frame = *frame;
     rxRing[rxRingHead].t2Us = frameCompleteUs;
@@ -173,10 +194,13 @@ static void customLinkRxCallback(uint16_t c, void *data)
 // no-op, preserving ISR-precision T2 timestamps.
 static void customLinkDrainBufferedRx(void)
 {
+    uint32_t drained = 0;
     while (serialRxBytesWaiting(customLinkPort) > 0) {
         const uint8_t c = serialRead(customLinkPort);
         clParserProcessByte(&parser, c, micros(), customLinkFrameHandler, NULL);
+        drained++;
     }
+    __atomic_fetch_add(&clStatBytes, drained, __ATOMIC_RELAXED);
 }
 
 // Send that only consumes a sequence number once the frame is actually on the
@@ -627,6 +651,7 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
         if (frame->len == sizeof(imu)) {
             memcpy(&imu, frame->payload, sizeof(imu));
             customLinkInjectImu(&imu);
+            CL_STAT_INC(clStatImu);
         }
         break;
     }
@@ -636,6 +661,7 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
         if (frame->len == sizeof(env)) {
             memcpy(&env, frame->payload, sizeof(env));
             customLinkInjectEnv(&env);
+            CL_STAT_INC(clStatEnv);
         }
         break;
     }
@@ -645,6 +671,7 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
         if (frame->len == sizeof(rc)) {
             memcpy(&rc, frame->payload, sizeof(rc));
             customLinkInjectRc(&rc);
+            CL_STAT_INC(clStatRc);
         }
         break;
     }
@@ -781,6 +808,16 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
         rxRingTail = (rxRingTail + 1) % CL_RX_RING_LEN;
         customLinkProcessUplinkFrame(&entry.frame, entry.t2Us);
     }
+
+    // uplink observability export (DEBUG_CUSTOM_LINK): truncated to u16.
+    // Relaxed atomic loads - an aligned u32 store is single-copy atomic
+    // anyway, this keeps the cross-context contract explicit.
+    DEBUG_SET(DEBUG_CUSTOM_LINK, 0, (int16_t)__atomic_load_n(&clStatFrames, __ATOMIC_RELAXED));
+    DEBUG_SET(DEBUG_CUSTOM_LINK, 1, (int16_t)__atomic_load_n(&clStatEnv, __ATOMIC_RELAXED));
+    DEBUG_SET(DEBUG_CUSTOM_LINK, 2, (int16_t)__atomic_load_n(&clStatImu, __ATOMIC_RELAXED));
+    DEBUG_SET(DEBUG_CUSTOM_LINK, 3, (int16_t)__atomic_load_n(&clStatRc, __ATOMIC_RELAXED));
+    DEBUG_SET(DEBUG_CUSTOM_LINK, 4, (int16_t)__atomic_load_n(&clStatRingDrops, __ATOMIC_RELAXED));
+    DEBUG_SET(DEBUG_CUSTOM_LINK, 5, (int16_t)__atomic_load_n(&clStatBytes, __ATOMIC_RELAXED));
 
     // authority is recomputed every task period so a watchdog expiry stops
     // the PID/mixer override immediately, ahead of the next processRxModes

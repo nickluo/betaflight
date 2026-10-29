@@ -175,6 +175,7 @@ SITL_CONFIG_BASE = (
     "set custom_link_motors_stream = ON",
     "set airmode_start_throttle_percent = 15",
     "set mag_declination = 20",
+    "set debug_mode = CUSTOM_LINK",  # uplink frame counters (MSP_DEBUG) for feeder-stall diagnosis
     *SIM_RESCUE_CONFIG,
     *joystick.CLI_CONFIG_LINES,
     "aux 7 56 5 1700 2100 0 0",  # flight-plan box on AUX6 (rescue plan executor)
@@ -210,6 +211,12 @@ def interactive_passed(phases, error):
 
 def log(message):
     print(f"[mission {time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def fmt_or(value, spec=".2f", placeholder="n/a"):
+    """Format possibly-None telemetry (e.g. visual distance without a static
+    target calibration) without killing the supervisor with a TypeError."""
+    return format(value, spec) if value is not None else placeholder
 
 
 def camera_target_error_degrees(camera_flu_to_enu, relative_ned):
@@ -433,6 +440,8 @@ class InterceptMission:
         self.world_ready = False
         self.external_rc = False  # interactive: a user bridge already streams UDP 9004
         self.hover_pwm = None
+        self.link_diag = None      # throttled FC GPS-fix + custom-link uplink counters
+        self.link_diag_stamp = 0.0
 
     # ---------------------------------------------------------------- helpers
 
@@ -514,6 +523,27 @@ class InterceptMission:
             "offset_m": off, "offset_ned_m": offset,
             "visual_pos_ned_m": self.visual_target_pos, "samples": n}
 
+    def poll_link_diagnostics(self, min_age=0.5):
+        """Throttled FC-side GPS-fix state and custom-link uplink counters
+        (MSP_STATUS GPS + MSP_DEBUG, debug_mode=CUSTOM_LINK). The uplink
+        counters localize a stalled feeder: env stopping while imu keeps
+        counting means the 0x22 GPS feed died at the host, not in the FC."""
+        now = time.monotonic()
+        if self.link_diag is not None and now - self.link_diag_stamp < min_age:
+            return
+        diag = dict(self.link_diag or {})
+        try:
+            gps = self.msp_request(106)
+            if len(gps) >= 2:
+                diag["gps_fix"], diag["gps_sats"] = gps[0], gps[1]
+            dbg = self.msp_request(102)
+            if len(dbg) >= 12:
+                (diag["frames"], diag["env"], diag["imu"], diag["rc"],
+                 diag["ringdrop"], diag["bytes"]) = struct.unpack_from("<6h", dbg)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never kill supervision
+            log(f"link diagnostics poll failed: {exc}")
+        self.link_diag, self.link_diag_stamp = diag, now
+
     def sample(self):
         if self.balloon is not None:
             self.balloon.check_running()
@@ -532,6 +562,9 @@ class InterceptMission:
             if self.min_visual_distance is None or vdist < self.min_visual_distance:
                 self.min_visual_distance = vdist
         modes, flags = self.modes()
+        if self.msp is not None and self.args is not None:
+            self.poll_link_diagnostics()
+        diag = self.link_diag or {}
         los = self.ros_iface.target_los if self.ros_iface else None
         bbox = self.ros_iface.target_bbox if self.ros_iface else None
         los_age = None if los is None else (
@@ -552,7 +585,10 @@ class InterceptMission:
                math.degrees(self.launcher.yaw) if self.launcher else None,
                math.degrees(self.launcher.pitch) if self.launcher else None,
                *(self.ros_iface.imu_quat if self.ros_iface and self.ros_iface.imu_quat
-                 else (None,) * 4))
+                 else (None,) * 4),
+               diag.get("gps_fix"), diag.get("gps_sats"),
+               diag.get("frames"), diag.get("env"), diag.get("imu"), diag.get("rc"),
+               diag.get("ringdrop"), diag.get("bytes"))
         if self.trajectory:
             self.trajectory.writerow(row)
         state["modes"] = modes
@@ -608,8 +644,13 @@ class InterceptMission:
         horizontal = math.hypot(state["pos"][0] - self.origin[0],
                                 state["pos"][1] - self.origin[1])
         height = self.origin[2] - state["pos"][2]
+        # Attitude bound: the interceptor's terminal phase legitimately pulls to
+        # the quaternion attitude layer's +-90 deg validity limit (an overhead
+        # target demands a near-vertical attitude; observed peaks 85-86 deg).
+        # Keep a margin below the limit so a genuine flip/derange still trips.
+        tilt_limit = max(89.0, (self.args.max_tilt or 0.0) + 4.0)
         if horizontal > 300 or height > 150 or max(abs(state["rpy"][0]),
-                                                   abs(state["rpy"][1])) > 85:
+                                                   abs(state["rpy"][1])) > tilt_limit:
             return horizontal, height
         return None
 
@@ -740,7 +781,10 @@ class InterceptMission:
                                   "los_frame", "los_age", "camera_error_deg",
                                   "target_vx", "target_vy", "target_vz",
                                   "launcher_yaw_deg", "launcher_pitch_deg",
-                                  "fc_qx", "fc_qy", "fc_qz", "fc_qw"))
+                                  "fc_qx", "fc_qy", "fc_qz", "fc_qw",
+                                  "gps_fix", "gps_sats",
+                                  "cl_frames", "cl_env", "cl_imu", "cl_rc",
+                                  "cl_ringdrop", "cl_bytes"))
 
     def start_sitl(self):
         self.stage = "sitl"
@@ -1446,7 +1490,7 @@ class InterceptMission:
                 result["duration_s"] = elapsed
                 if hit_distance is not None and hit_distance <= HIT_DISTANCE:
                     log(f"INTERCEPT: closest approach {self.min_distance:.2f} m "
-                        f"(visual {self.min_visual_distance:.2f} m, t+{elapsed:.1f}s)")
+                        f"(visual {fmt_or(self.min_visual_distance)} m, t+{elapsed:.1f}s)")
                     result["outcome"] = "hit"
                     return result
                 log(f"missed pass: range reopened to {distance:.1f} m "
@@ -1472,7 +1516,7 @@ class InterceptMission:
                             else self.min_distance)
             if hit_distance is not None and hit_distance <= HIT_DISTANCE:
                 log(f"INTERCEPT: closest approach {self.min_distance:.2f} m "
-                    f"(visual {self.min_visual_distance:.2f} m, t+{elapsed:.1f}s, "
+                    f"(visual {fmt_or(self.min_visual_distance)} m, t+{elapsed:.1f}s, "
                     f"height {height:.1f} m)")
                 result["outcome"] = "hit"
                 result["closest_distance_m"] = self.min_distance
@@ -1514,6 +1558,50 @@ class InterceptMission:
             time.sleep(0.05)
         raise RuntimeError("mission timeout: intercept did not conclude")
 
+    def stop_live_mission(self, settle=2.0):
+        """Make sure no MISSION still owns the custom link before the RTH dial.
+        The bridge normally ends the engagement itself (target lost / dismiss);
+        when it has not, a second AUX4 pulse publishes DISMISS through the
+        bridge's RC trigger latch."""
+        if self.ros_iface is None:
+            return
+        deadline = time.monotonic() + settle
+        while time.monotonic() < deadline:
+            state = self.sample()
+            if self.ros_iface.mission_state is not True and 58 not in state["modes"]:
+                return
+            time.sleep(0.1)
+        log("MISSION still live before RTH; sending an AUX4 dismiss pulse")
+        try:
+            self.pulse_rc_trigger("DISMISS")
+        except RuntimeError as exc:
+            log(f"dismiss pulse unanswered ({exc}); dialing RTH anyway - the FC "
+                "strips host authority the instant the rescue switch is active")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            state = self.sample()
+            if self.ros_iface.mission_state is not True and 58 not in state["modes"]:
+                return
+            time.sleep(0.1)
+
+    def rth_diagnostics(self):
+        """One-line FC state for RTH failure messages: dial as mirrored by the
+        FC, GPS fix, and the custom-link uplink counters."""
+        diag = self.link_diag or {}
+        return (f"dial={self.rc_channel('mode6')}us gps_fix={diag.get('gps_fix')} "
+                f"sats={diag.get('gps_sats')} cl_frames={diag.get('frames')} "
+                f"cl_env={diag.get('env')} cl_imu={diag.get('imu')} "
+                f"cl_ringdrop={diag.get('ringdrop')}")
+
+    def rescue_degraded(self, state):
+        """The ENABLE_RESCUE_PLAN no-GPS-fix degrade: the rescue plan cannot
+        stage without STATE(GPS_FIX), so the switch flies the designed
+        altitude-only rescue descent instead - ARM+ANGLE+ALTHOLD with the dial
+        latched in the rescue detent (a combination impossible from the dial's
+        disjoint aux ranges otherwise)."""
+        dial = self.rc_channel("mode6")
+        return (dial or 0) >= RC_DIAL_RTH_US and set(state["modes"]) == {0, 1, 3}
+
     def return_home(self, dial_engaged=False):
         """One-key RTH. dial_engaged: the pilot's own mode dial already selected
         GPS Rescue (interactive); otherwise the script drives its RC stream."""
@@ -1525,6 +1613,7 @@ class InterceptMission:
                 log("launcher never released; disarm via the AUX3 switch when done")
             self.report["phases"]["rth"] = {"outcome": "not-launched-home"}
             return
+        self.stop_live_mission()
         if not dial_engaged:
             if self.rc is None:
                 raise RuntimeError("automated RTH requires an RC stream")
@@ -1540,11 +1629,21 @@ class InterceptMission:
                               and 58 not in s["modes"], timeout=20)
         except AssertionError:
             state = self.sample()
+            self.poll_link_diagnostics(min_age=0.0)
             if 0 not in state["modes"]:
                 log("drone already disarmed before RTH engaged; nothing to return")
                 raise RuntimeError("disarmed before RTH could engage") from None
-            raise
-        start = time.monotonic()
+            if self.rescue_degraded(state):
+                log(f"RTH DEGRADED: GPS fix lost at the FC ({self.rth_diagnostics()}); "
+                    "rescue plan cannot stage - firmware flying the altitude-only "
+                    "rescue descent (lands at the current position, no homing)")
+                return self.supervise_degraded_rth(time.monotonic())
+            raise AssertionError(
+                f"GPS Rescue controller did not engage; {self.rth_diagnostics()}") from None
+        return self.supervise_rth_return(time.monotonic())
+
+    def supervise_rth_return(self, start):
+        """Homing supervision: watch the rescue fly home, land and auto-disarm."""
         quality = ReturnFlightMetrics()
         rth_report = {"quality": {}}
         self.report["phases"]["rth"] = rth_report
@@ -1613,6 +1712,64 @@ class InterceptMission:
             disarm_since = time.monotonic()
             time.sleep(0.2)
         raise RuntimeError(f"RTH did not conclude (closest home distance {closest:.1f} m)")
+
+    def supervise_degraded_rth(self, start):
+        """Supervise the no-GPS-fix degrade descent. The firmware lands the
+        craft where it is and auto-disarms; the mission reports a safe
+        degraded landing (not a return home). If the GPS fix recovers
+        mid-descent the firmware's staging retry engages the real rescue -
+        hand back to the homing supervision."""
+        rth_report = {"outcome": "degraded", "quality": {}}
+        self.report["phases"]["rth"] = rth_report
+        ground_contact_info = None
+        next_log = 0.0
+        disarm_since = start  # previous poll before a disarm observation
+        while time.monotonic() - start < RTH_WAIT:
+            state = self.sample()
+            self.poll_link_diagnostics(min_age=1.0)
+            if rescue_controller(state["modes"]) is not None and 58 not in state["modes"]:
+                log("GPS fix recovered mid-descent: rescue controller engaged; "
+                    "resuming homing supervision")
+                return self.supervise_rth_return(time.monotonic())
+            if 0 not in state["modes"]:
+                height = self.origin[2] - state["pos"][2]
+                velocity = math.hypot(*state["vel"])
+                distance = math.hypot(state["pos"][0] - self.origin[0],
+                                      state["pos"][1] - self.origin[1])
+                if height < 1.5 and velocity < 1.0:
+                    if not self.wait_for_trigger("OFF", disarm_since, 5.0):
+                        raise RuntimeError("degraded-landing disarm edge did not auto-publish "
+                                           "/fpv/tracker_trigger OFF (bridge)")
+                    log(f"RTH degraded landing complete: {distance:.1f} m from home, "
+                        f"|v| {velocity:.2f} m/s, disarmed (tracker auto-OFF confirmed)")
+                    rth_report.update({
+                        "outcome": "degraded-landed", "home_distance_m": distance,
+                        "height_m": height, "speed_m_s": velocity,
+                        "auto_disarmed": True, "disarm_trigger_off": True,
+                        "diagnostics": self.rth_diagnostics(),
+                        "duration_s": time.monotonic() - start})
+                    return
+                raise RuntimeError(f"disarmed mid-air during degraded descent: "
+                                   f"height={height:.1f} m |v|={velocity:.2f} m/s; "
+                                   f"{self.rth_diagnostics()}")
+            height = self.origin[2] - state["pos"][2]
+            velocity = math.hypot(*state["vel"])
+            collision = self.client.simGetCollisionInfo(vehicle_name=VEHICLE)
+            if (collision.has_collided and collision.time_stamp > (self.airborne_timestamp or 0)
+                    and collision.normal.z_val < -0.5):
+                ground_contact_info = {
+                    "object": collision.object_name, "timestamp_ns": collision.time_stamp,
+                    "position_ned_m": (collision.position.x_val, collision.position.y_val,
+                                       collision.position.z_val)}
+            if time.monotonic() - start >= next_log:
+                log(f"RTH(degraded) t+{time.monotonic() - start:5.1f}s "
+                    f"alt {height:5.1f} m |v| {velocity:4.1f} m/s modes={state['modes']} "
+                    f"({self.rth_diagnostics()})")
+                next_log += 5.0
+            disarm_since = time.monotonic()
+            time.sleep(0.2)
+        raise RuntimeError(f"degraded rescue descent did not conclude "
+                            f"({self.rth_diagnostics()})")
 
     # ------------------------------------------------------------ interactive
 
@@ -1752,16 +1909,39 @@ class InterceptMission:
         stage_reached = self.stage
         self.stage = "cleanup"
         if self.rc is not None:
+            airborne = False
+            if self.armed_once and self.origin is not None:
+                with contextlib.suppress(Exception):
+                    state = self.sample()
+                    airborne = 0 in state["modes"] and self.origin[2] - state["pos"][2] > 2.5
             try:
-                self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, yaw=1500,
-                            trigger=joystick.RC_MIN_US, switch3=joystick.RC_MIN_US)
-                self.rc.set_mode("ACRO")
-                if self.sitl is not None and self.sitl.poll() is None:
-                    deadline = time.monotonic() + 5.0
-                    while 0 in self.modes()[0]:
-                        if time.monotonic() >= deadline:
-                            raise RuntimeError("FC did not confirm cleanup RC disarm")
-                        time.sleep(.05)
+                if airborne:
+                    # Never force-disarm a craft that is still flying: cutting the
+                    # RC stream engages the configured failsafe AUTO-LAND instead.
+                    log("teardown: craft airborne - cutting RC for failsafe AUTO-LAND")
+                    self.rc.close()
+                    landed = False
+                    deadline = time.monotonic() + 90.0
+                    while time.monotonic() < deadline:
+                        state = self.sample()
+                        if 0 not in state["modes"] and \
+                                self.origin[2] - state["pos"][2] < 1.5:
+                            landed = True
+                            break
+                        time.sleep(0.2)
+                    if not landed:
+                        log("WARNING: failsafe landing did not conclude within 90 s; "
+                            "continuing cleanup with the craft possibly airborne")
+                else:
+                    self.rc.set(arm=joystick.RC_MIN_US, throttle=1000, yaw=1500,
+                                trigger=joystick.RC_MIN_US, switch3=joystick.RC_MIN_US)
+                    self.rc.set_mode("ACRO")
+                    if self.sitl is not None and self.sitl.poll() is None:
+                        deadline = time.monotonic() + 5.0
+                        while 0 in self.modes()[0]:
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError("FC did not confirm cleanup RC disarm")
+                            time.sleep(.05)
             except Exception as exc:
                 log(f"RC cleanup failed: {exc}")
                 error = error or exc

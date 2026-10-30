@@ -1137,6 +1137,8 @@ void processRxModes(timeUs_t currentTimeUs)
     bool rescueDescentRequest = false;
     static bool rescueSwitchStaged = false;
     static bool rescueSwitchDescending = false;
+    static uint8_t rescueSwitchRestarts = 0;
+    static uint32_t rescueSwitchAbortMs = 0;
     if (ARMING_FLAG(ARMED) && IS_RC_MODE_ACTIVE(BOXGPSRESCUE) && !failsafeIsActive()) {
         if (!rescueSwitchStaged) {
             rescueSwitchStaged = flightPlanNavStageRescuePlan();
@@ -1146,6 +1148,26 @@ void processRxModes(timeUs_t currentTimeUs)
         // if a fix returns, staging succeeds next cycle and the real plan flies.
         if (rescueSwitchStaged && flightPlanNavGetState() == FP_NAV_ABORTED) {
             rescueSwitchDescending = true;
+            if (rescueSwitchAbortMs == 0) {
+                rescueSwitchAbortMs = millis();
+            }
+        }
+        // Bounded recovery: a transient abort (e.g. a heading glitch right
+        // after a violent engagement) must not strand an otherwise healthy
+        // craft in the altitude-only descent far from home. After a dwell,
+        // re-stage from the current position and re-fly while the navigation
+        // inputs are still healthy; capped so a genuinely bad engagement
+        // settles into the descent permanently.
+        if (rescueSwitchDescending
+            && rescueSwitchRestarts < 2
+            && rescueSwitchAbortMs != 0
+            && millis() - rescueSwitchAbortMs >= 1000
+            && STATE(GPS_FIX)
+            && positionEstimatorIsValidXY()) {
+            rescueSwitchRestarts++;
+            rescueSwitchStaged = false;
+            rescueSwitchDescending = false;
+            rescueSwitchAbortMs = 0;
         }
         if (rescueSwitchDescending || !rescueSwitchStaged) {
             rescueDescentRequest = true;
@@ -1155,6 +1177,8 @@ void processRxModes(timeUs_t currentTimeUs)
     } else {
         rescueSwitchStaged = false;
         rescueSwitchDescending = false;
+        rescueSwitchRestarts = 0;
+        rescueSwitchAbortMs = 0;
     }
     flightPlanNavRescueDescent(rescueDescentRequest, currentTimeUs);
 #endif

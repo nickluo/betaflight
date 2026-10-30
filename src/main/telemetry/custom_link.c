@@ -49,6 +49,7 @@
 #include "fc/runtime_config.h"
 
 #include "flight/failsafe.h"
+#include "flight/flight_plan_nav.h"
 #include "flight/imu.h"
 #include "flight/mixer.h"
 #include "flight/pid.h"
@@ -818,6 +819,20 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
     DEBUG_SET(DEBUG_CUSTOM_LINK, 3, (int16_t)__atomic_load_n(&clStatRc, __ATOMIC_RELAXED));
     DEBUG_SET(DEBUG_CUSTOM_LINK, 4, (int16_t)__atomic_load_n(&clStatRingDrops, __ATOMIC_RELAXED));
     DEBUG_SET(DEBUG_CUSTOM_LINK, 5, (int16_t)__atomic_load_n(&clStatBytes, __ATOMIC_RELAXED));
+#if defined(USE_GPS_RESCUE) && ENABLE_RESCUE_PLAN
+    // Rescue-plan triage alongside the link counters: one-shot RTH degrades
+    // (altitude-only descent) are staged-or-aborted races that MSP modes
+    // sampling cannot resolve, so expose the executor state, the last abort
+    // reason, XY-estimate validity and the descent latch here.
+    {
+        uint16_t rescue = flightPlanNavGetState()
+            | (positionEstimatorIsValidXY() ? 0x20 : 0)
+            | (flightPlanNavIsRescueDescentActive() ? 0x40 : 0)
+            | (flightPlanNavIsInjectedPlanActive() ? 0x80 : 0);
+        DEBUG_SET(DEBUG_CUSTOM_LINK, 6, (int16_t)rescue);
+        DEBUG_SET(DEBUG_CUSTOM_LINK, 7, (int16_t)flightPlanNavGetAbortReason());
+    }
+#endif
 
     // authority is recomputed every task period so a watchdog expiry stops
     // the PID/mixer override immediately, ahead of the next processRxModes

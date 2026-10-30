@@ -536,10 +536,15 @@ class InterceptMission:
             gps = self.msp_request(106)
             if len(gps) >= 2:
                 diag["gps_fix"], diag["gps_sats"] = gps[0], gps[1]
-            dbg = self.msp_request(102)
+            dbg = self.msp_request(254)  # MSP_DEBUG (this branch): 8 x int16 debug[]
             if len(dbg) >= 12:
                 (diag["frames"], diag["env"], diag["imu"], diag["rc"],
                  diag["ringdrop"], diag["bytes"]) = struct.unpack_from("<6h", dbg)
+            if len(dbg) >= 16:
+                # Rescue-plan triage (debug[6]/[7]): low nibble = FP_NAV state,
+                # 0x20 XY estimate valid, 0x40 rescue descent latched,
+                # 0x80 injected plan active; [7] = flightPlanAbortReason.
+                diag["navstate"], diag["abort"] = struct.unpack_from("<2h", dbg, 12)
         except Exception as exc:  # noqa: BLE001 - diagnostics must never kill supervision
             log(f"link diagnostics poll failed: {exc}")
         self.link_diag, self.link_diag_stamp = diag, now
@@ -588,7 +593,8 @@ class InterceptMission:
                  else (None,) * 4),
                diag.get("gps_fix"), diag.get("gps_sats"),
                diag.get("frames"), diag.get("env"), diag.get("imu"), diag.get("rc"),
-               diag.get("ringdrop"), diag.get("bytes"))
+               diag.get("ringdrop"), diag.get("bytes"),
+               diag.get("navstate"), diag.get("abort"))
         if self.trajectory:
             self.trajectory.writerow(row)
         state["modes"] = modes
@@ -784,7 +790,8 @@ class InterceptMission:
                                   "fc_qx", "fc_qy", "fc_qz", "fc_qw",
                                   "gps_fix", "gps_sats",
                                   "cl_frames", "cl_env", "cl_imu", "cl_rc",
-                                  "cl_ringdrop", "cl_bytes"))
+                                  "cl_ringdrop", "cl_bytes",
+                                  "cl_navstate", "cl_abort"))
 
     def start_sitl(self):
         self.stage = "sitl"
@@ -1591,7 +1598,8 @@ class InterceptMission:
         return (f"dial={self.rc_channel('mode6')}us gps_fix={diag.get('gps_fix')} "
                 f"sats={diag.get('gps_sats')} cl_frames={diag.get('frames')} "
                 f"cl_env={diag.get('env')} cl_imu={diag.get('imu')} "
-                f"cl_ringdrop={diag.get('ringdrop')}")
+                f"cl_ringdrop={diag.get('ringdrop')} "
+                f"nav={diag.get('navstate')} abort={diag.get('abort')}")
 
     def rescue_degraded(self, state):
         """The ENABLE_RESCUE_PLAN no-GPS-fix degrade: the rescue plan cannot

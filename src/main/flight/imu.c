@@ -85,6 +85,7 @@ static bool imuUpdated = false;
 #define ATTITUDE_RESET_GYRO_LIMIT 15       // 15 deg/sec - gyro limit for quiet period
 #define ATTITUDE_RESET_ACTIVE_TIME 500000  // 500ms - Time to wait for attitude to converge at high gain
 #define GPS_COG_MIN_GROUNDSPEED 100        // 1.0m/s - min groundspeed for GPS Heading reinitialisation etc
+#define GPS_COG_INIT_GROUNDSPEED 300       // 3.0m/s - min groundspeed for the first COG heading lock: above wind-drift speed, so the initial lock is real forward flight
 
 bool canUseGPSHeading;
 
@@ -667,9 +668,15 @@ static void updateGpsHeadingUsable(float groundspeedGain, float imuCourseError, 
 {
     static float gpsHeadingConfidence = 0.0f;
     if (!canUseGPSHeading) {
-        const float alignment = fmaxf(1.0f - fabsf(imuCourseError) * 4.0f, 0.0f);
-        // fabsf(imuCourseError) = 0 when perfectly aligned, 0.25 at 15 degrees error, 1 for 90 degrees or greater error
-        // hence alignment is 1.0 when perfectly aligned, falling to zero when more than 15 degrees error.
+        // Wind-robust alignment window: wind drift bends COG away from the nose
+        // by atan(wind/speed), so a fixed 15-degree window can never open in a
+        // 5 m/s wind at flyable speeds (it would need ~19 m/s airspeed to
+        // crosswind). A given COG-vs-heading error is more likely genuine
+        // misalignment the faster the craft moves, so widen the window with
+        // groundspeed: ~15 degrees at 2 m/s to ~46 degrees at 8 m/s and above.
+        const float groundspeedMps = gpsSol.groundSpeed * 0.01f;
+        const float errScale = constrainf(4.0f - 0.45f * (groundspeedMps - 2.0f), 1.4f, 4.0f);
+        const float alignment = fmaxf(1.0f - fabsf(imuCourseError) * errScale, 0.0f);
         // an alignment of zero can be false, eg when wind drift angle matches an incorrect 'heading' angle
         const float confidence = groundspeedGain * alignment;
         // groundspeedGain is high when groundspeed is more than 1m/s
@@ -744,11 +751,14 @@ static void imuCalculateEstimatedAttitude(timeUs_t currentTimeUs)
 
             updateGpsHeadingUsable(groundspeedGain, imuCourseError, dt);
 
-        } else if (gpsSol.groundSpeed > GPS_COG_MIN_GROUNDSPEED) {
+        } else if (gpsSol.groundSpeed > GPS_COG_INIT_GROUNDSPEED) {
             if (!useMag) {
                 // Only reinitialize the quaternion from GPS COG when no mag is providing
                 // yaw reference.  When a mag is healthy it has already established yaw;
                 // overwriting it with an initial COG value would degrade accuracy.
+                // GPS_COG_INIT_GROUNDSPEED (3 m/s) keeps a wind-drifting hover from
+                // locking its drift direction in as the initial heading: at 1 m/s a
+                // hovering craft in wind moves, but its COG says nothing about the nose.
                 imuComputeQuaternionFromRPY(&qP, attitude.values.roll, attitude.values.pitch, gpsSol.groundCourse);
             }
             gpsHeadingInitialized = true;

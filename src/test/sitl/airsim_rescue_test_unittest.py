@@ -26,7 +26,7 @@ class RescueInputsTest(unittest.TestCase):
 
     def test_simulation_profile_tunes_outer_loop_not_rate_pid_or_rx_loss(self):
         self.assertIn("set gps_rescue_return_alt = 8", rescue.SIM_RESCUE_CONFIG)
-        self.assertIn("set gps_rescue_ground_speed = 300", rescue.SIM_RESCUE_CONFIG)
+        self.assertIn("set gps_rescue_ground_speed = 500", rescue.SIM_RESCUE_CONFIG)
         self.assertIn("set gps_rescue_landing_rate = 50", rescue.SIM_RESCUE_CONFIG)
         self.assertIn("set gps_rescue_allow_arming_without_fix = OFF", rescue.SIM_RESCUE_CONFIG)
         for setting in ("ap_position_p = 6", "ap_velocity_drag_coeff = 0",
@@ -51,7 +51,7 @@ class RescueInputsTest(unittest.TestCase):
 
 class ReturnFlightMetricsTest(unittest.TestCase):
     def metrics(self, velocity=(-3, 0, 0), attitude=(0, 3, 0)):
-        metrics = rescue.ReturnFlightMetrics()
+        metrics = rescue.ReturnFlightMetrics(cruise_speed_m_s=3.0)
         metrics.update(0, (80, 0), (10, 0, 5), (0, 40, 0))
         for i in range(30):
             metrics.update(6 + i * .1, (70 - i * .3, 0), velocity, attitude)

@@ -13,7 +13,7 @@ SIM_RESCUE_CONFIG = (
     "set gps_rescue_initial_climb = 3",
     "set gps_rescue_ascend_rate = 200",
     "set gps_rescue_descend_rate = 200",
-    "set gps_rescue_ground_speed = 300",
+    "set gps_rescue_ground_speed = 500",
     "set gps_rescue_landing_rate = 50",
     "set gps_rescue_descent_dist = 8",
     "set gps_rescue_min_sats = 8",
@@ -30,7 +30,7 @@ SIM_RESCUE_CONFIG = (
 class ReturnFlightMetrics:
     """Observe cruise separately from takeover/braking and the home descent."""
 
-    def __init__(self, cruise_speed_m_s=3.0):
+    def __init__(self, cruise_speed_m_s=5.0):
         self.cruise_speed = cruise_speed_m_s
         self.initial_distance = None
         self.peak_speed = 0.0
@@ -87,8 +87,10 @@ class ReturnFlightMetrics:
         metrics = self.summary()
         if self.cruise_samples < 20:
             raise AssertionError(f"too few Rescue cruise samples to assess stability: {metrics}")
-        if metrics["cruise_speed_error_rms_m_s"] > 1.5 \
-                or metrics["cruise_speed_std_m_s"] > 1.0 \
-                or self.cruise_peak_speed > 4.5 or self.cruise_peak_tilt > 20.0 \
+        # Speed tolerances scale with the commanded cruise: peak 1.5x, RMS error
+        # half, std a third (at 3 m/s these are the historical 4.5 / 1.5 / 1.0).
+        if metrics["cruise_speed_error_rms_m_s"] > 0.5 * self.cruise_speed \
+                or metrics["cruise_speed_std_m_s"] > self.cruise_speed / 3.0 \
+                or self.cruise_peak_speed > 1.5 * self.cruise_speed or self.cruise_peak_tilt > 20.0 \
                 or metrics["cruise_reverse_fraction"] > 0.05:
             raise AssertionError(f"unstable Rescue cruise: {metrics}")

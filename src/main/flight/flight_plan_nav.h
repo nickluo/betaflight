@@ -107,8 +107,10 @@ bool flightPlanNavIsRescuePlanActive(void);
 // (no home/fix) or whose plan aborts (flyaway/stall/GPS loss/heading). alt-hold
 // drives a baro-only descent - valid with the XY position estimate invalid -
 // while this detects touchdown and disarms (DISARM_REASON_LANDING), matching the
-// legacy emergency-descent behaviour. Call every cycle with the current request;
-// the query drives the alt-hold descent branch and the OSD annunciation.
+// legacy emergency-descent behaviour. Position hold stays active alongside it
+// while the XY estimate (and heading) is valid, so an aborted rescue descends in
+// place instead of drifting with the wind. Call every cycle with the current
+// request; the query drives the alt-hold descent branch and the OSD annunciation.
 void flightPlanNavRescueDescent(bool request, timeUs_t currentTimeUs);
 bool flightPlanNavIsRescueDescentActive(void);
 

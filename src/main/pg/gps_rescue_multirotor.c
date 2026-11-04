@@ -30,7 +30,7 @@
 
 #include "gps_rescue.h"
 
-PG_REGISTER_WITH_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig, PG_GPS_RESCUE, 9);
+PG_REGISTER_WITH_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig, PG_GPS_RESCUE, 10);
 
 PG_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig,
 
@@ -40,7 +40,7 @@ PG_RESET_TEMPLATE(gpsRescueConfig_t, gpsRescueConfig,
     .ascendRate = 200,          // cm/s, 2 m/s climb to the return altitude
 
     .returnAltitudeM = 8,
-    .groundSpeedCmS = 300,      // cm/s, 3 m/s return cruise speed
+    .groundSpeedCmS = 500,      // cm/s, 5 m/s return cruise speed, wind margin over typical 5 m/s breeze
 
     .descentDistanceM = 20,
     .descendRate = 200,         // cm/s, 2 m/s descent while above the return altitude

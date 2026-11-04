@@ -1182,6 +1182,7 @@ extern "C" {
     bool customLinkIsControlFresh(void) { return true; }
     bool customLinkIsModeRequested(void) { return mockHostRequested; }
     bool customLinkHostArmActive(void) { return false; }
+    bool customLinkAngleRequested(void) { return false; }
     void customLinkUpdateRcModes(bool) {}
     void sincosf_approx(float x, float *out_s, float *out_c) {
         *out_s = sin_approx(x);

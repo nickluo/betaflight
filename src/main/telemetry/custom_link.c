@@ -788,7 +788,11 @@ bool customLinkAngleRequested(void)
 
 float customLinkGetAngleSetpoint(int axis)
 {
-    return constrainf(cachedRate[axis], -10.0f, 10.0f);
+    // Host angle target in degrees, verbatim. pidLevel constrains it to the
+    // pid profile's angle_limit (CLI setting "angle_limit", default 60,
+    // range 10-80) - the same bound the pilot's ANGLE mode respects - so an
+    // out-of-range or garbage host command saturates there rather than here.
+    return cachedRate[axis];
 }
 
 float customLinkGetThrottle(void)

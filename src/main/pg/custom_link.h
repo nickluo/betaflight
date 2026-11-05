@@ -24,8 +24,10 @@
 
 typedef struct customLinkConfig_s {
     uint16_t watchdog_ms;       // host control stream staleness limit before offboard reverts to RC
-    uint16_t rate_limit_dps;    // host rate setpoint clamp per axis, deg/s; 0 = unlimited
-    uint16_t angle_limit_deg;   // roll/pitch attitude envelope for host control, deg; 0 = unlimited
+    uint16_t rate_limit_dps;    // host rate setpoint clamp per axis, deg/s; 0 = unlimited (rate mode / yaw)
+    uint16_t angle_limit_deg;   // rate-mode roll/pitch attitude envelope, deg; 0 = unlimited.
+                                // mode_req=3 angle targets are NOT gated by this - they are
+                                // bounded by the pid profile's angle_limit in pidLevel.
     uint8_t motors_stream;      // stream 0x13 mixer motor outputs to the host; 0 = off, 1 = on
 } customLinkConfig_t;
 

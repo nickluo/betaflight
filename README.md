@@ -144,11 +144,11 @@ readback must not be mistaken for a refresh of the active runtime coefficients.
 `APPLY_PID args="angle"` is a read-only capability probe returning `ANGLE OFFBOARD 1`
 when the native ANGLE path is compiled. Host control `mode_req=3` uses the same
 20-byte payload and authority/watchdog/pilot-takeover rules as rate mode 2, but
-roll/pitch fields carry 0.1-degree targets (clamped to ±10 degrees) while yaw
-remains 0.1 deg/s. Authorized mode 3 enables both ANGLE and OFFBOARD and supplies
-the targets directly to the existing `pidLevel` outer loop, without RC-rate scaling
-or pilot angle feedforward. Mode 2 remains rate-only. This supports closed-loop
-bench gain trials, not free-flight certification; live PID apply still requires
+roll/pitch fields carry 0.1-degree targets while yaw remains 0.1 deg/s. Authorized
+mode 3 enables both ANGLE and OFFBOARD and supplies the targets directly to the
+existing `pidLevel` outer loop, without RC-rate scaling or pilot angle feedforward;
+targets are bounded by the pid profile's `angle_limit` (default 60 degrees) exactly
+like the pilot's ANGLE mode. Mode 2 remains rate-only; live PID apply still requires
 zero throttle and zero command fields. See [the disposable SITL mode regression](src/test/sitl/sitl_custom_link_angle_test.py).
 
 ### AirSim POS HOLD odometry regression

@@ -15,14 +15,14 @@ flight/pid.c pidLevel uses attitude and rate on the same sign per axis):
                 nose-down + (both are the FLU right-handed +axis rotation),
                 yaw CCW +
   * acc        = FLU specific force: X fwd +, Y LEFT +, Z up + (+1 g level)
-  * attitude   roll right +, pitch nose-down + (FLU algebra), yaw =
-                right-handed math angle CCW +, 0 = north  (0x10)
+  * attitude   = quaternion (x16384, w first), FLU body -> ENU world =
+                Rz(+90 deg) * q_phys, continuous through +/-90 deg pitch
+                where the legacy ZYX euler transport wrapped (0x10)
 
-i.e. 0x10 gyro/acc are exactly the FLU values, 0x10 attitude is the FLU
-tf2-style RPY (pitch nose-down +) with yaw re-referenced to north, and the
-0x20 rate targets live in the 0x10 gyro frame. The ROS bridge therefore
-needs NO sign flips on gyro, acc, attitude or uplink rates - only the yaw
-reference rotation (+pi/2 to ENU).
+i.e. 0x10 gyro/acc are exactly the FLU values, the 0x10 attitude quaternion
+is the physics attitude pre-rotated to the ENU reference, and the 0x20 rate
+targets live in the 0x10 gyro frame. The ROS bridge therefore needs NO sign
+flips or reference rotations anywhere - the quaternion is published verbatim.
 
 Phases:
 
@@ -103,7 +103,7 @@ class Parser:
             if len(self.buf) < 5:
                 return
             msg_id, length, seq = self.buf[2], self.buf[3], self.buf[4]
-            if length == 0 or length > 64:
+            if length == 0 or length > 80:
                 self.buf = self.buf[2:]
                 continue
             if len(self.buf) < 7 + length:
@@ -239,52 +239,81 @@ def quat_from_rpy(roll, pitch, yaw):
             sy * cp * cr - cy * sp * sr)
 
 
+QZ90 = (math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5))   # +90 deg about world z
+
+
+def quat_wire_expected(phys_q):
+    """Expected 0x10 quaternion for a physics attitude q (FLU -> world with
+    world-X playing magnetic north): FLU -> ENU is Rz(+90) * q."""
+    return quat_mul(QZ90, phys_q)
+
+
+def quat_angle_err_deg(a, b):
+    """Rotation angle between two quaternions, degrees (robust to q ~ -q)."""
+    d = abs(sum(x * y for x, y in zip(a, b)))
+    d = max(-1.0, min(1.0, d))
+    return math.degrees(2.0 * math.acos(d))
+
+
+def wire_quat_to_att_deg(qraw):
+    """0x10 quat ints -> (roll, pitch, yaw) degrees in the legacy 0x10 domain:
+    roll right +, pitch nose-down +, yaw right-handed CCW+ from north."""
+    w, x, y, z = (v / 16384.0 for v in qraw)
+    roll = math.degrees(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
+    s = max(-1.0, min(1.0, 2 * (w * y - z * x)))
+    pitch = math.degrees(math.asin(s))
+    yaw_enu = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+    return roll, pitch, (yaw_enu - 90.0 + 180.0) % 360.0 - 180.0
+
+
 class BridgeReplica:
     """Transform pair replicating custom_link_vehicle_node.cpp.
 
-    fixed=True is the CORRECTED mapping: Betaflight gyro/acc are FLU
-    verbatim and the attitude euler is the FLU RPY (pitch nose-down +) --
-    no sign flips anywhere, only the yaw reference rotation to ENU.
+    fixed=True is the current node mapping: the 0x10 attitude quaternion
+    (FLU -> ENU) is decoded, renormalized and published verbatim - no sign
+    flips or reference rotations anywhere (gyro/acc/uplink rates have been
+    verbatim FLU since the left-handed-frame fix).
 
-    fixed=False replicates the CURRENT node code, which negates gyro
-    pitch/yaw, acc Y and the uplink pitch/yaw rate commands (its comments
-    misread the Betaflight conventions as a left-handed frame).
+    fixed=False replicates the historical left-handed-frame fault transplanted
+    to the quaternion era: the pitch sign inverted on the fed-back attitude
+    (roll/yaw pass through). Inverted pitch feedback is positive feedback -
+    linearized it puts an unstable pole at the target - so the closed loop
+    diverges, the exact mechanism behind the real OFFBOARD runaway fixed in
+    the node on 2026-10-09.
     """
 
     def __init__(self, fixed):
         self.fixed = fixed
 
-    def attitude_from_telemetry(self, att):
-        """0x10 attitude (0.01 deg) -> orientation quaternion as published
-        on /mavros/imu/data via tf2 setRPY. Both variants pass pitch
-        through (that part of the node was already right)."""
-        roll = math.radians(att[0] * 0.01)
-        pitch = math.radians(att[1] * 0.01)
-        yaw_enu = norm_angle(math.radians(att[2] * 0.01) + math.pi / 2)
-        return quat_from_rpy(roll, pitch, yaw_enu)
-
-    def gyro_flu(self, gyro):
-        """0x10 gyro (0.1 deg/s, BF) -> FLU rad/s."""
-        sy = 1.0 if self.fixed else -1.0   # node negates pitch/yaw
-        return (gyro[0] * 0.1 * math.pi / 180.0,
-                gyro[1] * 0.1 * math.pi / 180.0 * sy,
-                gyro[2] * 0.1 * math.pi / 180.0 * sy)
+    def attitude_from_telemetry(self, qraw):
+        """0x10 quaternion (x16384, FLU->ENU) -> orientation quaternion as
+        published on the Imu topic: decode, renormalize, publish verbatim."""
+        q = [v / 16384.0 for v in qraw]
+        n = math.sqrt(sum(v * v for v in q))
+        q = [v / n for v in q]
+        if self.fixed:
+            return tuple(q)
+        w, x, y, z = q
+        roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        pitch = -math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        return quat_from_rpy(roll, pitch, yaw)
 
     @staticmethod
-    def acc_flu_buggy(acc):
-        """Current node code: {ax, -ay, az}."""
-        return (acc[0] * 0.001, -acc[1] * 0.001, acc[2] * 0.001)
+    def gyro_flu(gyro):
+        """0x10 gyro (0.1 deg/s, BF) -> FLU rad/s, verbatim."""
+        k = 0.1 * math.pi / 180.0
+        return (gyro[0] * k, gyro[1] * k, gyro[2] * k)
 
     @staticmethod
-    def acc_flu_fixed(acc):
-        """Corrected: BF acc is already FLU (Y left+)."""
+    def acc_flu(acc):
+        """0x10 acc (1 mg) -> FLU g, verbatim."""
         return (acc[0] * 0.001, acc[1] * 0.001, acc[2] * 0.001)
 
-    def rates_to_bf(self, wx, wy, wz):
-        """FLU bodyrates rad/s -> 0x20 rate deg/s (BF axes)."""
-        sy = 1.0 if self.fixed else -1.0   # node negates pitch/yaw
-        return (math.degrees(wx), math.degrees(wy) * sy,
-                math.degrees(wz) * sy)
+    @staticmethod
+    def rates_to_bf(wx, wy, wz):
+        """FLU bodyrates rad/s -> 0x20 rate deg/s (BF axes), verbatim."""
+        return (math.degrees(wx), math.degrees(wy), math.degrees(wz))
 
 
 class AttitudeController:
@@ -411,12 +440,15 @@ class Telemetry:
     def _decode(self, msg_id, p, stamp):
         try:
             if msg_id == MSG_FC_FAST:
-                ts, gx, gy, gz, ax, ay, az, r, pi_, yaw = struct.unpack(
-                    "<I3h3h3h", p[:22])
+                ts, gx, gy, gz, ax, ay, az, qw, qx, qy, qz = struct.unpack(
+                    "<I3h3h4h", p[:24])
                 self.last["gyro"] = (gx, gy, gz)
                 self.last["acc"] = (ax, ay, az)
-                self.last["att"] = (r, pi_, yaw)
-                self.hist.append((stamp, (gx, gy, gz), (r, pi_, yaw)))
+                self.last["quat"] = (qw, qx, qy, qz)
+                # legacy-domain euler derived per sample so pulse averaging
+                # keeps working unchanged
+                self.last["att"] = wire_quat_to_att_deg(self.last["quat"])
+                self.hist.append((stamp, (gx, gy, gz), self.last["att"]))
                 if len(self.hist) > 4000:
                     del self.hist[:1000]
             elif msg_id == 0x12:
@@ -443,9 +475,7 @@ class Telemetry:
         return bool(f is not None and (f & OFFBOARD_MODE_BIT))
 
     def att_deg(self):
-        att = self.last.get("att")
-        return None if att is None else (att[0] * 0.01, att[1] * 0.01,
-                                         att[2] * 0.01)
+        return self.last.get("att")
 
     def gyro_dps(self):
         g = self.last.get("gyro")
@@ -522,11 +552,11 @@ def run_attitude_hold(feed, tel, bridge, phys, target_deg, hold_s,
     dbg_t0 = time.monotonic()
     feed.control["throttle"] = 1300
     while time.monotonic() < t_end:
-        att = tel.last.get("att")
-        if att is None:
+        qraw = tel.last.get("quat")
+        if qraw is None:
             time.sleep(0.01)
             continue
-        q_cur = bridge.attitude_from_telemetry(att)
+        q_cur = bridge.attitude_from_telemetry(qraw)
         wx, wy, wz = ctrl.rates(q_cur, q_des)
         rates = bridge.rates_to_bf(wx, wy, wz)
         feed.control["rates"] = rates
@@ -591,8 +621,7 @@ def run_phase_a(feed, tel, phys, results):
         gyro_samples = [h[1] for h in tel.hist if h[0] > t_end - dur * 0.6]
         att_samples = [h[2] for h in tel.hist if h[0] > t_end - 0.15]
         g_mean = tuple(mean(g[i] for g in gyro_samples) for i in range(3))
-        att_end = tuple(mean(a[i] for a in att_samples) for i in range(3))
-        att_end_deg = tuple(v * 0.01 for v in att_end)
+        att_end_deg = tuple(mean(a[i] for a in att_samples) for i in range(3))
         g_mean_dps = tuple(v * 0.1 for v in g_mean)
         print(f"  [{name}] cmd={cmd} deg/s  gyro mean={tuple(round(v,1) for v in g_mean_dps)}"
               f"  motors={mid_motors}"
@@ -623,6 +652,61 @@ def run_phase_a(feed, tel, phys, results):
     results["A_yaw"] = pulse("yaw", 2, 50, 1.2, chk_yaw)
     lv = hold_level_direct(feed, phys)
     print(f"  re-level after yaw: {lv}")
+
+    # 0x10 attitude quaternion vs physics truth at rest: the wire quaternion
+    # must equal Rz(+90) * q_phys (FLU -> ENU), and euler extracted from it
+    # must keep the legacy roll/pitch signs.
+    qraw = tel.last.get("quat")
+    if qraw is not None and tel.att_deg() is not None:
+        q_dec = tuple(v / 16384.0 for v in qraw)
+        q_err = quat_angle_err_deg(q_dec, quat_wire_expected(phys.q))
+        att = tel.att_deg()
+        r, p, y = phys.euler_flu()
+        e_err = max(abs(att[0] - math.degrees(r)), abs(att[1] - math.degrees(p)))
+        results["A_att_quat"] = q_err < 8.0 and e_err < 5.0
+        print(f"  att quat err={q_err:.1f} deg, euler roll/pitch err={e_err:.1f} deg")
+    else:
+        results["A_att_quat"] = False
+        print("  [FAIL] no 0x10 quaternion received")
+
+    # past-vertical regression: sweep pitch through -90 deg (nose-up past
+    # vertical). The legacy euler transport wrapped there (pitch sign
+    # reversed, roll flipped 180 deg - the original field symptom); the
+    # quaternion must track physics continuously through the crossing.
+    # Crossing is detected on the tilt angle (body +Z vs world up), which is
+    # continuous through the wrap where euler_flu pitch saturates at -90.
+    def tilt_deg(q):
+        c = max(-1.0, min(1.0, 1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2])))
+        return math.degrees(math.acos(c))
+
+    print("  past-vertical pitch sweep (nose-up through -90 deg)")
+    feed.control["rates"] = (0, -160, 0)
+    sweep = []
+    t_sweep = time.monotonic() + 4.0
+    while time.monotonic() < t_sweep:
+        sweep.append((tilt_deg(phys.q), phys.q, tel.last.get("quat")))
+        if sweep[-1][0] > 105.0:
+            break
+        time.sleep(0.01)
+    feed.control["rates"] = (0, 0, 0)
+    crossed = bool(sweep) and max(s[0] for s in sweep) > 95.0
+    max_err = 0.0
+    max_step = 0.0
+    prev_q = None
+    for _, q_phys, qraw in sweep:
+        if qraw is None:
+            continue
+        q_dec = tuple(v / 16384.0 for v in qraw)
+        max_err = max(max_err, quat_angle_err_deg(q_dec, quat_wire_expected(q_phys)))
+        if prev_q is not None:
+            max_step = max(max_step, quat_angle_err_deg(q_dec, prev_q))
+        prev_q = q_dec
+    results["A_past_vertical"] = bool(crossed and max_err < 15.0 and max_step < 6.0)
+    print(f"  sweep: crossed={crossed}, "
+          f"max_tilt={max((s[0] for s in sweep), default=0.0):.1f} deg, "
+          f"max quat err={max_err:.1f} deg, max sample step={max_step:.1f} deg")
+    lv = hold_level_direct(feed, phys)
+    print(f"  re-level after sweep: {lv}")
 
     # published gyro/acc vs physics truth (FLU verbatim expectation)
     g_phys = phys.gyro_bf_dps()
@@ -666,7 +750,8 @@ def run_phase_b(feed, tel, phys, results):
     run_attitude_hold(feed, tel, bridge_fixed, phys, (0.0, 0.0),
                       hold_s=0.5, settle=6.0)
 
-    # BUGGY transform (current node code): inverted pitch/yaw rate commands
+    # BUGGY transform: pitch feedback sign inverted (the historical
+    # left-handed-frame bug) - inverted pitch feedback must diverge
     bridge_buggy = BridgeReplica(fixed=False)
     conv, samples = run_attitude_hold(feed, tel, bridge_buggy, phys,
                                       (0.0, -8.0), hold_s=1.5, settle=8.0)

@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include <cmath>
 
 extern "C" {
     #include <platform.h>
@@ -132,20 +133,103 @@ TEST(CustomLinkRoundtripTest, OdometryPayloadFitsFrameAndPreservesEnuFields)
     odom.position_cm[1] = -23456;
     odom.position_cm[2] = 345;
     odom.velocity_cms[0] = -100;
-    odom.attitude_cdeg[2] = -9000;
+    odom.quat[3] = -11585;
     odom.gyro_dps_x10[1] = 200;
     odom.position_variance[0] = 0.25f;
     odom.velocity_variance[2] = 0.04f;
     uint8_t bytes[CUSTOM_LINK_FRAME_MAX];
     const uint8_t size = clEncodeFrame(CUSTOM_LINK_MSG_FC_ODOMETRY, 42, &odom, sizeof(odom), bytes, sizeof(bytes));
-    ASSERT_EQ(sizeof(odom), 64u);
-    ASSERT_EQ(size, 71);
+    ASSERT_EQ(sizeof(odom), 66u);
+    ASSERT_EQ(size, 73);
     feedBytes(bytes, size, 1000, 10);
     ASSERT_EQ(testRx.frameCount, 1u);
     ASSERT_EQ(testRx.lastFrame.msgId, CUSTOM_LINK_MSG_FC_ODOMETRY);
     clPayloadOdometry_t decoded;
     memcpy(&decoded, testRx.lastFrame.payload, sizeof(decoded));
     EXPECT_EQ(memcmp(&odom, &decoded, sizeof(odom)), 0);
+}
+
+// ZYX euler (FLU body, ENU world) of a decoded wire quaternion: roll right +,
+// pitch nose-down +, yaw 0 = east CCW + - the legacy 0x10 semantics.
+static void wireQuatToEulerDeg(const int16_t q[4], float eulerDeg[3])
+{
+    float v[4];
+    for (int i = 0; i < 4; i++) {
+        v[i] = q[i] / 16384.0f;
+    }
+    const float w = v[0], x = v[1], y = v[2], z = v[3];
+    eulerDeg[0] = atan2f(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + y * y)) * (180.0f / 3.14159265f);
+    const float s = 2.0f * (w * y - z * x);
+    eulerDeg[1] = asinf(s < -1.0f ? -1.0f : (s > 1.0f ? 1.0f : s)) * (180.0f / 3.14159265f);
+    eulerDeg[2] = atan2f(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z)) * (180.0f / 3.14159265f);
+}
+
+TEST(CustomLinkQuatTest, EncodeIsEnuReferenced)
+{
+    const float c = 0.70710678f;
+    int16_t out[4];
+
+    // level, nose magnetic north: internal q = identity -> wire = Rz(+90 deg)
+    const float qId[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    clQuatEncodeEnu(qId, out);
+    EXPECT_EQ(out[0], 11585);
+    EXPECT_EQ(out[1], 0);
+    EXPECT_EQ(out[2], 0);
+    EXPECT_EQ(out[3], 11585);
+
+    // level, nose east: internal Rz(-90 deg) -> wire = identity (ENU yaw 0)
+    const float qEast[4] = { c, 0.0f, 0.0f, -c };
+    clQuatEncodeEnu(qEast, out);
+    EXPECT_NEAR(out[0], 16384, 2);
+    EXPECT_EQ(out[1], 0);
+    EXPECT_EQ(out[2], 0);
+    EXPECT_NEAR(out[3], 0, 1);
+}
+
+TEST(CustomLinkQuatTest, EncodeReproducesLegacyEulerSemantics)
+{
+    // pure roll +30 deg: wire euler must read roll 30, pitch 0, yaw +90
+    // (north) - exactly what the old 0x10 euler fields carried after the
+    // host-side +pi/2 yaw rotation.
+    const float qRoll30[4] = { 0.96592583f, 0.25881905f, 0.0f, 0.0f };
+    int16_t out[4];
+    clQuatEncodeEnu(qRoll30, out);
+    float euler[3];
+    wireQuatToEulerDeg(out, euler);
+    EXPECT_NEAR(euler[0], 30.0f, 0.2f);
+    EXPECT_NEAR(euler[1], 0.0f, 0.2f);
+    EXPECT_NEAR(euler[2], 90.0f, 0.2f);
+}
+
+TEST(CustomLinkQuatTest, EncodeIsContinuousPastVerticalPitch)
+{
+    // nose-up past vertical (internal pitch -100 deg): the wire quaternion
+    // keeps encoding the true attitude where the legacy ZYX euler wrapped
+    // (pitch read -80 deg, roll flipped 180 deg). Compare the rotation.
+    const float qUp100[4] = { 0.64278761f, 0.0f, -0.76604444f, 0.0f };
+    int16_t out[4];
+    clQuatEncodeEnu(qUp100, out);
+    const float c = 0.70710678f;
+    const float expected[4] = {
+        c * qUp100[0] - c * qUp100[3],
+        c * qUp100[1] - c * qUp100[2],
+        c * qUp100[1] + c * qUp100[2],
+        c * qUp100[3] + c * qUp100[0],
+    };
+    for (int i = 0; i < 4; i++) {
+        EXPECT_NEAR(out[i] / 16384.0f, expected[i], 2.0f / 16384.0f);
+    }
+}
+
+TEST(CustomLinkQuatTest, EncodeNonFiniteFallsBackToIdentity)
+{
+    const float qBad[4] = { NAN, 1.0f, 0.0f, 0.0f };
+    int16_t out[4] = { 1, 2, 3, 4 };
+    clQuatEncodeEnu(qBad, out);
+    EXPECT_EQ(out[0], 16384);
+    EXPECT_EQ(out[1], 0);
+    EXPECT_EQ(out[2], 0);
+    EXPECT_EQ(out[3], 0);
 }
 
 TEST(CustomLinkRoundtripTest, TestAllMessageIds)
@@ -156,7 +240,7 @@ TEST(CustomLinkRoundtripTest, TestAllMessageIds)
     fast.ts_us = 123456;
     fast.gyro[FD_ROLL] = -1234;
     fast.acc[FD_PITCH] = 999;
-    fast.attitude[FD_YAW] = 18000;
+    fast.quat[3] = 11585;
     uint8_t buf[CUSTOM_LINK_FRAME_MAX];
     uint8_t len = clEncodeFrame(CUSTOM_LINK_MSG_FC_FAST, 7, &fast, sizeof(fast), buf, sizeof(buf));
     ASSERT_GT(len, 0);
@@ -170,7 +254,7 @@ TEST(CustomLinkRoundtripTest, TestAllMessageIds)
     EXPECT_EQ(fastOut.ts_us, fast.ts_us);
     EXPECT_EQ(fastOut.gyro[FD_ROLL], fast.gyro[FD_ROLL]);
     EXPECT_EQ(fastOut.acc[FD_PITCH], fast.acc[FD_PITCH]);
-    EXPECT_EQ(fastOut.attitude[FD_YAW], fast.attitude[FD_YAW]);
+    EXPECT_EQ(fastOut.quat[3], fast.quat[3]);
 
     clPayloadControl_t ctrl = {};
     ctrl.host_ts_us = 0x1122334455667788ULL;
@@ -576,24 +660,24 @@ TEST(CustomLinkCliTest, TestCliResponseHeaderChunking)
     clPayloadCliResp_t resp;
 
     // full chunk out of a longer response: MORE set, payload maxed
-    uint8_t n = clCliResponseHeader(&resp, 0xBEEF, 130, 0, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
-    EXPECT_EQ(n, 64u);
+    uint8_t n = clCliResponseHeader(&resp, 0xBEEF, 200, 0, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 80u);
     EXPECT_EQ(resp.req_id, 0xBEEFu);
-    EXPECT_EQ(resp.total_len, 130u);
+    EXPECT_EQ(resp.total_len, 200u);
     EXPECT_EQ(resp.offset, 0u);
     EXPECT_EQ(resp.status, CL_CLI_STATUS_OK);
     EXPECT_EQ(resp.flags, CL_CLI_FLAG_MORE);
 
     // middle chunk
-    n = clCliResponseHeader(&resp, 0xBEEF, 130, 56, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
-    EXPECT_EQ(n, 64u);
-    EXPECT_EQ(resp.offset, 56u);
+    n = clCliResponseHeader(&resp, 0xBEEF, 200, 72, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 80u);
+    EXPECT_EQ(resp.offset, 72u);
     EXPECT_EQ(resp.flags, CL_CLI_FLAG_MORE);
 
     // final partial chunk: clamped to the remaining bytes, MORE clear
-    n = clCliResponseHeader(&resp, 0xBEEF, 130, 112, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
-    EXPECT_EQ(n, 8u + 18u);
-    EXPECT_EQ(resp.offset, 112u);
+    n = clCliResponseHeader(&resp, 0xBEEF, 200, 144, CL_CLI_STATUS_OK, CL_CLI_MAX_DATA);
+    EXPECT_EQ(n, 8u + 56u);
+    EXPECT_EQ(resp.offset, 144u);
     EXPECT_EQ(resp.flags, 0u);
 
     // short single-chunk response
@@ -982,7 +1066,7 @@ TEST_F(CustomLinkAuthorityTest, WatchdogStillDropsHostAuthorityWithoutPilotTakeo
 
 TEST(CustomLinkStructTest, TestPackedLayout)
 {
-    EXPECT_EQ(sizeof(clPayloadFast_t), 22u);
+    EXPECT_EQ(sizeof(clPayloadFast_t), 24u);
     EXPECT_EQ(sizeof(clPayloadMedium_t), 47u);
     EXPECT_EQ(sizeof(clPayloadSlow_t), 36u);
     EXPECT_EQ(sizeof(clPayloadMotors_t), 17u);
@@ -992,8 +1076,8 @@ TEST(CustomLinkStructTest, TestPackedLayout)
     EXPECT_EQ(sizeof(clPayloadHostRc_t), 36u);
     EXPECT_EQ(sizeof(clPayloadTimesyncReq_t), 8u);
     EXPECT_EQ(sizeof(clPayloadTimesyncResp_t), 16u);
-    EXPECT_EQ(sizeof(clPayloadCliReq_t), 64u);
-    EXPECT_EQ(sizeof(clPayloadCliResp_t), 64u);
+    EXPECT_EQ(sizeof(clPayloadCliReq_t), 80u);
+    EXPECT_EQ(sizeof(clPayloadCliResp_t), 80u);
     EXPECT_EQ(sizeof(clPayloadEscTelemetry_t), 22u);
 
     EXPECT_EQ(offsetof(clPayloadControl_t, host_ts_us), 0u);

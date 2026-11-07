@@ -28,6 +28,7 @@
 #if defined(USE_CUSTOM_LINK)
 
 #include "common/crc.h"
+#include "common/maths.h"
 
 #include "telemetry/custom_link_protocol.h"
 
@@ -36,6 +37,33 @@ uint16_t clCrc(const clFrame_t *frame)
     // msgId, len and seq are contiguous at the head of clFrame_t
     uint16_t crc = crc16_ccitt_update(0, &frame->msgId, 3);
     return crc16_ccitt_update(crc, frame->payload, frame->len);
+}
+
+void clQuatEncodeEnu(const float qIn[4], int16_t out[4])
+{
+    // qz(+pi/2) = (c, 0, 0, c), c = sqrt(0.5); ENU differs from the internal
+    // NWU earth frame by exactly this rotation (north -> +Y, east -> +X):
+    //   q_enu = qz(+pi/2) * q_nwu
+    const float c = 0.70710678f;
+    const float qEnu[4] = {
+        c * qIn[0] - c * qIn[3],
+        c * qIn[1] - c * qIn[2],
+        c * qIn[1] + c * qIn[2],
+        c * qIn[3] + c * qIn[0],
+    };
+
+    if (isfinite(qEnu[0]) && isfinite(qEnu[1]) && isfinite(qEnu[2]) && isfinite(qEnu[3])) {
+        for (unsigned i = 0; i < 4; i++) {
+            out[i] = constrain((int32_t)lrintf(qEnu[i] * 16384.0f), INT16_MIN, INT16_MAX);
+        }
+    } else {
+        // a NaN attitude must never reach the wire as garbage; identity is a
+        // harmless placeholder and hosts already gate on quaternion sanity
+        out[0] = 16384;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+    }
 }
 
 uint8_t clEncodeFrame(uint8_t msgId, uint8_t seq, const void *payload, uint8_t payloadLen, uint8_t *out, uint8_t outSize)

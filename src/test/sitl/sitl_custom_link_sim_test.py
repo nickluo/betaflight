@@ -39,6 +39,7 @@ Notes:
 """
 
 import argparse
+import math
 import os
 import signal
 import socket
@@ -109,7 +110,7 @@ class Parser:
             if len(self.buf) < 5:
                 return
             msg_id, length, seq = self.buf[2], self.buf[3], self.buf[4]
-            if length == 0 or length > 64:
+            if length == 0 or length > 80:
                 self.buf = self.buf[2:]
                 continue
             if len(self.buf) < 7 + length:
@@ -225,11 +226,11 @@ class Telemetry:
     def _decode(self, msg_id, p, stamp):
         try:
             if msg_id == MSG_FC_FAST:
-                ts, gx, gy, gz, ax, ay, az, r, pi, yaw = struct.unpack(
-                    "<I3h3h3h", p[:22])
+                ts, gx, gy, gz, ax, ay, az, qw, qx, qy, qz = struct.unpack(
+                    "<I3h3h4h", p[:24])
                 self.last["gyro"] = (gx, gy, gz)
                 self.last["acc"] = (ax, ay, az)
-                self.last["attitude"] = (r, pi, yaw)
+                self.last["quat"] = (qw, qx, qy, qz)
             elif msg_id == MSG_FC_MEDIUM:
                 ts, pa, alt, temp = struct.unpack("<IIih", p[:14])
                 rc = struct.unpack("<16H", p[14:46])
@@ -264,8 +265,17 @@ class Telemetry:
         return self.last.get("gyro")
 
     def attitude_deg(self):
-        att = self.last.get("attitude")
-        return None if att is None else tuple(v * 0.1 for v in att)
+        """Euler degrees from the 0x10 attitude quaternion (FLU -> ENU):
+        roll right +, pitch nose-down +, yaw CCW + from north."""
+        q = self.last.get("quat")
+        if q is None:
+            return None
+        w, x, y, z = (v / 16384.0 for v in q)
+        roll = math.degrees(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
+        s = max(-1.0, min(1.0, 2 * (w * y - z * x)))
+        pitch = math.degrees(math.asin(s))
+        yaw_enu = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+        return (roll, pitch, (yaw_enu - 90.0 + 180.0) % 360.0 - 180.0)
 
     def armed(self):
         s = self.last.get("status")

@@ -49,7 +49,7 @@
 #define CUSTOM_LINK_SYNC2            0x90
 
 #define CUSTOM_LINK_FRAME_OVERHEAD   7                     // sync(2) + msgId + len + seq + crc16
-#define CUSTOM_LINK_MAX_PAYLOAD      64
+#define CUSTOM_LINK_MAX_PAYLOAD      80
 #define CUSTOM_LINK_FRAME_MAX        (CUSTOM_LINK_FRAME_OVERHEAD + CUSTOM_LINK_MAX_PAYLOAD)
 
 typedef enum {
@@ -69,18 +69,20 @@ typedef enum {
     CUSTOM_LINK_MSG_FC_TIMESYNC    = 0x31,   // time sync response (T1, T2, T3)
 } customLinkMsgId_e;
 
-// 0x10 - 200 Hz IMU and attitude (22 bytes)
+// 0x10 - 200 Hz IMU and attitude (24 bytes)
 typedef struct __attribute__((packed)) {
     uint32_t ts_us;             // FC micros() timestamp
     int16_t gyro[3];            // filtered gyro, 0.1 deg/s (roll right +,
                                 // pitch nose-down +, yaw CCW +)
     int16_t acc[3];             // accelerometer, 1 mg (FLU: X fwd, Y LEFT, Z up;
                                 // level reads +1000 on Z)
-    int16_t attitude[3];        // roll/pitch/yaw euler angles, 0.01 deg:
-                                // roll right +, pitch NOSE-DOWN +; yaw is a
-                                // right-handed math angle: positive = counter-
-                                // clockwise around body +Z(Up), 0 = magnetic
-                                // north, expressed as -180.00..+180.00 deg
+    int16_t quat[4];            // attitude quaternion w,x,y,z, each x16384.
+                                // Rotation body-FLU -> world-ENU: at level
+                                // attitude the euler angles extracted from it
+                                // keep the legacy semantics (roll right +,
+                                // pitch NOSE-DOWN +, yaw 0 = east, CCW +) with
+                                // no +/-90 deg pitch singularity. Level nose
+                                // north encodes as (11585,0,0,11585).
 } clPayloadFast_t;
 
 // 0x11 - 100 Hz barometer, temperature, RC channels and link quality (47 bytes)
@@ -112,7 +114,7 @@ typedef struct __attribute__((packed)) {
     uint16_t status;            // bit0 = armed, bit1 = failsafe active
 } clPayloadSlow_t;
 
-// 0x14 - 100 Hz, same sampling epoch for position, velocity, attitude and gyro (64 bytes).
+// 0x14 - 100 Hz, same sampling epoch for position, velocity, attitude and gyro (66 bytes).
 // Sent only while armed with a 3D GPS fix, a GPS origin captured at ARM, and valid fusion.
 typedef struct __attribute__((packed)) {
     uint32_t ts_us;             // FC telemetry sample timestamp
@@ -120,7 +122,7 @@ typedef struct __attribute__((packed)) {
     uint16_t origin_id;         // increments on each successful ARM (wraps at 65536)
     int32_t position_cm[3];     // ENU, relative to the ARM position
     int16_t velocity_cms[3];    // ENU
-    int16_t attitude_cdeg[3];   // as 0x10: FLU R/P/Y; yaw CCW from North
+    int16_t quat[4];            // attitude quaternion as 0x10 (FLU -> ENU, x16384)
     int16_t gyro_dps_x10[3];    // FLU body angular velocity
     float position_variance[3]; // m^2, ENU diagonal
     float velocity_variance[3]; // (m/s)^2, ENU diagonal
@@ -133,7 +135,7 @@ typedef struct __attribute__((packed)) {
 #define CL_ODOM_ARMED               0x0008
 #define CL_ODOM_VALID_FLAGS         (CL_ODOM_GPS_3D_FIX | CL_ODOM_ARM_ORIGIN | CL_ODOM_ESTIMATE_VALID | CL_ODOM_ARMED)
 
-_Static_assert(sizeof(clPayloadOdometry_t) == 64, "odometry payload size");
+_Static_assert(sizeof(clPayloadOdometry_t) == 66, "odometry payload size");
 
 #define CL_STATUS_ARMED              0x0001
 #define CL_STATUS_FAILSAFE           0x0002
@@ -300,6 +302,16 @@ typedef struct {
 
 // Computes the CRC of a frame header+payload the way clEncodeFrame appends it.
 uint16_t clCrc(const clFrame_t *frame);
+
+// Encodes the wire attitude quaternion for 0x10/0x14: composes the Betaflight
+// internal attitude quaternion (qIn, w first: body-FLU -> world-NWU, as
+// exported by imuGetQuaternion) with a +90 deg earth-frame z rotation, giving
+// body-FLU -> world-ENU, then scales each component by 16384 into out
+// (constrained to int16). ZYX euler extraction of the result reproduces the
+// legacy euler semantics exactly (roll right +, pitch nose-down +, yaw shifted
+// +90 deg so 0 = east) while remaining continuous through +/-90 deg pitch.
+// A non-finite input encodes as identity (16384,0,0,0).
+void clQuatEncodeEnu(const float qIn[4], int16_t out[4]);
 
 // Serializes one frame into out; returns the total frame size or 0 on error
 // (payload too large or output buffer too small).

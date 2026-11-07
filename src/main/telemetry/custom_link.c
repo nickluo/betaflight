@@ -113,6 +113,7 @@ static uint8_t downlinkSeq;            // one shared sequence counter for all do
 static volatile bool controlActive;
 static volatile float cachedRate[XYZ_AXIS_COUNT];      // deg/s
 static volatile float cachedThrottle;                  // 0.0 .. 1.0
+static volatile float cachedAngleDeg[2];               // roll/pitch from the attitude quaternion, deg
 
 // single-producer (RX ISR) single-consumer (200 Hz task) ring
 static clRxRingEntry_t rxRing[CL_RX_RING_LEN];
@@ -766,12 +767,14 @@ float customLinkGetRateSetpoint(int axis)
 
     // Roll/pitch attitude envelope: once the euler angle leaves the limit,
     // commands that would bank further in the same direction are cut to zero
-    // (recovery-direction commands still pass). Betaflight attitude signs are
-    // aligned with their rate axes (roll: right positive, pitch: nose-down
-    // positive), so the direction comparison is direct. 0 disables.
+    // (recovery-direction commands still pass). Angles are derived from the
+    // attitude quaternion with the IMU's own extraction (signs aligned with
+    // the rate axes: roll right +, pitch nose-down +) and cached by the 200 Hz
+    // task, so the direction comparison is direct and the PID loop pays no
+    // transcendental cost. 0 disables.
     const uint16_t angleLimit = customLinkConfig()->angle_limit_deg;
     if (axis < FD_YAW && angleLimit != 0) {
-        const float angle = (axis == FD_ROLL ? attitude.values.roll : attitude.values.pitch) * 0.1f;
+        const float angle = cachedAngleDeg[axis];
         if ((angle > (float)angleLimit && rate > 0.0f) ||
             (angle < -(float)angleLimit && rate < 0.0f)) {
             rate = 0.0f;
@@ -853,7 +856,12 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
         customLinkSendFrame(CUSTOM_LINK_MSG_FC_TIMESYNC, &resp, sizeof(resp));
     }
 
-    // 200 Hz IMU and attitude stream
+    // 200 Hz IMU and attitude stream. Attitude goes out as a quaternion
+    // (FLU -> ENU): the old euler transport wrapped through +/-90 deg pitch
+    // (roll flipped 180 deg, pitch sign reversed past vertical), which is
+    // intrinsic to ZYX euler, not a fixable bug. Snapshotting q here is the
+    // same lock-free class as the previous attitude.values reads (single
+    // writer in the gyro task, 32-bit aligned floats).
     clPayloadFast_t fast;
     memset(&fast, 0, sizeof(fast));
     fast.ts_us = (uint32_t)currentTimeUs;
@@ -861,20 +869,21 @@ void customLinkTaskFast(timeUs_t currentTimeUs)
         fast.gyro[axis] = clScaleFloat(gyro.gyroADCf[axis], 10.0f);                 // 0.1 deg/s
         fast.acc[axis] = clScaleFloat(acc.accADC.v[axis] * 1000.0f / acc.dev.acc_1G, 1.0f); // 1 mg
     }
-    fast.attitude[0] = clScaleFloat(attitude.values.roll, 10.0f);                   // 0.01 deg
-    fast.attitude[1] = clScaleFloat(attitude.values.pitch, 10.0f);
-    // Betaflight attitude.values.yaw 是罗盘航向 (0..360, 顺时针为正)。协议输出
-    // 改为右手系数学角：绕机体 +Z(Up) 逆时针为正，0 = 磁北，±180 deg 折返，
-    // 同时满足 i16 (±0.01 deg) 编码范围。
-    int32_t yawCd = -(int32_t)attitude.values.yaw * 10;                             // -36000..0
-    while (yawCd > 18000) {
-        yawCd -= 36000;
-    }
-    while (yawCd < -18000) {
-        yawCd += 36000;
-    }
-    fast.attitude[2] = constrain(yawCd, INT16_MIN, INT16_MAX);
+    quaternion_t qAtt;
+    getQuaternion(&qAtt);
+    const float qIn[4] = { qAtt.w, qAtt.x, qAtt.y, qAtt.z };
+    int16_t quatWire[4];
+    clQuatEncodeEnu(qIn, quatWire);
+    memcpy(fast.quat, quatWire, sizeof(fast.quat));   // packed: memcpy only
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_FAST, &fast, sizeof(fast));
+
+    // Roll/pitch angles for the rate envelope, derived from the same snapshot
+    // with the IMU's own euler extraction: numerically identical to
+    // attitude.values, cached at task rate for customLinkGetRateSetpoint.
+    cachedAngleDeg[0] = atan2f(2.0f * (qAtt.y * qAtt.z + qAtt.w * qAtt.x),
+        1.0f - 2.0f * (qAtt.x * qAtt.x + qAtt.y * qAtt.y)) * (180.0f / M_PIf);
+    cachedAngleDeg[1] = asinf(constrainf(2.0f * (qAtt.w * qAtt.y - qAtt.x * qAtt.z),
+        -1.0f, 1.0f)) * (180.0f / M_PIf);
 
 #ifdef USE_MOTOR
     // Mixer motor outputs for the simulator (0x13). External values in the us
@@ -999,17 +1008,18 @@ void customLinkTaskMed(timeUs_t currentTimeUs)
             }
             odom.position_cm[axis] = lrintf(position);
             odom.velocity_cms[axis] = lrintf(velocity);
-            odom.attitude_cdeg[axis] = attitude.raw[axis] * 10;
             odom.gyro_dps_x10[axis] = constrain(lrintf(gyro.gyroADCf[axis] * 10.0f), INT16_MIN, INT16_MAX);
             odom.position_variance[axis] = estimate.positionVariance.v[axis] * 0.0001f;
             odom.velocity_variance[axis] = estimate.velocityVariance.v[axis] * 0.0001f;
         }
-        // Keep odometry attitude identical to 0x10, not native clockwise compass heading.
-        int32_t yawCd = -(int32_t)attitude.values.yaw * 10;
-        if (yawCd < -18000) {
-            yawCd += 36000;
-        }
-        odom.attitude_cdeg[FD_YAW] = yawCd;
+        // Attitude quaternion, identical convention to 0x10, sampled at this
+        // task's epoch.
+        quaternion_t qAttOdom;
+        getQuaternion(&qAttOdom);
+        const float qOdom[4] = { qAttOdom.w, qAttOdom.x, qAttOdom.y, qAttOdom.z };
+        int16_t quatWire[4];
+        clQuatEncodeEnu(qOdom, quatWire);
+        memcpy(odom.quat, quatWire, sizeof(odom.quat));   // packed: memcpy only
         if (valid) {
             customLinkSendFrame(CUSTOM_LINK_MSG_FC_ODOMETRY, &odom, sizeof(odom));
         }

@@ -17,9 +17,9 @@ from airsim_tracker.target_los import TargetLosEstimator
 
 
 class LauncherTest(unittest.TestCase):
-    def test_minus_ten_aim_aligns_camera_through_platform_pitch(self):
+    def test_plus_ten_aim_aligns_camera_through_platform_pitch(self):
         position, target = (8, 0, -2), (78, 0, -47)
-        yaw, pitch, elevation = launcher_angles(position, target, -10)
+        yaw, pitch, elevation = launcher_angles(position, target, 10)
         camera_axis = rotate(quaternion_rpy(0, pitch, yaw),
                              rotate(quaternion_rpy(0, math.radians(80), 0), (1, 0, 0)))
         delta = tuple(t-p for p, t in zip(position, target))
@@ -29,7 +29,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_unreachable_launcher_tilt_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "beyond 65"):
-            launcher_angles((0, 0, 0), (70, 0, 0), -10)
+            launcher_angles((0, 0, 0), (70, 0, 0), 10)
 
     def test_verified_unchanged_ue_transform_is_not_an_actuator_failure(self):
         client = Mock()
@@ -115,9 +115,9 @@ class LauncherTest(unittest.TestCase):
             launcher.aim_at((70, 12 - y * .02, -43))
         self.assertNotEqual(launcher.yaw, first_yaw)
         self.assertNotEqual(launcher.pitch, first_pitch)
-        desired, *_ = launcher_angles(launcher.position, (70, 9.62, -43), -10)
+        desired, *_ = launcher_angles(launcher.position, (70, 9.62, -43), 10)
         self.assertLess(abs(launcher.yaw - desired), .05)
-        self.assertEqual(launcher.aim_pitch_deg, -10)
+        self.assertEqual(launcher.aim_pitch_deg, 10)
         launcher.release()
         client.simSetKinematics.reset_mock()
         with self.assertRaisesRegex(RuntimeError, "after release"):

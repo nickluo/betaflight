@@ -138,11 +138,20 @@ def apply_interceptor_profile(params, args):
 
 
 def apply_bridge_profile(profile, launcher_mounted):
-    """SITL bridge parameters for the mounted-launcher gimbal tuning."""
+    """SITL bridge parameters for the mounted-launcher gimbal tuning.
+
+    云台俯仰参数域为 ROS FLU 相对俯仰 (X 轴向 +Z 旋转为负, 向上 = -90°):
+    AIM 期望 = -90+pitch_aim, MISSION 窗口 = [-90+pitch_mission_min, -90+pitch_mission_max]
+    (内部抬头正关节域取反: AIM 目标 90-pitch_aim, 窗口 [90-max, 90-min])。
+    旧键 pitch_max 自 bridge 参数改名 (pitch_travel_min/max) 起即为无效死键, 已移除;
+    机械行程沿用 base yaml 的 ±120°。
+    """
     params = profile["custom_link_bridge"]["ros__parameters"]
     if launcher_mounted:
         gimbal = params["gimbal"]
-        gimbal["pitch_aim"], gimbal["pitch_max"] = -10.0, 85.0
+        gimbal["pitch_aim"] = 10.0            # -80° (上仰 80°, 与旧约定 -10 等价)
+        gimbal["pitch_mission_min"] = -20.0   # 关节窗口 [-110°, -20°] (抬头域 [20°, 110°])
+        gimbal["pitch_mission_max"] = 70.0
         gimbal["mission_on_ground"] = True
         gimbal.update(tracking_gain=2.0, tracking_max_rate=140.0,
                       tracking_max_accel=600.0, tracking_filter_tau=.12,
@@ -433,7 +442,7 @@ class InterceptMission:
         self.workdir = None
         self.stage = "preflight"
         self.bridge = None
-        self.pitch_aim = None  # None = yaml default (-15); set by auto-calibration
+        self.pitch_aim = None  # None = profile default (10.0); set by auto-calibration
         self.airborne_timestamp = None
         self.launcher = None
         self.hard_collision = False
@@ -1143,10 +1152,11 @@ class InterceptMission:
     def calibrate_gimbal_aim(self):
         """Point the AIM boresight at the balloon elevation before detection.
 
-        AIM requests gimbal pitch 90+pitch_aim (deg toward body +Z). The yaml
-        default (-15 -> 75 deg up) overshoots a ~33 deg-elevation target, so
-        measure the actual boresight via /fpv/gimbal and correct pitch_aim,
-        estimating the response slope empirically across bridge restarts.
+        AIM requests body-relative pitch -90+pitch_aim (ROS FLU 域, 向上 = -90°;
+        抬头关节角 = 90-pitch_aim). The profile default (10 -> 80 deg up)
+        overshoots a ~33 deg-elevation target, so measure the actual boresight
+        via /fpv/gimbal and correct pitch_aim, estimating the response slope
+        empirically across bridge restarts (slope = -1 in this convention).
         """
         if self.args.pitch_aim is not None:
             self.pitch_aim = self.args.pitch_aim
@@ -1170,14 +1180,14 @@ class InterceptMission:
         if abs(wanted - boresight) <= 2.0:
             log("boresight within 2 deg of balloon; no pitch_aim correction")
             return
-        pairs = [(self.pitch_aim if self.pitch_aim is not None else -15.0, boresight)]
-        slope = 1.0
+        pairs = [(self.pitch_aim if self.pitch_aim is not None else 10.0, boresight)]
+        slope = -1.0
         for iteration in range(3):
             p0, b0 = pairs[-1]
             if abs(slope) < 1e-3:
                 raise RuntimeError("AIM pitch is at a joint limit; calibration cannot converge")
-            p1 = (wanted - 90.0 if iteration == 0 else p0 + (wanted - b0) / slope)
-            p1 = max(-120.0, min(60.0, p1))
+            p1 = (90.0 - wanted if iteration == 0 else p0 + (wanted - b0) / slope)
+            p1 = max(-90.0, min(90.0, p1))
             self.pitch_aim = p1
             log(f"gimbal calibration iter {iteration + 1}: pitch_aim={p1:.1f}")
             if not self.restart_bridge():
@@ -2200,9 +2210,9 @@ def parse_arguments(argv=None):
     if not math.isfinite(args.rpc_wait) or args.rpc_wait <= 0:
         parser.error("--rpc-wait must be finite and positive")
     if args.launcher:
-        if args.pitch_aim is not None and args.pitch_aim != -10.0:
-            parser.error("virtual launcher uses fixed --pitch-aim=-10")
-        args.pitch_aim = -10.0
+        if args.pitch_aim is not None and args.pitch_aim != 10.0:
+            parser.error("virtual launcher uses fixed --pitch-aim=10")
+        args.pitch_aim = 10.0
     if args.interactive and args.aim_only:
         parser.error("--interactive and --aim-only are mutually exclusive")
     if not math.isfinite(args.interactive_timeout) or args.interactive_timeout <= 0:

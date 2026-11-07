@@ -138,7 +138,7 @@ class InterceptMissionTest(unittest.TestCase):
         self.assertTrue(args.launcher)
         self.assertFalse(args.interactive)
         self.assertTrue(args.aim_only)
-        self.assertEqual(args.pitch_aim, -10)
+        self.assertEqual(args.pitch_aim, 10)
 
     def test_yaml_uses_existing_range_and_mode_validation(self):
         for text in ("guidance_speed: 41", "balloon_orbit_speed: 6", "rpc_wait: 0",

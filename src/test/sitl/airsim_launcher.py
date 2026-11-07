@@ -34,8 +34,10 @@ def launcher_angles(position, target, aim_pitch_deg):
     delta = tuple(t - p for p, t in zip(position, target))
     bearing = math.atan2(delta[1], delta[0])
     elevation = math.atan2(-delta[2], math.hypot(delta[0], delta[1]))
-    # Camera AIM is 90 + pitch_aim relative to body forward, not world pitch.
-    body_pitch = elevation - math.radians(90 + aim_pitch_deg)
+    # Camera AIM boresight is 90 - pitch_aim above body forward (nose-up joint
+    # deg; the bridge parameter is ROS FLU body-relative pitch -90 + pitch_aim,
+    # up = -90 deg). Not world pitch.
+    body_pitch = elevation - math.radians(90.0 - aim_pitch_deg)
     if abs(body_pitch) > math.radians(65):
         raise RuntimeError("target requires launcher tilt beyond 65 degrees")
     return bearing, body_pitch, elevation
@@ -64,7 +66,7 @@ class AirsimLauncher:
     MOUNT_OFFSET = .60
 
     def __init__(self, client, host, port, reference_camera="CineCameraActor_0", forward=8.0,
-                 aim_pitch_deg=-10.0):
+                 aim_pitch_deg=10.0):
         self.client = client
         self.host, self.port = host, port
         self.reference_camera = reference_camera

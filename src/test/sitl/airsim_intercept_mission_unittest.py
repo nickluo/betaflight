@@ -21,7 +21,9 @@ import airsim_intercept_mission as mission
 
 class InterceptMissionTest(unittest.TestCase):
     def make_mission(self):
-        return mission.InterceptMission(SimpleNamespace())
+        # argparse 默认值里的可选覆盖项: 空命名空间无法到达 envelope_exceeded 等路径。
+        return mission.InterceptMission(SimpleNamespace(
+            max_tilt=None, terminal_floor=None, target_width=None))
 
     def test_yaml_config_loads_typed_values_and_rejects_unknown_options(self):
         parser = argparse.ArgumentParser()
@@ -189,7 +191,8 @@ class InterceptMissionTest(unittest.TestCase):
 
     def test_controller_profile_is_independent_of_balloon_motion(self):
         base = dict(guidance_speed=20.0, climb_speed=20.0, turn_cap_factor=.8,
-                    rate_control_attenuation=False)
+                    rate_control_attenuation=False,
+                    max_tilt=None, terminal_floor=None, target_width=None)
         hover = {"balloon_motion": "hover", **base}
         orbit = {"balloon_motion": "orbit", **base}
         def parameters():
@@ -304,7 +307,7 @@ class InterceptMissionTest(unittest.TestCase):
         test.args = SimpleNamespace(
             host="127.0.0.1", rpc_port=41451, balloon_script=Path("airsim_balloon_target.py"),
             balloon_x=70, balloon_y=0, balloon_z=-45, balloon_motion="orbit",
-            balloon_orbit_radius=5, balloon_orbit_speed=1.5)
+            balloon_orbit_radius=5, balloon_orbit_speed=1.5, balloon_min_alt=40.0)
         test.origin = (100, 200, -3)
         test.workdir = Path("/tmp/not-created-by-unit-test")
         test.launcher = SimpleNamespace(heading=math.pi / 2)
@@ -433,7 +436,9 @@ class InterceptMissionTest(unittest.TestCase):
         test.modes = Mock(return_value=([0], 0))
         test.trajectory = Mock()
         self.assertEqual(test.sample()["distance"], .5)
-        self.assertEqual(test.trajectory.writerow.call_args.args[0][-4:],
+        # fc_qx..fc_qw 列后还有 10 个 cl_* 诊断列 (表头见 mission 的 trajectory
+        # writerow), imu 四元数位于行 [29:33] 而非行尾。
+        self.assertEqual(test.trajectory.writerow.call_args.args[0][29:33],
                          test.ros_iface.imu_quat)
 
     def test_hover_handover_uses_rc_takeoff_and_fc_hold(self):
@@ -1337,6 +1342,7 @@ class InterceptMissionTest(unittest.TestCase):
         test.ros_iface = Mock(tracker_state=2)
         test.capture_png = Mock()
         test.pulse_rc_trigger = Mock()
+        test.calibrate_visual_target = Mock()  # 静态目标锁定后的视觉标定, 本用例不考察
         test.sample = Mock(return_value={
             "target_pos": (70, 0, -45), "target_vel": (0, 0, 0), "camera_error_deg": None})
         test.start_tracking(preview=True)

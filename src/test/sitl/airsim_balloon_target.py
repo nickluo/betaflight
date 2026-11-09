@@ -24,6 +24,14 @@ INTERCEPTOR_NAME = "Copter"
 TARGET_NAME = "TargetDrone"
 # Inverse horizontal acceleration gain of the default SimpleFlight velocity P loop.
 ORBIT_VELOCITY_LEAD_S = .9
+# Vertical tracking integral: SimpleFlight's velocity loop holds the commanded climb
+# accurately only near level attitude; the centripetal bank of a fast orbit
+# (atan(w^2*r/g) ~ 16 deg at 4.5 m/s on r = 7 m) bleeds vertical thrust faster than the
+# pure-P outer loop can cancel, leaving ~1 m of steady droop — exactly the 1 m readiness
+# threshold ("orbit motion did not become ready", 2026-11-09). Integrate the altitude
+# error into the climb command until the droop cancels (m/s per m*s, and the clamp in m*s).
+ORBIT_ALTITUDE_INTEGRAL_KI = .15
+ORBIT_ALTITUDE_INTEGRAL_MAX = 8.0
 
 
 def validate_motion(motion, radius, speed):
@@ -266,6 +274,8 @@ class BalloonTarget:
             self.fly_leg(entry)
         start = self.client.getMultirotorState(vehicle_name=TARGET_NAME).timestamp * 1e-9
         wall_start = time.monotonic()
+        previous_wall = wall_start
+        altitude_integral = 0.0
         ready_since, ready = None, False
         first_position = self.vehicle_position(TARGET_NAME)
         next_log = 0.0
@@ -299,7 +309,10 @@ class BalloonTarget:
                     print(f"[balloon] target ready: motion={self.args.motion}, "
                           f"speed={speed:.2f} m/s, position={pos}", flush=True)
                     ready = True
-                elif time.monotonic() - wall_start > 20:
+                elif time.monotonic() - wall_start > max(20.0, 6.0 + 4.0 * max(2.0, self.args.orbit_speed)):
+                    # 20 s covers hover and slow orbits; faster orbits spend most of it in
+                    # the speed ramp alone (ramp_time = max(2, speed) s at <= 1 m/s^2), so
+                    # scale the settle budget with the ramp.
                     raise RuntimeError(f"balloon {self.args.motion} motion did not become ready")
             acceleration = (orbit_start_acceleration(
                 self.args.orbit_radius, self.args.orbit_speed, elapsed)
@@ -308,6 +321,18 @@ class BalloonTarget:
             # to generate the centripetal lean before radial tracking error grows.
             command = tuple(ff + ORBIT_VELOCITY_LEAD_S * a + .8 * (g-p)
                             for g, p, ff, a in zip(goal, pos, feedforward, acceleration))
+            # Vertical droop integral (see ORBIT_ALTITUDE_INTEGRAL_KI): trapezoid-free
+            # rectangle update on the loop wall dt, clamped so a long chase or a lost
+            # reference cannot wind up; the bank-induced deficit is < 1.5 m/s at the
+            # validated envelope (radius <= 10 m, speed <= 5 m/s).
+            wall_now = time.monotonic()
+            loop_dt = min(max(wall_now - previous_wall, 0.0), .5)
+            previous_wall = wall_now
+            altitude_integral = min(max(
+                altitude_integral + (goal[2] - pos[2]) * loop_dt,
+                -ORBIT_ALTITUDE_INTEGRAL_MAX), ORBIT_ALTITUDE_INTEGRAL_MAX)
+            command = (command[0], command[1],
+                       command[2] + ORBIT_ALTITUDE_INTEGRAL_KI * altitude_integral)
             limit = max(self.args.cruise, self.args.orbit_speed * 1.5)
             magnitude = math.hypot(*command)
             if magnitude > limit:

@@ -377,7 +377,7 @@ def main():
     parser.add_argument("--motion", choices=("hover", "orbit"), default="hover")
     parser.add_argument("--orbit-radius", type=float, default=5.0)
     parser.add_argument("--orbit-speed", type=float, default=1.5)
-    parser.add_argument("--cruise", type=float, default=8.0, help="transit speed (m/s)")
+    parser.add_argument("--cruise", type=float, default=15.0, help="transit speed (m/s)")
     parser.add_argument("--scale", type=float, default=1.5, help="visual scale factor")
     parser.add_argument("--duration", type=float, default=0.0, help="0 = until stopped")
     parser.add_argument("--reset", action=argparse.BooleanOptionalAction, default=True,

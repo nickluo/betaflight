@@ -2217,8 +2217,8 @@ def parse_arguments(argv=None):
         parser.error("--interactive and --aim-only are mutually exclusive")
     if not math.isfinite(args.interactive_timeout) or args.interactive_timeout <= 0:
         parser.error("--interactive-timeout must be finite and positive")
-    if not 0 < args.guidance_speed <= 40 or not 0 < args.climb_speed <= 25:
-        parser.error("guidance speed must be in (0,40], climb speed in (0,25]")
+    if not 0 < args.guidance_speed <= 80 or not 0 < args.climb_speed <= 25:
+        parser.error("guidance speed must be in (0,80], climb speed in (0,25]")
     if not .3 <= args.turn_cap_factor <= 1:
         parser.error("--turn-cap-factor must be in [0.3,1.0]")
     args.binary = args.binary.expanduser().resolve()

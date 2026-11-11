@@ -130,6 +130,7 @@ static volatile uint8_t rxRingTail;
 // atomic; relaxed ordering suffices because these are statistics only.
 #define CL_STAT_INC(stat) __atomic_fetch_add(&(stat), 1, __ATOMIC_RELAXED)
 static uint32_t clStatFrames;      // parser-completed uplink frames, all types
+static volatile uint32_t clStatIsrBytes;  // TEMP DIAGNOSTIC: bytes seen by the RX ISR callback
 static uint32_t clStatEnv;         // 0x22 HOST_ENV frames processed
 static uint32_t clStatImu;         // 0x21 HOST_IMU frames processed
 static uint32_t clStatRc;          // 0x23 HOST_RC frames processed
@@ -187,6 +188,7 @@ static void customLinkFrameHandler(const clFrame_t *frame, timeUs_t frameComplet
 static void customLinkRxCallback(uint16_t c, void *data)
 {
     UNUSED(data);
+    clStatIsrBytes++;  // TEMP DIAGNOSTIC: ISR single writer, task reads a u16 snapshot
     clParserProcessByte(&parser, (uint8_t)c, microsISR(), customLinkFrameHandler, NULL);
 }
 
@@ -701,9 +703,19 @@ void customLinkInit(void)
     }
     const uint32_t baud = baudRates[baudIndex];
 
-    // inter-byte resync timeout: twice the on-wire time of a maximum frame
+    // Inter-byte resync timeout. This must tolerate the HOST-SIDE USB-serial
+    // stack's transfer chunking, not just wire time: a host write is split
+    // into USB bulk transfers that can be separated by milliseconds under bus
+    // load, so a 2 ms budget ("twice the on-wire time of a maximum frame")
+    // deterministically kills longer uplink frames mid-frame (real-hardware
+    // finding 2026-11-11: CLI frames >= ~39 bytes arrived with intra-frame
+    // gaps past the 2 ms budget and were reset by the parser; SITL's TCP
+    // transport never splits, which is why only real hardware showed it).
+    // 50 ms only delays parser recovery from genuine garbage - frame
+    // integrity is CRC-guarded and resync still works - while comfortably
+    // bridging USB scheduling gaps. The watchdog guards a stalled host.
     timeUs_t interByteTimeoutUs = (timeUs_t)(((uint64_t)CUSTOM_LINK_FRAME_MAX * 10 * 2 * 1000000) / baud);
-    interByteTimeoutUs = MAX(interByteTimeoutUs, (timeUs_t)2000);
+    interByteTimeoutUs = MAX(interByteTimeoutUs, (timeUs_t)50000);
 #ifdef SIMULATOR
     // the SITL transport is polled at task rate, not per byte
     interByteTimeoutUs = MAX(interByteTimeoutUs, (timeUs_t)20000);
@@ -1069,6 +1081,13 @@ void customLinkTaskSlow(timeUs_t currentTimeUs)
     slow.mode_flags = flightModeFlags;
     slow.status = (ARMING_FLAG(ARMED) ? CL_STATUS_ARMED : 0) |
                   (failsafeIsActive() ? CL_STATUS_FAILSAFE : 0);
+    // TEMP DIAGNOSTIC: export the uplink-loss counters (revert after hunt).
+    // With USE_UART1_RX_DMA the bytes arrive via the DMA ring and are drained
+    // in taskFast (clStatBytes); the ISR callback counter stays 0.
+    slow.dbg_isr_bytes = (uint16_t)__atomic_load_n(&clStatBytes, __ATOMIC_RELAXED);
+    slow.dbg_frames = (uint16_t)__atomic_load_n(&clStatFrames, __ATOMIC_RELAXED);
+    slow.dbg_ring_drops = (uint16_t)__atomic_load_n(&clStatRingDrops, __ATOMIC_RELAXED);
+    slow.dbg_spare = 0;
     customLinkSendFrame(CUSTOM_LINK_MSG_FC_SLOW, &slow, sizeof(slow));
 
 #ifdef SIMULATOR

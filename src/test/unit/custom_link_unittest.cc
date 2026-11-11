@@ -1113,7 +1113,7 @@ TEST(CustomLinkStructTest, TestPackedLayout)
 {
     EXPECT_EQ(sizeof(clPayloadFast_t), 24u);
     EXPECT_EQ(sizeof(clPayloadMedium_t), 47u);
-    EXPECT_EQ(sizeof(clPayloadSlow_t), 36u);
+    EXPECT_EQ(sizeof(clPayloadSlow_t), 44u);  // TEMP DIAGNOSTIC: +8B counters tail
     EXPECT_EQ(sizeof(clPayloadMotors_t), 17u);
     EXPECT_EQ(sizeof(clPayloadControl_t), 20u);
     EXPECT_EQ(sizeof(clPayloadHostImu_t), 24u);

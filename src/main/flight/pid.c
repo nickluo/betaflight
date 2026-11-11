@@ -1204,7 +1204,16 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         // setpoint with the host rate command; the same acceleration limit
         // applies as for stick input.
         if (customLinkHasControl()) {
-            currentPidSetpoint = customLinkGetRateSetpoint(axis);
+            if (customLinkMotorDirect()) {
+                // Motor-direct bench mode: the mixer discards the PID
+                // differential anyway; command zero and keep the I-term
+                // reset so leaving the mode (watchdog expiry / authority
+                // loss) never snaps with wound-up gains.
+                currentPidSetpoint = 0.0f;
+                pidResetIterm();
+            } else {
+                currentPidSetpoint = customLinkGetRateSetpoint(axis);
+            }
         }
 #endif
         if (pidRuntime.maxVelocity[axis]) {

@@ -151,6 +151,19 @@ targets are bounded by the pid profile's `angle_limit` (default 60 degrees) exac
 like the pilot's ANGLE mode. Mode 2 remains rate-only; live PID apply still requires
 zero throttle and zero command fields. See [the disposable SITL mode regression](src/test/sitl/sitl_custom_link_angle_test.py).
 
+`mode_req=1` is the **motor-direct bench mode**: all motors follow the host
+collective alone - the mixer drops the PID differential, the rate loop commands
+zero and keeps its I-term reset, so bench vibration at high throttle cannot
+excite the rate PID into positive feedback and the attitude state is irrelevant
+to the thrust measurement. It uses the same payload/authority/watchdog/pilot-
+takeover rules as modes 2/3. Because an in-flight mode-1 command would mean four
+equal motors and no attitude control, it is fenced behind the CLI setting
+`custom_link_motor_direct` (default `OFF`, RAM-only): with the gate off, mode-1
+frames degrade to manual and can never grant offboard authority on their own.
+`thrust_test_node` enables the gate via `/fpv/cli` for the duration of a thrust
+test and reverts it on exit. See the motor-direct phase in
+[src/test/sitl/sitl_custom_link_sim_test.py](src/test/sitl/sitl_custom_link_sim_test.py).
+
 ### AirSim POS HOLD odometry regression
 
 The `0x10` and `0x14` attitude/ARM yaw both use **CCW-positive mathematical

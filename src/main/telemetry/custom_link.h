@@ -64,6 +64,13 @@ float customLinkGetRateSetpoint(int axis);
 bool customLinkAngleRequested(void);
 float customLinkGetAngleSetpoint(int axis);
 
+// Motor-direct bench mode (mode_req=1, gated by custom_link_motor_direct):
+// while customLinkMotorDirect() the mixer drops the PID differential so the
+// motors follow the host collective alone - bench vibration cannot reach the
+// motors through the rate loop.
+bool customLinkMotorDirectRequested(void);
+bool customLinkMotorDirect(void);
+
 // Host throttle in mixer units, 0.0 .. 1.0.
 float customLinkGetThrottle(void);
 

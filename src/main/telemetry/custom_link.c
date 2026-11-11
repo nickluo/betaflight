@@ -619,7 +619,8 @@ static void customLinkProcessUplinkFrame(const clFrame_t *frame, timeUs_t t2Us)
 {
     switch (frame->msgId) {
     case CUSTOM_LINK_MSG_HOST_CONTROL: {
-        const clEvent_e event = clControlApplyFrame(&controlState, frame, millis());
+        const clEvent_e event = clControlApplyFrame(&controlState, frame, millis(),
+            customLinkConfig()->motor_direct != 0);
         for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
             cachedRate[axis] = controlState.rateX10[axis] * 0.1f;
         }
@@ -787,6 +788,20 @@ float customLinkGetRateSetpoint(int axis)
 bool customLinkAngleRequested(void)
 {
     return controlState.modeReq == 3 && customLinkIsControlFresh() && customLinkIsModeRequested();
+}
+
+bool customLinkMotorDirectRequested(void)
+{
+    // mode_req=1 only ever latches when custom_link_motor_direct was on at
+    // frame-apply time (clControlApplyFrame remaps it to manual otherwise).
+    return controlState.modeReq == 1 && customLinkIsControlFresh() && customLinkIsModeRequested();
+}
+
+bool customLinkMotorDirect(void)
+{
+    // True while the host actively controls in motor-direct mode: the mixer
+    // drops the PID differential and the motors follow the collective alone.
+    return customLinkHasControl() && customLinkMotorDirectRequested();
 }
 
 float customLinkGetAngleSetpoint(int axis)

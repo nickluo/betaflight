@@ -29,6 +29,10 @@ typedef struct customLinkConfig_s {
                                 // mode_req=3 angle targets are NOT gated by this - they are
                                 // bounded by the pid profile's angle_limit in pidLevel.
     uint8_t motors_stream;      // stream 0x13 mixer motor outputs to the host; 0 = off, 1 = on
+    uint8_t motor_direct;      // accept mode_req=1 (motor-direct bench mode: pure collective,
+                               // PID differential bypassed in the mixer). 0 = off: mode_req=1
+                               // frames are treated as manual. Bench tooling sets this via CLI
+                               // for the duration of a thrust test; keep OFF for flying.
 } customLinkConfig_t;
 
 PG_DECLARE(customLinkConfig_t, customLinkConfig);

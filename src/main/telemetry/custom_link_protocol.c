@@ -254,7 +254,8 @@ void clControlReset(clControlState_t *state)
     memset(state, 0, sizeof(*state));
 }
 
-clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, uint32_t nowMs)
+clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, uint32_t nowMs,
+    bool allowMotorDirect)
 {
     if (frame->msgId != CUSTOM_LINK_MSG_HOST_CONTROL || frame->len != sizeof(clPayloadControl_t)) {
         return CL_EVENT_NONE;
@@ -271,10 +272,14 @@ clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, u
     }
 
     state->arm = cmd.arm ? 1 : 0;
-    if ((cmd.mode_req == 2 || cmd.mode_req == 3) && cmd.mode_req != state->modeReq) {
+    // mode_req=1 (motor-direct bench mode) is only accepted when the FC's
+    // custom_link_motor_direct gate is on; otherwise the frame degrades to
+    // manual so it can never grant offboard authority on its own.
+    const uint8_t modeReq = (cmd.mode_req == 1 && !allowMotorDirect) ? 0 : cmd.mode_req;
+    if ((modeReq == 1 || modeReq == 2 || modeReq == 3) && modeReq != state->modeReq) {
         state->apiRequestPending = true;
     }
-    state->modeReq = cmd.mode_req;
+    state->modeReq = modeReq;
     state->lastHostTsUs = cmd.host_ts_us;
     state->lastCmdSeq = cmd.cmd_seq;
     state->throttle = cmd.throttle < 1000 ? 1000 : (cmd.throttle > 2000 ? 2000 : cmd.throttle);
@@ -335,7 +340,8 @@ void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
     }
     if (fresh && !rescueSwitch && !state->pilotDisarmed && offboardSwitch) {
         state->authority = CL_AUTHORITY_RC;
-    } else if (fresh && !rescueSwitch && !state->apiBlocked && (state->modeReq == 2 || state->modeReq == 3)) {
+    } else if (fresh && !rescueSwitch && !state->apiBlocked
+               && (state->modeReq == 1 || state->modeReq == 2 || state->modeReq == 3)) {
         state->authority = CL_AUTHORITY_API;
         state->handoverArm = false;
     } else {
@@ -346,7 +352,9 @@ void clControlUpdateAuthority(clControlState_t *state, uint32_t pilotModes,
 bool clControlModeRequested(const clControlState_t *state)
 {
     return state->authority == CL_AUTHORITY_RC
-        || (state->authority == CL_AUTHORITY_API && (state->modeReq == 2 || state->modeReq == 3) && !state->apiBlocked);
+        || (state->authority == CL_AUTHORITY_API
+            && (state->modeReq == 1 || state->modeReq == 2 || state->modeReq == 3)
+            && !state->apiBlocked);
 }
 
 bool clControlHostArmActive(const clControlState_t *state, bool armed, bool fresh)

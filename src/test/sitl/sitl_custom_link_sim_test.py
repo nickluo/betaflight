@@ -62,15 +62,17 @@ MSG_FC_FAST = 0x10
 MSG_FC_MEDIUM = 0x11
 MSG_FC_SLOW = 0x12
 MSG_FC_MOTORS = 0x13
+MSG_FC_CLI = 0x15
 MSG_FC_ESC_TELEMETRY = 0x16
 MSG_HOST_CONTROL = 0x20
 MSG_HOST_IMU = 0x21
 MSG_HOST_ENV = 0x22
 MSG_HOST_RC = 0x23
+MSG_HOST_CLI = 0x24
 
 MSG_NAMES = {
     MSG_FC_FAST: "0x10", MSG_FC_MEDIUM: "0x11", MSG_FC_SLOW: "0x12",
-    MSG_FC_MOTORS: "0x13", MSG_FC_ESC_TELEMETRY: "0x16",
+    MSG_FC_MOTORS: "0x13", MSG_FC_CLI: "0x15", MSG_FC_ESC_TELEMETRY: "0x16",
 }
 
 
@@ -205,8 +207,26 @@ class Telemetry:
         self.first_seen = {}
         self.motor_values = None
         self.motor_stamp = 0.0
+        self.cli = {}  # req_id -> {"total", "status", "final", "chunks": {offset: bytes}}
         self.t = threading.Thread(target=self._loop, daemon=True)
         self.t.start()
+
+    def cli_done(self, req_id):
+        e = self.cli.get(req_id)
+        if not e:
+            return False
+        got = sum(len(c) for c in e["chunks"].values())
+        return e["final"] and got >= e["total"]
+
+    def cli_status(self, req_id):
+        e = self.cli.get(req_id)
+        return e["status"] if e else None
+
+    def cli_text(self, req_id):
+        e = self.cli.get(req_id)
+        if not e:
+            return ""
+        return b"".join(e["chunks"][o] for o in sorted(e["chunks"])).decode(errors="replace")
 
     def _loop(self):
         while self.running:
@@ -253,6 +273,14 @@ class Telemetry:
                 ts, count, valid = struct.unpack("<IBB", p[:6])
                 rpm = struct.unpack("<8H", p[6:22])[:count]
                 self.last["esc_telemetry"] = (count, valid, rpm)
+            elif msg_id == MSG_FC_CLI:
+                req_id, total, offset, status, flags = struct.unpack("<HHHBB", p[:8])
+                e = self.cli.setdefault(req_id, {"total": total, "status": status,
+                                                 "final": False, "chunks": {}})
+                e["chunks"][offset] = p[8:]
+                e["status"] = status
+                if not (flags & 0x01):
+                    e["final"] = True
         except struct.error:
             pass
 
@@ -505,6 +533,77 @@ def main():
         feed.control["arm"] = 0
         results["host_disarm"] = re_ok and wait_for(
             "disarmed via arm=0", lambda: not tel.armed(), timeout=5)
+
+        # ---- 12. motor-direct bench mode (mode_req=1) ----
+        print("== 12. motor-direct bench mode (mode_req=1) ==")
+        cli_seq = [0]
+
+        def cli_cmd(cmd, args):
+            cli_seq[0] += 1
+            rid = cli_seq[0] & 0xFFFF
+            payload = struct.pack("<HBB", rid, cmd, 0) + args.encode() + b"\0"
+            feed._send(MSG_HOST_CLI, payload)
+            ok = wait_for(f"cli cmd {args}", lambda: tel.cli_done(rid), timeout=5)
+            print(f"    cli reply: {tel.cli_text(rid)!r}")
+            return ok and tel.cli_status(rid) == 0
+
+        def cli_set(name, value):
+            return cli_cmd(1, f"{name} = {value}")
+
+        def cli_get(name):
+            return cli_cmd(0, name)
+
+        # gate OFF (boot default): mode 1 is inert. The harness normally holds
+        # the BOXOFFBOARD RC switch high (RC authority grants host control
+        # regardless of mode_req); drop AUX2 so only the mode-gated API path
+        # can engage - that is what the gate must block. Drop the switch FIRST
+        # and let the authority settle, else the first arm=1 frame races the
+        # switch edge and latches handoverArm (armed-without-offboard).
+        cli_get("custom_link_motor_direct")
+        feed.rc_channels[5] = 1000  # AUX2 low: BOXOFFBOARD switch off
+        time.sleep(0.5)             # authority settles to NONE before arming
+        feed.control = dict(throttle=1000, rates=(0, 0, 0), arm=1, mode=1)
+        time.sleep(1.5)
+        results["motor_direct_gated_off"] = not tel.armed() and not tel.offboard()
+        print(f"  gated off: armed={tel.armed()} offboard={tel.offboard()}")
+
+        # gate ON: mode 1 arms + engages OFFBOARD through the API path
+        results["motor_direct_gate_set"] = cli_set("custom_link_motor_direct", "ON")
+        results["motor_direct_arm"] = wait_for("armed in mode 1", lambda: tel.armed(), timeout=12)
+        results["motor_direct_offboard"] = wait_for("OFFBOARD in mode 1", lambda: tel.offboard(), timeout=5)
+
+        # "bench vibration": injected gyro noise + non-zero rate fields must NOT
+        # split the motors - the mixer drops the PID differential in mode 1
+        feed.gyro_dps = (400.0, -350.0, 250.0)
+        feed.control["throttle"] = 1500
+        feed.control["rates"] = (200.0, -200.0, 150.0)
+
+        def equal_motors_at(target, spread=25, tol=120):
+            m = tel.motor_values
+            return m is not None and len(m) == 4 and max(m) - min(m) <= spread \
+                and all(abs(v - target) <= tol for v in m)
+
+        results["motor_direct_equal"] = wait_for(
+            "motors equal at ~1500 us despite gyro/rate injection",
+            lambda: equal_motors_at(1500), timeout=5)
+        print(f"  motors under vibration: {tel.motor_values}")
+        feed.gyro_dps = (0.0, 0.0, 0.0)
+
+        # clearing the gate mid-stream degrades mode 1 to manual: OFFBOARD drops
+        # and the host arm level loses its authority -> disarm
+        results["motor_direct_gate_clear"] = cli_set("custom_link_motor_direct", "OFF")
+        results["motor_direct_degrades"] = wait_for(
+            "OFFBOARD dropped after gate cleared", lambda: not tel.offboard(), timeout=3)
+        results["motor_direct_disarm"] = wait_for(
+            "disarmed after degrade", lambda: not tel.armed(), timeout=5)
+
+        # regression: ordinary mode 2 still arms and engages after gate toggling
+        feed.control = dict(throttle=1000, rates=(0, 0, 0), arm=1, mode=2)
+        results["motor_direct_rates_regress"] = wait_for(
+            "mode 2 re-arms", lambda: tel.armed() and tel.offboard(), timeout=12)
+        feed.control["arm"] = 0
+        results["motor_direct_final_disarm"] = wait_for(
+            "final disarm", lambda: not tel.armed(), timeout=5)
     finally:
         if feed:
             feed.stop()

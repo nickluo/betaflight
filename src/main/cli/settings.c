@@ -2119,6 +2119,7 @@ const clivalue_t valueTable[] = {
     { "custom_link_rate_limit_dps",  VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 0, 1800 }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, rate_limit_dps) },
     { "custom_link_angle_limit_deg", VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 0, 89 }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, angle_limit_deg) },
     { "custom_link_motors_stream",   VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, motors_stream) },
+    { "custom_link_motor_direct",    VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_CUSTOM_LINK_CONFIG, offsetof(customLinkConfig_t, motor_direct) },
 #endif
 };
 

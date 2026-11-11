@@ -126,6 +126,7 @@ extern "C" {
     void initRcProcessing(void) { }
     bool customLinkHasControl(void) { return simulatedCustomControl; }
     bool customLinkAngleRequested(void) { return simulatedCustomAngle; }
+    bool customLinkMotorDirect(void) { return false; }  // motor-direct bypasses the rate loop; untested here
     float customLinkGetRateSetpoint(int axis) { return simulatedSetpointRate[axis]; }
     float customLinkGetAngleSetpoint(int axis) { return simulatedAngleTarget[axis]; }
 }

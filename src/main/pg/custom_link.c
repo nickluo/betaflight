@@ -41,11 +41,16 @@
 #define CUSTOM_LINK_MOTORS_STREAM 0     // real hardware: opt-in only (extra downlink bandwidth)
 #endif
 
-PG_REGISTER_WITH_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig, PG_CUSTOM_LINK_CONFIG, 2);
+#ifndef CUSTOM_LINK_MOTOR_DIRECT
+#define CUSTOM_LINK_MOTOR_DIRECT 0       // always off by default: bench tooling enables it via
+#endif                                    // CLI for the duration of a thrust test (mode_req=1)
+
+PG_REGISTER_WITH_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig, PG_CUSTOM_LINK_CONFIG, 3);
 
 PG_RESET_TEMPLATE(customLinkConfig_t, customLinkConfig,
     .watchdog_ms = CUSTOM_LINK_WATCHDOG_MS,
     .rate_limit_dps = CUSTOM_LINK_RATE_LIMIT_DPS,
     .angle_limit_deg = CUSTOM_LINK_ANGLE_LIMIT_DEG,
     .motors_stream = CUSTOM_LINK_MOTORS_STREAM,
+    .motor_direct = CUSTOM_LINK_MOTOR_DIRECT,
 );

@@ -145,7 +145,9 @@ typedef struct __attribute__((packed)) {
     uint64_t host_ts_us;        // host monotonic timestamp at send time
     uint16_t cmd_seq;           // command sequence number
     uint8_t arm;                // 0 = request disarm, 1 = request arm
-    uint8_t mode_req;           // 0 manual, 1 reserved, 2 offboard rates, 3 offboard ANGLE (roll/pitch deg, yaw deg/s)
+    uint8_t mode_req;           // 0 manual, 1 offboard MOTOR-DIRECT (bench: pure collective, PID differential bypassed;
+                                //   honored only while the FC's custom_link_motor_direct gate is on, else treated as 0),
+                                //   2 offboard rates, 3 offboard ANGLE (roll/pitch deg, yaw deg/s)
     uint16_t throttle;          // throttle, us-style 1000-2000 (clamped)
     int16_t rate_x10[3];        // roll/pitch/yaw rate targets, 0.1 deg/s,
                                 // in the same frame as the 0x10 gyro: roll
@@ -406,8 +408,11 @@ typedef struct {
 void clControlReset(clControlState_t *state);
 
 // Applies a (validated) host control frame. Only CUSTOM_LINK_MSG_HOST_CONTROL
-// frames are accepted; returns the arm edge event, if any.
-clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, uint32_t nowMs);
+// frames are accepted; returns the arm edge event, if any. allowMotorDirect
+// gates mode_req=1 (motor-direct bench mode) - when false such frames degrade
+// to manual and cannot grant offboard authority.
+clEvent_e clControlApplyFrame(clControlState_t *state, const clFrame_t *frame, uint32_t nowMs,
+    bool allowMotorDirect);
 
 // True while the most recent control frame is younger than watchdogMs.
 bool clControlIsFresh(const clControlState_t *state, uint32_t nowMs, uint16_t watchdogMs);

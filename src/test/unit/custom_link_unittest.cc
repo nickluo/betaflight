@@ -754,20 +754,20 @@ TEST(CustomLinkControlTest, TestArmEdgeDetection)
 
     cmd->arm = 1;
     cmd->throttle = 1500;
-    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1000), CL_EVENT_ARM_REQUEST);
+    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1000, true), CL_EVENT_ARM_REQUEST);
     EXPECT_TRUE(clControlIsFresh(&state, 1000, 50));
     EXPECT_TRUE(clControlIsFresh(&state, 1050, 50));     // exactly at the watchdog boundary: still fresh
     EXPECT_FALSE(clControlIsFresh(&state, 1051, 50));
 
     cmd->arm = 1;                                        // repeated arm: no new event
-    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1100), CL_EVENT_NONE);
+    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1100, true), CL_EVENT_NONE);
 
     cmd->arm = 0;
-    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1200), CL_EVENT_DISARM_REQUEST);
+    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1200, true), CL_EVENT_DISARM_REQUEST);
 
     clControlReset(&state);
     cmd->arm = 1;                                        // after a reset the edge fires again
-    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1300), CL_EVENT_ARM_REQUEST);
+    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1300, true), CL_EVENT_ARM_REQUEST);
     EXPECT_EQ(state.arm, 1u);
 }
 
@@ -787,15 +787,15 @@ TEST(CustomLinkControlTest, TestThrottleClampAndRates)
     cmd->rate_x10[FD_YAW] = 32767;
     cmd->cmd_seq = 0xBEEF;
     cmd->host_ts_us = 0x0102030405060708ULL;
-    clControlApplyFrame(&state, &frame, 500);
+    clControlApplyFrame(&state, &frame, 500, true);
     EXPECT_EQ(state.throttle, 1000u);                    // clamped low
 
     cmd->throttle = 2100;
-    clControlApplyFrame(&state, &frame, 600);
+    clControlApplyFrame(&state, &frame, 600, true);
     EXPECT_EQ(state.throttle, 2000u);                    // clamped high
 
     cmd->throttle = 1750;
-    clControlApplyFrame(&state, &frame, 700);
+    clControlApplyFrame(&state, &frame, 700, true);
     EXPECT_EQ(state.throttle, 1750u);
 
     EXPECT_EQ(state.rateX10[FD_ROLL], -1500);
@@ -816,12 +816,12 @@ TEST(CustomLinkControlTest, TestNonControlFramesIgnored)
     frame.len = sizeof(clPayloadControl_t);
     clPayloadControl_t *cmd = (clPayloadControl_t *)frame.payload;
     cmd->arm = 1;
-    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1000), CL_EVENT_NONE);
+    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1000, true), CL_EVENT_NONE);
     EXPECT_FALSE(state.haveFrame);
 
     frame.msgId = CUSTOM_LINK_MSG_HOST_CONTROL;
     frame.len = 4;                                        // wrong length
-    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1000), CL_EVENT_NONE);
+    EXPECT_EQ(clControlApplyFrame(&state, &frame, 1000, true), CL_EVENT_NONE);
     EXPECT_FALSE(state.haveFrame);
 }
 
@@ -835,7 +835,7 @@ TEST(CustomLinkControlTest, StoresApiModeRequest)
     clPayloadControl_t cmd = {};
     cmd.mode_req = 2;
     memcpy(frame.payload, &cmd, sizeof(cmd));
-    clControlApplyFrame(&state, &frame, 1000);
+    clControlApplyFrame(&state, &frame, 1000, true);
     EXPECT_EQ(state.modeReq, 2);
 }
 
@@ -853,7 +853,7 @@ protected:
         cmd.throttle = 1800;
         cmd.rate_x10[FD_YAW] = 1000;
         memcpy(frame.payload, &cmd, sizeof(cmd));
-        clControlApplyFrame(&state, &frame, 1000);
+        clControlApplyFrame(&state, &frame, 1000, true);
     }
     void update(uint32_t modes, bool rcOffboard = false, bool rescue = false,
         bool pilotArm = false, bool armed = true, bool fresh = true, bool valid = true)
@@ -893,6 +893,51 @@ TEST_F(CustomLinkAuthorityTest, ApiEntryDoesNotRequireOffboardSwitch)
     EXPECT_EQ(state.authority, CL_AUTHORITY_API);
     EXPECT_TRUE(clControlModeRequested(&state));
     EXPECT_TRUE(clControlHostArmActive(&state, false, true));
+}
+
+TEST_F(CustomLinkAuthorityTest, MotorDirectModeUsesTheSameAuthorityAndWatchdogGates)
+{
+    command(1);
+    EXPECT_EQ(state.modeReq, 1);
+    update(1);
+    EXPECT_EQ(state.authority, CL_AUTHORITY_API);
+    EXPECT_TRUE(clControlModeRequested(&state));
+    update(1, false, false, false, true, false);          // watchdog expiry
+    EXPECT_FALSE(clControlModeRequested(&state));
+    update(1);                                            // fresh again
+    EXPECT_TRUE(clControlModeRequested(&state));
+    update(0);                                            // pilot mode change latches apiBlocked
+    EXPECT_FALSE(clControlModeRequested(&state));
+    command(1);
+    update(0);
+    EXPECT_FALSE(clControlModeRequested(&state));         // still blocked until a fresh request edge
+}
+
+TEST_F(CustomLinkAuthorityTest, MotorDirectModeDegradesToManualWhenGateIsOff)
+{
+    // custom_link_motor_direct = 0: a mode_req=1 frame is stored as manual,
+    // grants no API authority, and a later mode 2 request still takes over
+    // through the normal edge.
+    clFrame_t frame = {};
+    frame.msgId = CUSTOM_LINK_MSG_HOST_CONTROL;
+    frame.len = sizeof(clPayloadControl_t);
+    clPayloadControl_t cmd = {};
+    cmd.mode_req = 1;
+    cmd.arm = 1;
+    cmd.throttle = 1800;
+    memcpy(frame.payload, &cmd, sizeof(cmd));
+    clControlApplyFrame(&state, &frame, 1000, false);
+    EXPECT_EQ(state.modeReq, 0);                          // degraded to manual
+
+    update(1);
+    EXPECT_EQ(state.authority, CL_AUTHORITY_NONE);
+    EXPECT_FALSE(clControlModeRequested(&state));
+    EXPECT_FALSE(clControlHostArmActive(&state, false, true));
+
+    command(2);                                           // gate still off, but mode 2 is ungated
+    EXPECT_EQ(state.modeReq, 2);
+    update(1);
+    EXPECT_TRUE(clControlModeRequested(&state));
 }
 
 TEST_F(CustomLinkAuthorityTest, EveryPilotModeChangePreemptsApiWithoutStickOrThrottleGates)

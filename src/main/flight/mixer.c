@@ -768,11 +768,26 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
     // ??? Where is the optimal location for this code?
     float motorMix[MAX_SUPPORTED_MOTORS];
     float motorMixMax = 0, motorMixMin = 0;
+#ifdef USE_CUSTOM_LINK
+    // Motor-direct bench mode (mode_req=1): drop the PID differential so all
+    // motors follow the host collective (already injected above) alone - bench
+    // vibration at high throttle cannot excite the rate loop into positive
+    // feedback, and the attitude state is irrelevant to the thrust measurement.
+    const bool motorDirect = customLinkMotorDirect();
+#endif
     for (int i = 0; i < mixerRuntime.motorCount; i++) {
-        float mix =
-            scaledAxisPidRoll  * activeMixer[i].roll +
-            scaledAxisPidPitch * activeMixer[i].pitch +
-            scaledAxisPidYaw   * activeMixer[i].yaw;
+        float mix;
+#ifdef USE_CUSTOM_LINK
+        if (motorDirect) {
+            mix = 0.0f;
+        } else
+#endif
+        {
+            mix =
+                scaledAxisPidRoll  * activeMixer[i].roll +
+                scaledAxisPidPitch * activeMixer[i].pitch +
+                scaledAxisPidYaw   * activeMixer[i].yaw;
+        }
 
         if (mix > motorMixMax) {
             motorMixMax = mix;

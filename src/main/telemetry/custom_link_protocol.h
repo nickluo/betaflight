@@ -112,14 +112,6 @@ typedef struct __attribute__((packed)) {
     uint16_t course_cdeg;       // ground course, 0.01 deg
     uint32_t mode_flags;        // flightModeFlags (see flightModeFlags_e)
     uint16_t status;            // bit0 = armed, bit1 = failsafe active
-    // TEMP DIAGNOSTIC (2026-11-11 uplink frame-loss hunt on real hardware;
-    // revert once root-caused). Receivers unpack leading fields by fixed
-    // offsets and ignore the tail - same backward-compatible trick as the
-    // rssi_pct append on 0x11.
-    uint16_t dbg_isr_bytes;     // bytes that reached the RX ISR callback (u16 snapshot, wraps)
-    uint16_t dbg_frames;        // parser-completed (CRC-valid) uplink frames, all types
-    uint16_t dbg_ring_drops;    // uplink frames dropped on a full rxRing
-    uint16_t dbg_spare;         // 0
 } clPayloadSlow_t;
 
 // 0x14 - 100 Hz, same sampling epoch for position, velocity, attitude and gyro (66 bytes).
